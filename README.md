@@ -34,6 +34,10 @@ Keep SteamVR running while using the mod.
 
 [![HytaleVRInjector-mod video tutorial](https://img.youtube.com/vi/ktmVUCQHKF0/maxresdefault.jpg)](https://youtu.be/ktmVUCQHKF0)
 
+## Controls
+
+![HytaleVRInjector-mod controller mapping](docs/assets/touch.png)
+
 ## Build
 
 Requirements:
