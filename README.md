@@ -29,7 +29,7 @@ This is an experimental mod. It is not affiliated with or endorsed by Hytale, Hy
 8. Click `Center VR` to inject and align the VR view.
 
 Keep SteamVR running while using the mod.
-
+tutorial video : https://youtu.be/ktmVUCQHKF0
 ## Build
 
 Requirements:
