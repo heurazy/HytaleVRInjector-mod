@@ -1,0 +1,37 @@
+# Build output
+build/
+build-*/
+out/
+dist/
+install/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+CTestTestfile.cmake
+DartConfiguration.tcl
+Testing/
+
+# Visual Studio / MSVC
+.vs/
+*.user
+*.suo
+*.vcxproj
+*.vcxproj.filters
+*.vcxproj.user
+*.sln
+*.obj
+*.pdb
+*.ilk
+*.exp
+
+# Runtime logs and local packages
+*.log
+app-v*/
+hytale_vr_render_debug.log
+hytale_scaler_debug.log
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

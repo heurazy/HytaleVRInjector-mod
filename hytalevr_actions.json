@@ -1,0 +1,86 @@
+{
+  "action_sets": [
+    {
+      "name": "/actions/hytale",
+      "usage": "single"
+    }
+  ],
+  "actions": [
+    {
+      "name": "/actions/hytale/in/move",
+      "type": "vector2"
+    },
+    {
+      "name": "/actions/hytale/in/turn",
+      "type": "vector2"
+    },
+    {
+      "name": "/actions/hytale/in/jump",
+      "type": "boolean"
+    },
+    {
+      "name": "/actions/hytale/in/sprint",
+      "type": "boolean"
+    },
+    {
+      "name": "/actions/hytale/in/right_pose",
+      "type": "pose"
+    },
+    {
+      "name": "/actions/hytale/in/right_trigger",
+      "type": "vector1"
+    },
+    {
+      "name": "/actions/hytale/in/left_trigger",
+      "type": "vector1"
+    },
+    {
+      "name": "/actions/hytale/in/button_x",
+      "type": "boolean"
+    },
+    {
+      "name": "/actions/hytale/in/button_y",
+      "type": "boolean"
+    },
+    {
+      "name": "/actions/hytale/in/button_b",
+      "type": "boolean"
+    },
+    {
+      "name": "/actions/hytale/in/left_grip",
+      "type": "vector1"
+    },
+    {
+      "name": "/actions/hytale/in/right_grip",
+      "type": "vector1"
+    },
+    {
+      "name": "/actions/hytale/in/right_stick_click",
+      "type": "boolean"
+    }
+  ],
+  "default_bindings": [
+    {
+      "controller_type": "oculus_touch",
+      "binding_url": "hytalevr_bindings_oculus_touch.json"
+    }
+  ],
+  "localization": [
+    {
+      "language_tag": "en_US",
+      "/actions/hytale/in/move": "Move",
+      "/actions/hytale/in/turn": "Turn",
+      "/actions/hytale/in/jump": "Jump",
+      "/actions/hytale/in/sprint": "Sprint",
+      "/actions/hytale/in/right_pose": "Right hand aim",
+      "/actions/hytale/in/right_trigger": "Right trigger attack",
+      "/actions/hytale/in/left_trigger": "Left trigger click",
+      "/actions/hytale/in/button_x": "X key",
+      "/actions/hytale/in/button_y": "Tab key",
+      "/actions/hytale/in/button_b": "A key",
+      "/actions/hytale/in/left_grip": "Hotbar down",
+      "/actions/hytale/in/right_grip": "Hotbar up",
+      "/actions/hytale/in/right_stick_click": "Toggle sneak"
+    }
+  ]
+}

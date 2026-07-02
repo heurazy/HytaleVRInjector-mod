@@ -1,0 +1,16 @@
+{
+  "source": "builtin",
+  "applications": [
+    {
+      "app_key": "com.hytalevr.injected",
+      "launch_type": "binary",
+      "binary_path_windows": "HytaleClient.exe",
+      "is_dashboard_overlay": false,
+      "strings": {
+        "en_us": {
+          "name": "Hytale VR"
+        }
+      }
+    }
+  ]
+}
