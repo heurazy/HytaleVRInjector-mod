@@ -28,7 +28,7 @@ This is an experimental mod. It is not affiliated with or endorsed by Hytale, Hy
 7. Select the detected coordinate block from the list.
 8. Click `Center VR` to inject and align the VR view.
 
-Keep SteamVR running while using the mod.
+Keep SteamVR running while using the mod. Hytale must stay focused for the mod controls to work correctly.
 
 ### Video Tutorial
 
@@ -37,6 +37,10 @@ Keep SteamVR running while using the mod.
 ## Controls
 
 ![HytaleVRInjector-mod controller mapping](docs/assets/touch.png)
+
+## Support
+
+If you have a problem with the mod, contact me on Discord: `heurazy`.
 
 ## Build
 
