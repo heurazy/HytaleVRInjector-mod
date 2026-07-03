@@ -2323,13 +2323,13 @@ bool inject_vr_camera_hook() {
     if (g_vr_camera_shared->hook_error != 0) {
         switch (g_vr_camera_shared->hook_error) {
         case 1:
-            set_status(L"Unknown Hytale camera signature. Hook v120 rejects this game version.");
+            set_status(L"Camera auto-scan failed. This Hytale version needs a new hook pattern.");
             break;
         case 2:
             set_status(L"SDL_GL_SwapWindow is incompatible. The camera hook was removed cleanly.");
             break;
         case 4:
-            set_status(L"Unknown Hytale interaction-ray signature. The hook was removed cleanly.");
+            set_status(L"Interaction-ray auto-scan failed. Camera hook was removed cleanly.");
             break;
         case 5:
             set_status(L"2D UI hook unavailable on this version. Camera, stereo and interaction remain active.");

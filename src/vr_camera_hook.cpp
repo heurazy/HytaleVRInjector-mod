@@ -13,6 +13,7 @@
 #include <mutex>
 #include <sstream>
 #include <string>
+#include <vector>
 
 #include "vr_camera_shared.h"
 #include "vr_math.h"
@@ -252,6 +253,145 @@ float matrix_max_delta(const Matrix4& a, const Matrix4& b) {
         result = std::max(result, std::fabs(a.value[i] - b.value[i]));
     }
     return result;
+}
+
+struct ModuleRange {
+    unsigned char* base = nullptr;
+    size_t size = 0;
+};
+
+struct PatternByte {
+    unsigned char value = 0;
+    bool wildcard = false;
+};
+
+int hex_nibble(char value) {
+    if (value >= '0' && value <= '9') return value - '0';
+    if (value >= 'a' && value <= 'f') return value - 'a' + 10;
+    if (value >= 'A' && value <= 'F') return value - 'A' + 10;
+    return -1;
+}
+
+bool parse_pattern(const char* text, std::vector<PatternByte>& out) {
+    out.clear();
+    const char* cursor = text;
+    while (*cursor) {
+        while (*cursor == ' ' || *cursor == '\t' || *cursor == '\r' || *cursor == '\n') ++cursor;
+        if (!*cursor) break;
+        if (*cursor == '?') {
+            ++cursor;
+            if (*cursor == '?') ++cursor;
+            out.push_back(PatternByte{0, true});
+            continue;
+        }
+        const int high = hex_nibble(cursor[0]);
+        const int low = hex_nibble(cursor[1]);
+        if (high < 0 || low < 0) return false;
+        out.push_back(PatternByte{static_cast<unsigned char>((high << 4) | low), false});
+        cursor += 2;
+    }
+    return !out.empty();
+}
+
+bool pattern_matches(const unsigned char* data, size_t available,
+                     const std::vector<PatternByte>& pattern) {
+    if (available < pattern.size()) return false;
+    for (size_t i = 0; i < pattern.size(); ++i) {
+        if (!pattern[i].wildcard && data[i] != pattern[i].value) return false;
+    }
+    return true;
+}
+
+ModuleRange current_executable_range() {
+    auto* base = reinterpret_cast<unsigned char*>(GetModuleHandleW(nullptr));
+    if (!base) return {};
+    const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(base);
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) return {};
+    const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(base + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return {};
+    return {base, static_cast<size_t>(nt->OptionalHeader.SizeOfImage)};
+}
+
+bool is_executable_page(DWORD protect) {
+    if (protect & (PAGE_GUARD | PAGE_NOACCESS)) return false;
+    protect &= 0xff;
+    return protect == PAGE_EXECUTE || protect == PAGE_EXECUTE_READ ||
+           protect == PAGE_EXECUTE_READWRITE || protect == PAGE_EXECUTE_WRITECOPY;
+}
+
+unsigned char* scan_unique_pattern(const ModuleRange& range, const char* name,
+                                   const char* pattern_text, size_t preferred_rva) {
+    std::vector<PatternByte> pattern;
+    if (!parse_pattern(pattern_text, pattern) || !range.base || range.size < pattern.size()) {
+        render_log(std::string("pattern parse failed: ") + name);
+        return nullptr;
+    }
+
+    if (preferred_rva > 0 && preferred_rva + pattern.size() <= range.size &&
+        pattern_matches(range.base + preferred_rva, range.size - preferred_rva, pattern)) {
+        std::ostringstream out;
+        out << name << " pattern matched preferred rva=0x" << std::hex << preferred_rva;
+        render_log(out.str());
+        return range.base + preferred_rva;
+    }
+
+    unsigned char* first = nullptr;
+    size_t count = 0;
+    unsigned char* cursor = range.base;
+    const unsigned char* end = range.base + range.size;
+    while (cursor < end) {
+        MEMORY_BASIC_INFORMATION memory{};
+        if (VirtualQuery(cursor, &memory, sizeof(memory)) != sizeof(memory)) break;
+        auto* region = static_cast<unsigned char*>(memory.BaseAddress);
+        const size_t region_size = memory.RegionSize;
+        unsigned char* region_end = region + region_size;
+        if (memory.State == MEM_COMMIT && is_executable_page(memory.Protect)) {
+            unsigned char* scan_begin = std::max(region, range.base);
+            unsigned char* scan_end = std::min(region_end, const_cast<unsigned char*>(end));
+            if (scan_end > scan_begin && static_cast<size_t>(scan_end - scan_begin) >= pattern.size()) {
+                for (unsigned char* at = scan_begin; at + pattern.size() <= scan_end; ++at) {
+                    if (!pattern_matches(at, static_cast<size_t>(scan_end - at), pattern)) continue;
+                    if (!first) first = at;
+                    ++count;
+                    if (count > 1) {
+                        std::ostringstream out;
+                        out << name << " pattern is not unique: first_rva=0x"
+                            << std::hex << static_cast<uintptr_t>(first - range.base)
+                            << " another_rva=0x" << static_cast<uintptr_t>(at - range.base);
+                        render_log(out.str());
+                        return nullptr;
+                    }
+                }
+            }
+        }
+        cursor = region_end > cursor ? region_end : cursor + 0x1000;
+    }
+
+    if (first) {
+        std::ostringstream out;
+        out << name << " pattern found rva=0x" << std::hex
+            << static_cast<uintptr_t>(first - range.base);
+        render_log(out.str());
+    } else {
+        render_log(std::string(name) + " pattern not found");
+    }
+    return first;
+}
+
+unsigned char* find_hook_target_by_patterns(const char* name, size_t preferred_rva,
+                                            const char* const* patterns,
+                                            size_t pattern_count) {
+    const ModuleRange range = current_executable_range();
+    if (!range.base || !range.size) {
+        render_log(std::string(name) + " module range unavailable");
+        return nullptr;
+    }
+    for (size_t i = 0; i < pattern_count; ++i) {
+        if (auto* target = scan_unique_pattern(range, name, patterns[i], preferred_rva)) {
+            return target;
+        }
+    }
+    return nullptr;
 }
 
 void reset_eye_capture_resources(const char* reason) {
@@ -2929,20 +3069,22 @@ void emit8(unsigned char*& cursor, uint64_t value) {
 }
 
 bool install_interaction_hook() {
-    auto* executable = reinterpret_cast<unsigned char*>(GetModuleHandleW(nullptr));
-    if (!executable) return false;
-
-    g_interaction_hook_target = executable + 0x4BF5F1;
-    const unsigned char expected[15] = {
-        0x0F, 0x29, 0xBD, 0x20, 0xFE, 0xFF, 0xFF,
-        0x44, 0x0F, 0x29, 0x85, 0x10, 0xFE, 0xFF, 0xFF,
+    constexpr const char* patterns[] = {
+        "0F 29 BD 20 FE FF FF 44 0F 29 85 10 FE FF FF",
+        "0F 29 BD ?? FE FF FF 44 0F 29 85 ?? FE FF FF",
     };
-    if (std::memcmp(g_interaction_hook_target, expected, sizeof(expected)) != 0) {
-        g_interaction_hook_target = nullptr;
-        return false;
-    }
+    g_interaction_hook_target = find_hook_target_by_patterns(
+        "interaction-ray hook", 0x4BF5F1, patterns, sizeof(patterns) / sizeof(patterns[0]));
+    if (!g_interaction_hook_target) return false;
+
     std::memcpy(g_interaction_original.data(), g_interaction_hook_target,
                 g_interaction_original.size());
+    int32_t ray_origin_stack_offset = 0;
+    int32_t ray_direction_stack_offset = 0;
+    std::memcpy(&ray_origin_stack_offset, g_interaction_original.data() + 3,
+                sizeof(ray_origin_stack_offset));
+    std::memcpy(&ray_direction_stack_offset, g_interaction_original.data() + 11,
+                sizeof(ray_direction_stack_offset));
 
     auto* code = static_cast<unsigned char*>(g_interaction_hook_memory);
     const bool allocated_code = code == nullptr;
@@ -2954,8 +3096,8 @@ bool install_interaction_hook() {
         unsigned char* p = code;
 
         // Preserve Hytale's two aligned stores before calling the C++ bridge.
-        std::memcpy(p, expected, sizeof(expected));
-        p += sizeof(expected);
+        std::memcpy(p, g_interaction_original.data(), 15);
+        p += 15;
         const unsigned char prefix[] = {
             0x9C, 0x50, 0x51, 0x52, 0x41, 0x50, 0x41, 0x51, 0x41, 0x52, 0x41, 0x53,
             0x48, 0x81, 0xEC, 0x80, 0x00, 0x00, 0x00,
@@ -2965,12 +3107,21 @@ bool install_interaction_hook() {
             0xF3, 0x0F, 0x7F, 0x5C, 0x24, 0x50,
             0xF3, 0x0F, 0x7F, 0x64, 0x24, 0x60,
             0xF3, 0x0F, 0x7F, 0x6C, 0x24, 0x70,
-            0x48, 0x8D, 0x8D, 0x20, 0xFE, 0xFF, 0xFF,
-            0x48, 0x8D, 0x95, 0x10, 0xFE, 0xFF, 0xFF,
-            0x48, 0xB8,
         };
         std::memcpy(p, prefix, sizeof(prefix));
         p += sizeof(prefix);
+        const unsigned char origin_lea[] = {0x48, 0x8D, 0x8D};
+        std::memcpy(p, origin_lea, sizeof(origin_lea));
+        p += sizeof(origin_lea);
+        std::memcpy(p, &ray_origin_stack_offset, sizeof(ray_origin_stack_offset));
+        p += sizeof(ray_origin_stack_offset);
+        const unsigned char direction_lea[] = {0x48, 0x8D, 0x95};
+        std::memcpy(p, direction_lea, sizeof(direction_lea));
+        p += sizeof(direction_lea);
+        std::memcpy(p, &ray_direction_stack_offset, sizeof(ray_direction_stack_offset));
+        p += sizeof(ray_direction_stack_offset);
+        *p++ = 0x48;
+        *p++ = 0xB8;
         emit8(p, reinterpret_cast<uint64_t>(&apply_controller_gameplay_ray));
         const unsigned char suffix[] = {
             0xFF, 0xD0,
@@ -3024,18 +3175,14 @@ bool install_interaction_hook() {
 }
 
 bool install_hook() {
-    auto* executable = reinterpret_cast<unsigned char*>(GetModuleHandleW(nullptr));
-    if (!executable) return false;
-
-    g_hook_target = executable + 0x5EC7F3;
-    const unsigned char expected[16] = {
-        0x0F, 0x28, 0xB4, 0x24, 0x80, 0x03, 0x00, 0x00,
-        0x0F, 0x28, 0xBC, 0x24, 0x70, 0x03, 0x00, 0x00,
+    constexpr const char* patterns[] = {
+        "0F 28 B4 24 80 03 00 00 0F 28 BC 24 70 03 00 00",
+        "0F 28 B4 24 ?? ?? 00 00 0F 28 BC 24 ?? ?? 00 00",
     };
-    if (std::memcmp(g_hook_target, expected, sizeof(expected)) != 0) {
-        g_hook_target = nullptr;
-        return false;
-    }
+    g_hook_target = find_hook_target_by_patterns(
+        "camera hook", 0x5EC7F3, patterns, sizeof(patterns) / sizeof(patterns[0]));
+    if (!g_hook_target) return false;
+
     std::memcpy(g_original.data(), g_hook_target, g_original.size());
 
     auto* code = static_cast<unsigned char*>(g_hook_memory);
@@ -3072,12 +3219,13 @@ bool install_hook() {
             0xF3, 0x0F, 0x6F, 0x6C, 0x24, 0x70,
             0x48, 0x81, 0xC4, 0x80, 0x00, 0x00, 0x00,
             0x41, 0x5B, 0x41, 0x5A, 0x41, 0x59, 0x41, 0x58, 0x5A, 0x59, 0x58, 0x9D,
-            0x0F, 0x28, 0xB4, 0x24, 0x80, 0x03, 0x00, 0x00,
-            0x0F, 0x28, 0xBC, 0x24, 0x70, 0x03, 0x00, 0x00,
-            0x48, 0xB8,
         };
         std::memcpy(p, suffix, sizeof(suffix));
         p += sizeof(suffix);
+        std::memcpy(p, g_original.data(), 16);
+        p += 16;
+        *p++ = 0x48;
+        *p++ = 0xB8;
         emit8(p, reinterpret_cast<uint64_t>(g_hook_target + 16));
         *p++ = 0xFF;
         *p++ = 0xE0;
