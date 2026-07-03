@@ -2268,7 +2268,8 @@ bool inject_vr_camera_hook() {
         MemoryBarrier();
         InterlockedIncrement(
             reinterpret_cast<volatile LONG*>(&g_vr_camera_shared->control_sequence));
-        for (int i = 0; i < 400 && !g_vr_camera_shared->hook_active &&
+        set_status(L"VR hook loaded. Waiting for auto-scan to finish...");
+        for (int i = 0; i < 2000 && !g_vr_camera_shared->hook_active &&
              g_vr_camera_shared->hook_error == 0; ++i) {
             Sleep(5);
         }
@@ -2316,7 +2317,8 @@ bool inject_vr_camera_hook() {
         return false;
     }
 
-    for (int i = 0; i < 200 && !g_vr_camera_shared->hook_active &&
+    set_status(L"VR hook injected. Waiting for auto-scan to finish...");
+    for (int i = 0; i < 2000 && !g_vr_camera_shared->hook_active &&
          g_vr_camera_shared->hook_error == 0; ++i) {
         Sleep(5);
     }
@@ -2334,13 +2336,16 @@ bool inject_vr_camera_hook() {
         case 5:
             set_status(L"2D UI hook unavailable on this version. Camera, stereo and interaction remain active.");
             break;
+        case 6:
+            set_status(L"VR hook worker could not read shared memory. Restart Hytale and the dashboard.");
+            break;
         default:
             set_status(L"Hook restoration failed. Close the dashboard and restart Hytale.");
             break;
         }
     }
     if (!g_vr_camera_shared->hook_active) {
-        set_status(L"VR hook v120 is loaded but did not activate. Close and restart Hytale to clear the old injection.");
+        set_status(L"VR hook worker did not report back. Check %TEMP%\\HytaleVR\\hytale_vr_render_debug.log.");
     }
     const bool active = g_vr_camera_shared->hook_active != 0;
     if (active) focus_hytale_window_and_tap_f7();

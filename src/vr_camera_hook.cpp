@@ -3070,6 +3070,9 @@ void emit8(unsigned char*& cursor, uint64_t value) {
 
 bool install_interaction_hook() {
     constexpr const char* patterns[] = {
+        "0F 29 BD 20 FE FF FF 44 0F 29 85 10 FE FF FF "
+        "48 8D 95 00 FF FF FF 48 89 54 24 20 "
+        "48 8D 95 20 FE FF FF 4C 8D 85 10 FE FF FF 4C 8B CF",
         "0F 29 BD 20 FE FF FF 44 0F 29 85 10 FE FF FF",
         "0F 29 BD ?? FE FF FF 44 0F 29 85 ?? FE FF FF",
     };
@@ -3176,6 +3179,11 @@ bool install_interaction_hook() {
 
 bool install_hook() {
     constexpr const char* patterns[] = {
+        "0F 28 B4 24 80 03 00 00 0F 28 BC 24 70 03 00 00 "
+        "44 0F 28 84 24 60 03 00 00 44 0F 28 8C 24 50 03 00 00 "
+        "44 0F 28 94 24 40 03 00 00 44 0F 28 9C 24 30 03 00 00 "
+        "44 0F 28 A4 24 20 03 00 00 44 0F 28 AC 24 10 03 00 00 "
+        "48 81 C4 90 03 00 00 5B 5D 5E 5F 41 5D 41 5E 41 5F C3",
         "0F 28 B4 24 80 03 00 00 0F 28 BC 24 70 03 00 00",
         "0F 28 B4 24 ?? ?? 00 00 0F 28 BC 24 ?? ?? 00 00",
     };
@@ -3402,6 +3410,7 @@ DWORD WINAPI worker(void*) {
     if (!g_shared || g_shared->magic != kVrCameraMagic ||
         g_shared->version != kVrCameraVersion) {
         render_log("worker abort: shared mapping magic/version mismatch");
+        if (g_shared) g_shared->hook_error = 6;
         return 0;
     }
     render_log("worker mapped shared memory");
