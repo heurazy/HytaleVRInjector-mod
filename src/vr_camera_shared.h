@@ -41,6 +41,10 @@ struct VrCameraControls {
     uint32_t wide_culling_enabled = 1;
     float wide_culling_scale = 0.50f;
     uint32_t hmd_culling_view_enabled = 1;
+    float hand_model_scale = 1.0f;
+    float hand_model_pitch_degrees = -90.0f;
+    float hand_model_yaw_degrees = 0.0f;
+    float hand_model_roll_degrees = 0.0f;
 };
 
 struct VrCameraShared {
@@ -83,6 +87,10 @@ struct VrCameraShared {
     uint32_t wide_culling_enabled = 1;
     float wide_culling_scale = 0.50f;
     uint32_t hmd_culling_view_enabled = 1;
+    float hand_model_scale = 1.0f;
+    float hand_model_pitch_degrees = -90.0f;
+    float hand_model_yaw_degrees = 0.0f;
+    float hand_model_roll_degrees = 0.0f;
 
     volatile uint32_t hook_active = 0;
     volatile int32_t hook_error = 0;

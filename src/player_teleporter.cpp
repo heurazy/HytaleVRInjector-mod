@@ -86,6 +86,10 @@ enum ControlId {
     IDC_VR_FLOOR_TILT,
     IDC_VR_CALIBRATE_FLOOR,
     IDC_VR_HIDE_FIRST_PERSON_HAND,
+    IDC_VR_HAND_MODEL_SCALE,
+    IDC_VR_HAND_MODEL_PITCH,
+    IDC_VR_HAND_MODEL_YAW,
+    IDC_VR_HAND_MODEL_ROLL,
     IDC_VR_ADVANCED_OPTIONS,
     IDC_VR_KEY_FORWARD,
     IDC_VR_KEY_BACKWARD,
@@ -856,7 +860,8 @@ void update_tab_visibility() {
         IDC_VR_STEREO, IDC_VR_DISABLE_FOREGROUND_EFFECTS, IDC_VR_DISABLE_SHADOWS,
         IDC_VR_DISABLE_PARTICLES, IDC_VR_DISABLE_DISTORTION, IDC_VR_QUEST_LOCOMOTION,
         IDC_VR_HIDE_FIRST_PERSON_HAND, IDC_VR_IPD, IDC_VR_SEPARATION,
-        IDC_VR_RENDER_SCALE
+        IDC_VR_RENDER_SCALE, IDC_VR_HAND_MODEL_SCALE, IDC_VR_HAND_MODEL_PITCH,
+        IDC_VR_HAND_MODEL_YAW, IDC_VR_HAND_MODEL_ROLL
     };
     for (int id : col2_ids) ShowWindow(control(id), showTab2);
     
@@ -2417,6 +2422,14 @@ void publish_vr_controls(bool enabled, bool shutdown_requested, bool unload_requ
     g_vr_camera_shared->wide_culling_enabled = 0u;
     g_vr_camera_shared->wide_culling_scale = 0.50f;
     g_vr_camera_shared->hmd_culling_view_enabled = 1u;
+    g_vr_camera_shared->hand_model_scale =
+        std::clamp(get_float(IDC_VR_HAND_MODEL_SCALE, 1.0f), 0.10f, 5.0f);
+    g_vr_camera_shared->hand_model_pitch_degrees =
+        std::clamp(get_float(IDC_VR_HAND_MODEL_PITCH, -90.0f), -180.0f, 180.0f);
+    g_vr_camera_shared->hand_model_yaw_degrees =
+        std::clamp(get_float(IDC_VR_HAND_MODEL_YAW, 0.0f), -180.0f, 180.0f);
+    g_vr_camera_shared->hand_model_roll_degrees =
+        std::clamp(get_float(IDC_VR_HAND_MODEL_ROLL, 0.0f), -180.0f, 180.0f);
     g_vr_camera_shared->swap_eyes =
         IsDlgButtonChecked(g_window, IDC_VR_SWAP_EYES) == BST_CHECKED ? 1u : 0u;
     g_vr_camera_shared->shutdown_requested = shutdown_requested ? 1u : 0u;
@@ -2753,9 +2766,13 @@ void create_ui(HWND window) {
     add(L"BUTTON", L"Disable distortion", BS_AUTOCHECKBOX, 405, 400, 175, 20, IDC_VR_DISABLE_DISTORTION);
     add(L"BUTTON", L"Quest stick", BS_AUTOCHECKBOX, 405, 424, 175, 20, IDC_VR_QUEST_LOCOMOTION);
     add(L"BUTTON", L"Hide 1P Hand", BS_AUTOCHECKBOX, 405, 448, 175, 20, IDC_VR_HIDE_FIRST_PERSON_HAND);
-    add(L"EDIT", L"64.0", WS_BORDER | ES_AUTOHSCROLL, 515, 500, 65, 24, IDC_VR_IPD);
-    add(L"EDIT", L"100", WS_BORDER | ES_AUTOHSCROLL, 515, 528, 65, 24, IDC_VR_SEPARATION);
-    add(L"EDIT", L"100", WS_BORDER | ES_AUTOHSCROLL, 515, 556, 65, 24, IDC_VR_RENDER_SCALE);
+    add(L"EDIT", L"64.0", WS_BORDER | ES_AUTOHSCROLL, 515, 496, 65, 24, IDC_VR_IPD);
+    add(L"EDIT", L"100", WS_BORDER | ES_AUTOHSCROLL, 515, 522, 65, 24, IDC_VR_SEPARATION);
+    add(L"EDIT", L"100", WS_BORDER | ES_AUTOHSCROLL, 515, 548, 65, 24, IDC_VR_RENDER_SCALE);
+    add(L"EDIT", L"1.00", WS_BORDER | ES_AUTOHSCROLL, 405, 596, 78, 24, IDC_VR_HAND_MODEL_SCALE);
+    add(L"EDIT", L"-90", WS_BORDER | ES_AUTOHSCROLL, 502, 596, 78, 24, IDC_VR_HAND_MODEL_PITCH);
+    add(L"EDIT", L"0", WS_BORDER | ES_AUTOHSCROLL, 405, 648, 78, 24, IDC_VR_HAND_MODEL_YAW);
+    add(L"EDIT", L"0", WS_BORDER | ES_AUTOHSCROLL, 502, 648, 78, 24, IDC_VR_HAND_MODEL_ROLL);
 
     // Column 3 inputs
     add(L"EDIT", L"Auto", WS_BORDER | ES_AUTOHSCROLL, 685, 328, 75, 24, IDC_VR_KEY_FORWARD);
@@ -3010,6 +3027,10 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
                     g.DrawString(L"IPD mm", -1, &labelFont, Gdiplus::PointF(405.0f, 504.0f), &labelBrush);
                     g.DrawString(L"Separation %", -1, &labelFont, Gdiplus::PointF(405.0f, 532.0f), &labelBrush);
                     g.DrawString(L"VR Resolution", -1, &labelFont, Gdiplus::PointF(405.0f, 560.0f), &labelBrush);
+                    g.DrawString(L"Hand scale", -1, &labelFont, Gdiplus::PointF(405.0f, 580.0f), &labelBrush);
+                    g.DrawString(L"Pitch", -1, &labelFont, Gdiplus::PointF(502.0f, 580.0f), &labelBrush);
+                    g.DrawString(L"Yaw", -1, &labelFont, Gdiplus::PointF(405.0f, 632.0f), &labelBrush);
+                    g.DrawString(L"Roll", -1, &labelFont, Gdiplus::PointF(502.0f, 632.0f), &labelBrush);
                     g.DrawString(L"Custom Keys", -1, &labelFont, Gdiplus::PointF(605.0f, 308.0f), &labelBrush);
                     g.DrawString(L"Forward", -1, &labelFont, Gdiplus::PointF(605.0f, 332.0f), &labelBrush);
                     g.DrawString(L"Backward", -1, &labelFont, Gdiplus::PointF(605.0f, 358.0f), &labelBrush);

@@ -1,11 +1,16 @@
 #include <windows.h>
 #include <tlhelp32.h>
+#include <objidl.h>
+#include <gdiplus.h>
 #include <GL/gl.h>
 #include <openvr.h>
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <cmath>
+#include <cstddef>
+#include <cstdlib>
 #include <cstdint>
 #include <cstring>
 #include <fstream>
@@ -77,6 +82,12 @@ HANDLE g_ui_scale_mapping = nullptr;
 UiScaleShared* g_ui_scale_shared = nullptr;
 bool menu_visible_recently();
 bool controller_hand_ndc_for_eye(vr::EVREye eye, float& ndc_x, float& ndc_y, float& depth);
+bool project_tracking_point_to_eye_ndc(int eye, const float hmd[12],
+                                       const float absolute[3],
+                                       float& ndc_x, float& ndc_y,
+                                       float& depth);
+void clear_scissor_rect(int x, int y, int width, int height,
+                        int target_width, int target_height);
 void* g_hook_memory = nullptr;
 unsigned char* g_hook_target = nullptr;
 std::array<unsigned char, 16> g_original{};
@@ -94,6 +105,30 @@ using GlFramebufferTexture2DFn = void(APIENTRY*)(GLenum, GLenum, GLenum, GLuint,
 using GlBlitFramebufferFn = void(APIENTRY*)(GLint, GLint, GLint, GLint, GLint, GLint, GLint, GLint,
                                              GLbitfield, GLenum);
 using GlCheckFramebufferStatusFn = GLenum(APIENTRY*)(GLenum);
+using GlCreateShaderFn = GLuint(APIENTRY*)(GLenum);
+using GlShaderSourceFn = void(APIENTRY*)(GLuint, GLsizei, const char* const*, const GLint*);
+using GlCompileShaderFn = void(APIENTRY*)(GLuint);
+using GlGetShaderivFn = void(APIENTRY*)(GLuint, GLenum, GLint*);
+using GlGetShaderInfoLogFn = void(APIENTRY*)(GLuint, GLsizei, GLsizei*, char*);
+using GlCreateProgramFn = GLuint(APIENTRY*)();
+using GlAttachShaderFn = void(APIENTRY*)(GLuint, GLuint);
+using GlBindAttribLocationFn = void(APIENTRY*)(GLuint, GLuint, const char*);
+using GlLinkProgramFn = void(APIENTRY*)(GLuint);
+using GlGetProgramivFn = void(APIENTRY*)(GLuint, GLenum, GLint*);
+using GlGetProgramInfoLogFn = void(APIENTRY*)(GLuint, GLsizei, GLsizei*, char*);
+using GlDeleteShaderFn = void(APIENTRY*)(GLuint);
+using GlUseProgramFn = void(APIENTRY*)(GLuint);
+using GlGetUniformLocationFn = GLint(APIENTRY*)(GLuint, const char*);
+using GlUniform1iFn = void(APIENTRY*)(GLint, GLint);
+using GlGenVertexArraysFn = void(APIENTRY*)(GLsizei, GLuint*);
+using GlBindVertexArrayFn = void(APIENTRY*)(GLuint);
+using GlGenBuffersFn = void(APIENTRY*)(GLsizei, GLuint*);
+using GlBindBufferFn = void(APIENTRY*)(GLenum, GLuint);
+using GlBufferDataFn = void(APIENTRY*)(GLenum, ptrdiff_t, const void*, GLenum);
+using GlEnableVertexAttribArrayFn = void(APIENTRY*)(GLuint);
+using GlVertexAttribPointerFn = void(APIENTRY*)(GLuint, GLint, GLenum, GLboolean, GLsizei,
+                                                const void*);
+using GlActiveTextureFn = void(APIENTRY*)(GLenum);
 SdlGlSwapWindowFn g_swap_trampoline = nullptr;
 SdlGetWindowSizeFn g_sdl_get_window_size_in_pixels = nullptr;
 unsigned char* g_swap_target = nullptr;
@@ -128,9 +163,11 @@ SRWLOCK g_pose_lock = SRWLOCK_INIT;
 Matrix4 g_hmd_view_delta = identity_matrix();
 float g_hmd_origin_pose[12]{};
 float g_hmd_current_pose[12]{};
+float g_left_controller_pose[12]{};
 float g_right_controller_pose[12]{};
 bool g_hmd_origin_valid = false;
 bool g_hmd_current_valid = false;
+bool g_left_controller_valid = false;
 bool g_right_controller_valid = false;
 uint32_t g_recenter_sequence = 0;
 bool g_runtime_active = false;
@@ -153,6 +190,29 @@ GlBindFramebufferFn g_gl_bind_framebuffer = nullptr;
 GlFramebufferTexture2DFn g_gl_framebuffer_texture_2d = nullptr;
 GlBlitFramebufferFn g_gl_blit_framebuffer = nullptr;
 GlCheckFramebufferStatusFn g_gl_check_framebuffer_status = nullptr;
+GlCreateShaderFn g_gl_create_shader = nullptr;
+GlShaderSourceFn g_gl_shader_source = nullptr;
+GlCompileShaderFn g_gl_compile_shader = nullptr;
+GlGetShaderivFn g_gl_get_shader_iv = nullptr;
+GlGetShaderInfoLogFn g_gl_get_shader_info_log = nullptr;
+GlCreateProgramFn g_gl_create_program = nullptr;
+GlAttachShaderFn g_gl_attach_shader = nullptr;
+GlBindAttribLocationFn g_gl_bind_attrib_location = nullptr;
+GlLinkProgramFn g_gl_link_program = nullptr;
+GlGetProgramivFn g_gl_get_program_iv = nullptr;
+GlGetProgramInfoLogFn g_gl_get_program_info_log = nullptr;
+GlDeleteShaderFn g_gl_delete_shader = nullptr;
+GlUseProgramFn g_gl_use_program = nullptr;
+GlGetUniformLocationFn g_gl_get_uniform_location = nullptr;
+GlUniform1iFn g_gl_uniform_1i = nullptr;
+GlGenVertexArraysFn g_gl_gen_vertex_arrays = nullptr;
+GlBindVertexArrayFn g_gl_bind_vertex_array = nullptr;
+GlGenBuffersFn g_gl_gen_buffers = nullptr;
+GlBindBufferFn g_gl_bind_buffer = nullptr;
+GlBufferDataFn g_gl_buffer_data = nullptr;
+GlEnableVertexAttribArrayFn g_gl_enable_vertex_attrib_array = nullptr;
+GlVertexAttribPointerFn g_gl_vertex_attrib_pointer = nullptr;
+GlActiveTextureFn g_gl_active_texture = nullptr;
 void* g_primary_camera = nullptr;
 ULONGLONG g_last_primary_camera_tick = 0;
 SRWLOCK g_camera_lock = SRWLOCK_INIT;
@@ -179,6 +239,7 @@ vr::VRActionHandle_t g_action_move = vr::k_ulInvalidActionHandle;
 vr::VRActionHandle_t g_action_turn = vr::k_ulInvalidActionHandle;
 vr::VRActionHandle_t g_action_jump = vr::k_ulInvalidActionHandle;
 vr::VRActionHandle_t g_action_sprint = vr::k_ulInvalidActionHandle;
+vr::VRActionHandle_t g_action_left_pose = vr::k_ulInvalidActionHandle;
 vr::VRActionHandle_t g_action_right_pose = vr::k_ulInvalidActionHandle;
 vr::VRActionHandle_t g_action_right_trigger = vr::k_ulInvalidActionHandle;
 vr::VRActionHandle_t g_action_left_trigger = vr::k_ulInvalidActionHandle;
@@ -207,6 +268,19 @@ constexpr GLenum GL_FRAMEBUFFER_COMPLETE_VALUE = 0x8CD5;
 constexpr GLenum GL_CLAMP_TO_EDGE_VALUE = 0x812F;
 constexpr GLenum GL_SAMPLES_VALUE = 0x80A9;
 constexpr GLenum GL_VIEWPORT_VALUE = 0x0BA2;
+constexpr GLenum GL_VERTEX_SHADER_VALUE = 0x8B31;
+constexpr GLenum GL_FRAGMENT_SHADER_VALUE = 0x8B30;
+constexpr GLenum GL_COMPILE_STATUS_VALUE = 0x8B81;
+constexpr GLenum GL_LINK_STATUS_VALUE = 0x8B82;
+constexpr GLenum GL_INFO_LOG_LENGTH_VALUE = 0x8B84;
+constexpr GLenum GL_CURRENT_PROGRAM_VALUE = 0x8B8D;
+constexpr GLenum GL_ARRAY_BUFFER_VALUE = 0x8892;
+constexpr GLenum GL_ARRAY_BUFFER_BINDING_VALUE = 0x8894;
+constexpr GLenum GL_VERTEX_ARRAY_BINDING_VALUE = 0x85B5;
+constexpr GLenum GL_DYNAMIC_DRAW_VALUE = 0x88E8;
+constexpr GLenum GL_ACTIVE_TEXTURE_VALUE = 0x84E0;
+constexpr GLenum GL_TEXTURE0_VALUE = 0x84C0;
+constexpr GLenum GL_UNPACK_ALIGNMENT_VALUE = 0x0CF5;
 
 bool render_logging_enabled() {
     static int enabled = -1;
@@ -253,6 +327,1049 @@ float matrix_max_delta(const Matrix4& a, const Matrix4& b) {
         result = std::max(result, std::fabs(a.value[i] - b.value[i]));
     }
     return result;
+}
+
+struct Vec3 {
+    float x = 0.0f;
+    float y = 0.0f;
+    float z = 0.0f;
+};
+
+struct HandVertex {
+    Vec3 position{};
+    Vec3 normal{};
+    float u = 0.5f;
+    float v = 0.5f;
+};
+
+std::vector<HandVertex> g_hand_vertices;
+bool g_hand_model_loaded = false;
+bool g_hand_model_attempted = false;
+std::vector<uint32_t> g_hand_texture_pixels;
+uint32_t g_hand_texture_width = 0;
+uint32_t g_hand_texture_height = 0;
+bool g_hand_texture_loaded = false;
+bool g_hand_texture_attempted = false;
+ULONG_PTR g_hand_gdiplus_token = 0;
+GLuint g_hand_texture_gl = 0;
+GLuint g_hand_program = 0;
+GLuint g_hand_vao = 0;
+GLuint g_hand_vbo = 0;
+GLint g_hand_texture_uniform = -1;
+bool g_hand_gl_attempted = false;
+bool g_hand_gl_ready = false;
+
+std::wstring module_directory() {
+    wchar_t path[MAX_PATH]{};
+    GetModuleFileNameW(g_module, path, MAX_PATH);
+    wchar_t* slash = wcsrchr(path, L'\\');
+    if (slash) slash[1] = L'\0';
+    return path;
+}
+
+bool ensure_hand_gdiplus() {
+    if (g_hand_gdiplus_token != 0) return true;
+    Gdiplus::GdiplusStartupInput input{};
+    return Gdiplus::GdiplusStartup(&g_hand_gdiplus_token, &input, nullptr) == Gdiplus::Ok;
+}
+
+struct PngImage {
+    uint32_t width = 0;
+    uint32_t height = 0;
+    std::vector<uint32_t> pixels;
+};
+
+struct CachedAvatarPart {
+    std::string id;
+    std::string variant;
+};
+
+struct AvatarPartTexture {
+    std::string model;
+    std::string texture;
+    std::string gradient_set;
+    std::string gradient_variant;
+    bool greyscale = false;
+};
+
+std::wstring widen_asset_path(std::string path) {
+    for (char& ch : path) {
+        if (ch == '/') ch = '\\';
+    }
+    return std::wstring(path.begin(), path.end());
+}
+
+std::wstring character_creator_asset_path(const std::string& relative_path) {
+    return module_directory() + L"assets\\character_creator\\" + widen_asset_path(relative_path);
+}
+
+bool read_text_file(const std::wstring& path, std::string& out) {
+    std::ifstream file(path, std::ios::binary);
+    if (!file.is_open()) return false;
+    std::ostringstream buffer;
+    buffer << file.rdbuf();
+    out = buffer.str();
+    return true;
+}
+
+std::string extract_json_string_value(const std::string& text, const std::string& key) {
+    const std::string quoted_key = "\"" + key + "\"";
+    size_t pos = text.find(quoted_key);
+    if (pos == std::string::npos) return {};
+    pos = text.find(':', pos + quoted_key.size());
+    if (pos == std::string::npos) return {};
+    ++pos;
+    while (pos < text.size() && std::isspace(static_cast<unsigned char>(text[pos]))) ++pos;
+    if (pos >= text.size() || text[pos] == 'n') return {};
+    if (text[pos] != '"') return {};
+    ++pos;
+    std::string value;
+    bool escape = false;
+    for (; pos < text.size(); ++pos) {
+        const char ch = text[pos];
+        if (escape) {
+            value.push_back(ch);
+            escape = false;
+        } else if (ch == '\\') {
+            escape = true;
+        } else if (ch == '"') {
+            break;
+        } else {
+            value.push_back(ch);
+        }
+    }
+    return value;
+}
+
+CachedAvatarPart split_cached_avatar_part(const std::string& value) {
+    CachedAvatarPart part{};
+    if (value.empty()) return part;
+    const size_t dot = value.rfind('.');
+    if (dot == std::string::npos) {
+        part.id = value;
+    } else {
+        part.id = value.substr(0, dot);
+        part.variant = value.substr(dot + 1);
+    }
+    return part;
+}
+
+std::string find_top_level_json_object_by_id(const std::string& catalog, const std::string& id) {
+    bool in_string = false;
+    bool escape = false;
+    int depth = 0;
+    size_t object_start = std::string::npos;
+    for (size_t i = 0; i < catalog.size(); ++i) {
+        const char ch = catalog[i];
+        if (in_string) {
+            if (escape) {
+                escape = false;
+            } else if (ch == '\\') {
+                escape = true;
+            } else if (ch == '"') {
+                in_string = false;
+            }
+            continue;
+        }
+        if (ch == '"') {
+            in_string = true;
+        } else if (ch == '{') {
+            if (depth == 0) object_start = i;
+            ++depth;
+        } else if (ch == '}') {
+            --depth;
+            if (depth == 0 && object_start != std::string::npos) {
+                const std::string object = catalog.substr(object_start, i - object_start + 1);
+                if (extract_json_string_value(object, "Id") == id) return object;
+                object_start = std::string::npos;
+            }
+        }
+    }
+    return {};
+}
+
+std::string find_nested_json_object(const std::string& text, const std::string& key) {
+    const std::string quoted_key = "\"" + key + "\"";
+    size_t pos = text.find(quoted_key);
+    if (pos == std::string::npos) return {};
+    pos = text.find('{', pos + quoted_key.size());
+    if (pos == std::string::npos) return {};
+    bool in_string = false;
+    bool escape = false;
+    int depth = 0;
+    for (size_t i = pos; i < text.size(); ++i) {
+        const char ch = text[i];
+        if (in_string) {
+            if (escape) {
+                escape = false;
+            } else if (ch == '\\') {
+                escape = true;
+            } else if (ch == '"') {
+                in_string = false;
+            }
+            continue;
+        }
+        if (ch == '"') {
+            in_string = true;
+        } else if (ch == '{') {
+            ++depth;
+        } else if (ch == '}') {
+            --depth;
+            if (depth == 0) return text.substr(pos, i - pos + 1);
+        }
+    }
+    return {};
+}
+
+float extract_json_number_value(const std::string& text, const std::string& key,
+                                float fallback = 0.0f) {
+    const std::string quoted_key = "\"" + key + "\"";
+    size_t pos = text.find(quoted_key);
+    if (pos == std::string::npos) return fallback;
+    pos = text.find(':', pos + quoted_key.size());
+    if (pos == std::string::npos) return fallback;
+    ++pos;
+    while (pos < text.size() && std::isspace(static_cast<unsigned char>(text[pos]))) ++pos;
+    char* end = nullptr;
+    const float value = std::strtof(text.c_str() + pos, &end);
+    return end == text.c_str() + pos ? fallback : value;
+}
+
+bool extract_json_bool_value(const std::string& text, const std::string& key,
+                             bool fallback = false) {
+    const std::string quoted_key = "\"" + key + "\"";
+    size_t pos = text.find(quoted_key);
+    if (pos == std::string::npos) return fallback;
+    pos = text.find(':', pos + quoted_key.size());
+    if (pos == std::string::npos) return fallback;
+    ++pos;
+    while (pos < text.size() && std::isspace(static_cast<unsigned char>(text[pos]))) ++pos;
+    if (text.compare(pos, 4, "true") == 0) return true;
+    if (text.compare(pos, 5, "false") == 0) return false;
+    return fallback;
+}
+
+std::string json_object_around(const std::string& text, size_t position) {
+    bool in_string = false;
+    bool escape = false;
+    std::vector<size_t> stack;
+    size_t best_start = std::string::npos;
+    size_t best_end = std::string::npos;
+    for (size_t i = 0; i < text.size(); ++i) {
+        const char ch = text[i];
+        if (in_string) {
+            if (escape) {
+                escape = false;
+            } else if (ch == '\\') {
+                escape = true;
+            } else if (ch == '"') {
+                in_string = false;
+            }
+            continue;
+        }
+        if (ch == '"') {
+            in_string = true;
+        } else if (ch == '{') {
+            stack.push_back(i);
+        } else if (ch == '}') {
+            if (!stack.empty()) {
+                const size_t start = stack.back();
+                stack.pop_back();
+                if (position >= start && position <= i &&
+                    (best_start == std::string::npos || start > best_start)) {
+                    best_start = start;
+                    best_end = i;
+                }
+            }
+        }
+    }
+    if (best_start != std::string::npos && best_end >= best_start) {
+        return text.substr(best_start, best_end - best_start + 1);
+    }
+    return {};
+}
+
+std::string first_texture_from_textures_object(const std::string& object) {
+    const size_t textures_pos = object.find("\"Textures\"");
+    if (textures_pos == std::string::npos) return {};
+    const size_t texture_pos = object.find("\"Texture\"", textures_pos);
+    if (texture_pos == std::string::npos) return {};
+    return extract_json_string_value(object.substr(texture_pos), "Texture");
+}
+
+std::string texture_from_textures_object(const std::string& object,
+                                         const std::string& variant) {
+    if (!variant.empty()) {
+        const std::string variant_object = find_nested_json_object(object, variant);
+        const std::string texture = extract_json_string_value(variant_object, "Texture");
+        if (!texture.empty()) return texture;
+    }
+    return first_texture_from_textures_object(object);
+}
+
+bool load_png_image(const std::wstring& path, PngImage& image) {
+    if (!ensure_hand_gdiplus()) return false;
+    Gdiplus::Bitmap bitmap(path.c_str());
+    if (bitmap.GetLastStatus() != Gdiplus::Ok || bitmap.GetWidth() == 0 ||
+        bitmap.GetHeight() == 0) {
+        return false;
+    }
+    image.width = bitmap.GetWidth();
+    image.height = bitmap.GetHeight();
+    image.pixels.assign(static_cast<size_t>(image.width) * image.height, 0);
+    for (uint32_t y = 0; y < image.height; ++y) {
+        for (uint32_t x = 0; x < image.width; ++x) {
+            Gdiplus::Color color{};
+            bitmap.GetPixel(static_cast<INT>(x), static_cast<INT>(y), &color);
+            image.pixels[static_cast<size_t>(y) * image.width + x] =
+                (static_cast<uint32_t>(color.GetAlpha()) << 24) |
+                (static_cast<uint32_t>(color.GetRed()) << 16) |
+                (static_cast<uint32_t>(color.GetGreen()) << 8) |
+                static_cast<uint32_t>(color.GetBlue());
+        }
+    }
+    return true;
+}
+
+uint32_t apply_gradient_pixel(uint32_t greyscale_pixel, const PngImage& gradient) {
+    const uint32_t alpha = (greyscale_pixel >> 24) & 0xff;
+    const uint32_t red = (greyscale_pixel >> 16) & 0xff;
+    const uint32_t green = (greyscale_pixel >> 8) & 0xff;
+    const uint32_t blue = greyscale_pixel & 0xff;
+    const uint32_t grey = (red + green + blue) / 3;
+    if (gradient.pixels.empty() || gradient.width == 0 || gradient.height == 0) {
+        return greyscale_pixel;
+    }
+    const uint32_t x = std::min<uint32_t>(
+        gradient.width - 1,
+        static_cast<uint32_t>((static_cast<float>(grey) / 255.0f) *
+                              static_cast<float>(gradient.width - 1)));
+    const uint32_t y = gradient.height / 2;
+    const uint32_t mapped = gradient.pixels[static_cast<size_t>(y) * gradient.width + x];
+    return (alpha << 24) | (mapped & 0x00ffffffu);
+}
+
+PngImage colorize_greyscale_image(const PngImage& greyscale, const PngImage& gradient) {
+    PngImage result{};
+    result.width = greyscale.width;
+    result.height = greyscale.height;
+    result.pixels.resize(greyscale.pixels.size());
+    for (size_t i = 0; i < greyscale.pixels.size(); ++i) {
+        result.pixels[i] = apply_gradient_pixel(greyscale.pixels[i], gradient);
+    }
+    return result;
+}
+
+void alpha_composite_same_size(PngImage& destination, const PngImage& source) {
+    if (destination.width != source.width || destination.height != source.height ||
+        destination.pixels.empty() || source.pixels.empty()) {
+        return;
+    }
+    for (size_t i = 0; i < destination.pixels.size(); ++i) {
+        const uint32_t src = source.pixels[i];
+        const uint32_t alpha = (src >> 24) & 0xff;
+        if (alpha == 0) continue;
+        if (alpha == 255) {
+            destination.pixels[i] = 0xff000000u | (src & 0x00ffffffu);
+            continue;
+        }
+        const uint32_t dst = destination.pixels[i];
+        const uint32_t sr = (src >> 16) & 0xff;
+        const uint32_t sg = (src >> 8) & 0xff;
+        const uint32_t sb = src & 0xff;
+        const uint32_t dr = (dst >> 16) & 0xff;
+        const uint32_t dg = (dst >> 8) & 0xff;
+        const uint32_t db = dst & 0xff;
+        const uint32_t inv = 255 - alpha;
+        const uint32_t out_r = (sr * alpha + dr * inv) / 255;
+        const uint32_t out_g = (sg * alpha + dg * inv) / 255;
+        const uint32_t out_b = (sb * alpha + db * inv) / 255;
+        destination.pixels[i] = 0xff000000u | (out_r << 16) | (out_g << 8) | out_b;
+    }
+}
+
+std::wstring latest_cached_player_skin_path() {
+    wchar_t appdata[MAX_PATH]{};
+    if (GetEnvironmentVariableW(L"APPDATA", appdata, MAX_PATH) == 0) return {};
+    const std::wstring pattern =
+        std::wstring(appdata) + L"\\Hytale\\UserData\\CachedPlayerSkins\\*.json";
+    WIN32_FIND_DATAW data{};
+    HANDLE find = FindFirstFileW(pattern.c_str(), &data);
+    if (find == INVALID_HANDLE_VALUE) return {};
+    std::wstring best;
+    FILETIME best_time{};
+    do {
+        if ((data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0) continue;
+        if (best.empty() || CompareFileTime(&data.ftLastWriteTime, &best_time) > 0) {
+            best_time = data.ftLastWriteTime;
+            const std::wstring directory = pattern.substr(0, pattern.rfind(L'\\') + 1);
+            best = directory + data.cFileName;
+        }
+    } while (FindNextFileW(find, &data));
+    FindClose(find);
+    return best;
+}
+
+std::string catalog_file_for_part(const char* category) {
+    return std::string("CharacterCreator\\") + category + ".json";
+}
+
+bool resolve_avatar_part_texture(const char* category, const std::string& cached_value,
+                                 AvatarPartTexture& out) {
+    const CachedAvatarPart part = split_cached_avatar_part(cached_value);
+    if (part.id.empty()) return false;
+    std::string catalog;
+    if (!read_text_file(character_creator_asset_path(catalog_file_for_part(category)), catalog)) {
+        return false;
+    }
+    const std::string object = find_top_level_json_object_by_id(catalog, part.id);
+    if (object.empty()) return false;
+    out.model = extract_json_string_value(object, "Model");
+    const std::string greyscale = extract_json_string_value(object, "GreyscaleTexture");
+    if (!greyscale.empty()) {
+        out.texture = greyscale;
+        out.gradient_set = extract_json_string_value(object, "GradientSet");
+        out.gradient_variant = part.variant;
+        out.greyscale = true;
+        return true;
+    }
+    const std::string full_color = texture_from_textures_object(object, part.variant);
+    if (!full_color.empty()) {
+        out.texture = full_color;
+        out.gradient_variant = part.variant;
+        out.greyscale = false;
+        return true;
+    }
+    return false;
+}
+
+bool gradient_texture_for_part(const AvatarPartTexture& part, std::string& out_texture) {
+    if (part.gradient_set.empty() || part.gradient_variant.empty()) return false;
+    std::string gradients;
+    if (!read_text_file(character_creator_asset_path("CharacterCreator\\GradientSets.json"),
+                        gradients)) {
+        return false;
+    }
+    const std::string set_object =
+        find_top_level_json_object_by_id(gradients, part.gradient_set);
+    const std::string variant_object =
+        find_nested_json_object(set_object, part.gradient_variant);
+    out_texture = extract_json_string_value(variant_object, "Texture");
+    return !out_texture.empty();
+}
+
+bool load_avatar_part_image(const AvatarPartTexture& part, PngImage& image) {
+    PngImage source{};
+    if (!load_png_image(character_creator_asset_path(part.texture), source)) return false;
+    if (!part.greyscale) {
+        image = std::move(source);
+        return true;
+    }
+    std::string gradient_texture;
+    if (!gradient_texture_for_part(part, gradient_texture)) {
+        image = std::move(source);
+        return true;
+    }
+    PngImage gradient{};
+    if (!load_png_image(character_creator_asset_path(gradient_texture), gradient)) {
+        image = std::move(source);
+        return true;
+    }
+    image = colorize_greyscale_image(source, gradient);
+    return true;
+}
+
+bool build_user_avatar_hand_texture(PngImage& result) {
+    const std::wstring cache_path = latest_cached_player_skin_path();
+    if (cache_path.empty()) return false;
+    std::string cached_skin;
+    if (!read_text_file(cache_path, cached_skin)) return false;
+
+    AvatarPartTexture body_part{};
+    const std::string body = extract_json_string_value(cached_skin, "bodyCharacteristic");
+    if (!resolve_avatar_part_texture("BodyCharacteristics", body, body_part)) return false;
+    if (!load_avatar_part_image(body_part, result)) return false;
+
+    std::ostringstream out;
+    out << "hand texture: built from cached avatar " << result.width << "x" << result.height;
+    render_log(out.str());
+    return result.width > 0 && result.height > 0 && !result.pixels.empty();
+}
+
+bool load_hand_texture() {
+    if (g_hand_texture_attempted) return g_hand_texture_loaded;
+    g_hand_texture_attempted = true;
+    if (!ensure_hand_gdiplus()) {
+        render_log("hand texture: GDI+ startup failed");
+        return false;
+    }
+
+    PngImage texture{};
+    if (!build_user_avatar_hand_texture(texture)) {
+        const std::wstring path = module_directory() + L"assets\\vr_hands\\Player_Greyscale.png";
+        if (!load_png_image(path, texture)) {
+            render_log("hand texture: Player_Greyscale.png not found or invalid");
+            return false;
+        }
+        render_log("hand texture: using fallback Player_Greyscale.png");
+    }
+
+    g_hand_texture_width = texture.width;
+    g_hand_texture_height = texture.height;
+    g_hand_texture_pixels.resize(texture.pixels.size());
+    for (size_t i = 0; i < texture.pixels.size(); ++i) {
+        g_hand_texture_pixels[i] = texture.pixels[i] & 0x00ffffffu;
+    }
+    g_hand_texture_loaded = true;
+    std::ostringstream out;
+    out << "hand texture: loaded " << g_hand_texture_width << "x" << g_hand_texture_height;
+    render_log(out.str());
+    return true;
+}
+
+void sample_hand_texture(float u, float v, float shade,
+                         float& red, float& green, float& blue) {
+    if (!g_hand_texture_loaded || g_hand_texture_pixels.empty() ||
+        g_hand_texture_width == 0 || g_hand_texture_height == 0) {
+        red = 0.84f * shade;
+        green = 0.84f * shade;
+        blue = 0.80f * shade;
+        return;
+    }
+
+    u = u - std::floor(u);
+    v = v - std::floor(v);
+    const uint32_t x = std::min<uint32_t>(
+        g_hand_texture_width - 1,
+        static_cast<uint32_t>(u * static_cast<float>(g_hand_texture_width - 1)));
+    const uint32_t y = std::min<uint32_t>(
+        g_hand_texture_height - 1,
+        static_cast<uint32_t>((1.0f - v) * static_cast<float>(g_hand_texture_height - 1)));
+    const uint32_t pixel = g_hand_texture_pixels[static_cast<size_t>(y) * g_hand_texture_width + x];
+    red = static_cast<float>((pixel >> 16) & 0xff) / 255.0f * shade;
+    green = static_cast<float>((pixel >> 8) & 0xff) / 255.0f * shade;
+    blue = static_cast<float>(pixel & 0xff) / 255.0f * shade;
+}
+
+template <typename T>
+T load_gl_proc(const char* name) {
+    PROC proc = wglGetProcAddress(name);
+    if (!proc || proc == reinterpret_cast<PROC>(1) ||
+        proc == reinterpret_cast<PROC>(2) ||
+        proc == reinterpret_cast<PROC>(3) ||
+        proc == reinterpret_cast<PROC>(-1)) {
+        HMODULE opengl = GetModuleHandleA("opengl32.dll");
+        if (opengl) proc = GetProcAddress(opengl, name);
+    }
+    return reinterpret_cast<T>(proc);
+}
+
+bool load_hand_gl_functions() {
+    if (g_gl_create_shader) return true;
+    g_gl_create_shader = load_gl_proc<GlCreateShaderFn>("glCreateShader");
+    g_gl_shader_source = load_gl_proc<GlShaderSourceFn>("glShaderSource");
+    g_gl_compile_shader = load_gl_proc<GlCompileShaderFn>("glCompileShader");
+    g_gl_get_shader_iv = load_gl_proc<GlGetShaderivFn>("glGetShaderiv");
+    g_gl_get_shader_info_log = load_gl_proc<GlGetShaderInfoLogFn>("glGetShaderInfoLog");
+    g_gl_create_program = load_gl_proc<GlCreateProgramFn>("glCreateProgram");
+    g_gl_attach_shader = load_gl_proc<GlAttachShaderFn>("glAttachShader");
+    g_gl_bind_attrib_location = load_gl_proc<GlBindAttribLocationFn>("glBindAttribLocation");
+    g_gl_link_program = load_gl_proc<GlLinkProgramFn>("glLinkProgram");
+    g_gl_get_program_iv = load_gl_proc<GlGetProgramivFn>("glGetProgramiv");
+    g_gl_get_program_info_log = load_gl_proc<GlGetProgramInfoLogFn>("glGetProgramInfoLog");
+    g_gl_delete_shader = load_gl_proc<GlDeleteShaderFn>("glDeleteShader");
+    g_gl_use_program = load_gl_proc<GlUseProgramFn>("glUseProgram");
+    g_gl_get_uniform_location = load_gl_proc<GlGetUniformLocationFn>("glGetUniformLocation");
+    g_gl_uniform_1i = load_gl_proc<GlUniform1iFn>("glUniform1i");
+    g_gl_gen_vertex_arrays = load_gl_proc<GlGenVertexArraysFn>("glGenVertexArrays");
+    g_gl_bind_vertex_array = load_gl_proc<GlBindVertexArrayFn>("glBindVertexArray");
+    g_gl_gen_buffers = load_gl_proc<GlGenBuffersFn>("glGenBuffers");
+    g_gl_bind_buffer = load_gl_proc<GlBindBufferFn>("glBindBuffer");
+    g_gl_buffer_data = load_gl_proc<GlBufferDataFn>("glBufferData");
+    g_gl_enable_vertex_attrib_array =
+        load_gl_proc<GlEnableVertexAttribArrayFn>("glEnableVertexAttribArray");
+    g_gl_vertex_attrib_pointer =
+        load_gl_proc<GlVertexAttribPointerFn>("glVertexAttribPointer");
+    g_gl_active_texture = load_gl_proc<GlActiveTextureFn>("glActiveTexture");
+
+    return g_gl_create_shader && g_gl_shader_source && g_gl_compile_shader &&
+        g_gl_get_shader_iv && g_gl_create_program && g_gl_attach_shader &&
+        g_gl_bind_attrib_location && g_gl_link_program && g_gl_get_program_iv &&
+        g_gl_delete_shader && g_gl_use_program && g_gl_get_uniform_location &&
+        g_gl_uniform_1i && g_gl_gen_vertex_arrays && g_gl_bind_vertex_array &&
+        g_gl_gen_buffers && g_gl_bind_buffer && g_gl_buffer_data &&
+        g_gl_enable_vertex_attrib_array && g_gl_vertex_attrib_pointer &&
+        g_gl_active_texture;
+}
+
+GLuint compile_hand_shader(GLenum type, const char* source, const char* name) {
+    GLuint shader = g_gl_create_shader(type);
+    g_gl_shader_source(shader, 1, &source, nullptr);
+    g_gl_compile_shader(shader);
+    GLint ok = 0;
+    g_gl_get_shader_iv(shader, GL_COMPILE_STATUS_VALUE, &ok);
+    if (!ok) {
+        GLint length = 0;
+        if (g_gl_get_shader_iv) g_gl_get_shader_iv(shader, GL_INFO_LOG_LENGTH_VALUE, &length);
+        std::string log(static_cast<size_t>(std::max(1, length)), '\0');
+        if (g_gl_get_shader_info_log && length > 1) {
+            g_gl_get_shader_info_log(shader, length, nullptr, log.data());
+        }
+        std::ostringstream out;
+        out << "hand renderer: " << name << " shader compile failed " << log.c_str();
+        render_log(out.str());
+        g_gl_delete_shader(shader);
+        return 0;
+    }
+    return shader;
+}
+
+bool ensure_hand_gl_renderer() {
+    if (g_hand_gl_attempted) return g_hand_gl_ready;
+    g_hand_gl_attempted = true;
+    if (!load_hand_texture() || !load_hand_gl_functions()) {
+        render_log("hand renderer: required OpenGL functions or texture are unavailable");
+        return false;
+    }
+
+    constexpr const char* kVertexSource = R"GLSL(
+#version 130
+in vec2 aPos;
+in vec2 aUv;
+in float aShade;
+out vec2 vUv;
+out float vShade;
+void main() {
+    vUv = vec2(aUv.x, 1.0 - aUv.y);
+    vShade = aShade;
+    gl_Position = vec4(aPos, 0.0, 1.0);
+}
+)GLSL";
+    constexpr const char* kFragmentSource = R"GLSL(
+#version 130
+uniform sampler2D uTexture;
+in vec2 vUv;
+in float vShade;
+out vec4 fragColor;
+void main() {
+    vec3 color = texture(uTexture, vUv).rgb * clamp(vShade, 0.35, 1.08);
+    fragColor = vec4(color, 1.0);
+}
+)GLSL";
+
+    const GLuint vertex = compile_hand_shader(GL_VERTEX_SHADER_VALUE, kVertexSource, "vertex");
+    const GLuint fragment =
+        compile_hand_shader(GL_FRAGMENT_SHADER_VALUE, kFragmentSource, "fragment");
+    if (!vertex || !fragment) return false;
+
+    g_hand_program = g_gl_create_program();
+    g_gl_attach_shader(g_hand_program, vertex);
+    g_gl_attach_shader(g_hand_program, fragment);
+    g_gl_bind_attrib_location(g_hand_program, 0, "aPos");
+    g_gl_bind_attrib_location(g_hand_program, 1, "aUv");
+    g_gl_bind_attrib_location(g_hand_program, 2, "aShade");
+    g_gl_link_program(g_hand_program);
+    g_gl_delete_shader(vertex);
+    g_gl_delete_shader(fragment);
+    GLint linked = 0;
+    g_gl_get_program_iv(g_hand_program, GL_LINK_STATUS_VALUE, &linked);
+    if (!linked) {
+        GLint length = 0;
+        if (g_gl_get_program_iv) g_gl_get_program_iv(g_hand_program, GL_INFO_LOG_LENGTH_VALUE, &length);
+        std::string log(static_cast<size_t>(std::max(1, length)), '\0');
+        if (g_gl_get_program_info_log && length > 1) {
+            g_gl_get_program_info_log(g_hand_program, length, nullptr, log.data());
+        }
+        std::ostringstream out;
+        out << "hand renderer: program link failed " << log.c_str();
+        render_log(out.str());
+        g_hand_program = 0;
+        return false;
+    }
+    g_hand_texture_uniform = g_gl_get_uniform_location(g_hand_program, "uTexture");
+
+    GLint old_texture = 0;
+    GLint old_unpack = 4;
+    glGetIntegerv(GL_TEXTURE_BINDING_2D, &old_texture);
+    glGetIntegerv(GL_UNPACK_ALIGNMENT_VALUE, &old_unpack);
+    glGenTextures(1, &g_hand_texture_gl);
+    glBindTexture(GL_TEXTURE_2D, g_hand_texture_gl);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE_VALUE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE_VALUE);
+
+    std::vector<uint8_t> rgba;
+    rgba.reserve(static_cast<size_t>(g_hand_texture_width) *
+                 static_cast<size_t>(g_hand_texture_height) * 4);
+    for (const uint32_t pixel : g_hand_texture_pixels) {
+        rgba.push_back(static_cast<uint8_t>((pixel >> 16) & 0xff));
+        rgba.push_back(static_cast<uint8_t>((pixel >> 8) & 0xff));
+        rgba.push_back(static_cast<uint8_t>(pixel & 0xff));
+        rgba.push_back(0xff);
+    }
+    glPixelStorei(GL_UNPACK_ALIGNMENT_VALUE, 1);
+    glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, static_cast<GLsizei>(g_hand_texture_width),
+                 static_cast<GLsizei>(g_hand_texture_height), 0, GL_RGBA, GL_UNSIGNED_BYTE,
+                 rgba.data());
+    glPixelStorei(GL_UNPACK_ALIGNMENT_VALUE, old_unpack);
+    glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(old_texture));
+
+    g_gl_gen_vertex_arrays(1, &g_hand_vao);
+    g_gl_gen_buffers(1, &g_hand_vbo);
+    g_hand_gl_ready = g_hand_program != 0 && g_hand_texture_gl != 0 &&
+        g_hand_vao != 0 && g_hand_vbo != 0;
+    if (g_hand_gl_ready) render_log("hand renderer: GL textured path ready");
+    return g_hand_gl_ready;
+}
+
+bool load_hand_model() {
+    if (g_hand_model_attempted) return g_hand_model_loaded;
+    g_hand_model_attempted = true;
+
+    const std::wstring path = module_directory() + L"assets\\vr_hands\\left_hand.obj";
+    std::ifstream file(path);
+    if (!file.is_open()) {
+        render_log("hand model: assets/vr_hands/left_hand.obj not found");
+        return false;
+    }
+
+    std::vector<Vec3> positions;
+    std::vector<Vec3> normals;
+    std::vector<std::array<float, 2>> texcoords;
+    std::string line;
+    while (std::getline(file, line)) {
+        std::istringstream stream(line);
+        std::string tag;
+        stream >> tag;
+        if (tag == "v") {
+            Vec3 position{};
+            stream >> position.x >> position.y >> position.z;
+            positions.push_back(position);
+        } else if (tag == "vn") {
+            Vec3 normal{};
+            stream >> normal.x >> normal.y >> normal.z;
+            normals.push_back(normal);
+        } else if (tag == "vt") {
+            std::array<float, 2> uv{};
+            stream >> uv[0] >> uv[1];
+            texcoords.push_back(uv);
+        } else if (tag == "f") {
+            struct Ref {
+                int position = 0;
+                int texcoord = 0;
+                int normal = 0;
+            };
+            std::vector<Ref> refs;
+            std::string token;
+            while (stream >> token) {
+                Ref ref{};
+                const size_t first = token.find('/');
+                const size_t second =
+                    first == std::string::npos ? std::string::npos : token.find('/', first + 1);
+                ref.position = std::atoi(token.substr(0, first).c_str());
+                if (first != std::string::npos && second != std::string::npos &&
+                    second > first + 1) {
+                    ref.texcoord = std::atoi(token.substr(first + 1, second - first - 1).c_str());
+                } else if (first != std::string::npos && second == std::string::npos &&
+                           first + 1 < token.size()) {
+                    ref.texcoord = std::atoi(token.substr(first + 1).c_str());
+                }
+                if (second != std::string::npos && second + 1 < token.size()) {
+                    ref.normal = std::atoi(token.substr(second + 1).c_str());
+                }
+                refs.push_back(ref);
+            }
+            if (refs.size() < 3) continue;
+
+            const auto emit = [&](const Ref& ref) {
+                const int position_index = ref.position > 0
+                    ? ref.position - 1
+                    : static_cast<int>(positions.size()) + ref.position;
+                const int normal_index = ref.normal > 0
+                    ? ref.normal - 1
+                    : static_cast<int>(normals.size()) + ref.normal;
+                const int texcoord_index = ref.texcoord > 0
+                    ? ref.texcoord - 1
+                    : static_cast<int>(texcoords.size()) + ref.texcoord;
+                if (position_index < 0 ||
+                    position_index >= static_cast<int>(positions.size())) {
+                    return;
+                }
+                HandVertex vertex{};
+                vertex.position = positions[position_index];
+                vertex.normal = {0.0f, 1.0f, 0.0f};
+                if (normal_index >= 0 && normal_index < static_cast<int>(normals.size())) {
+                    vertex.normal = normals[normal_index];
+                }
+                if (texcoord_index >= 0 && texcoord_index < static_cast<int>(texcoords.size())) {
+                    vertex.u = texcoords[texcoord_index][0];
+                    vertex.v = texcoords[texcoord_index][1];
+                }
+                g_hand_vertices.push_back(vertex);
+            };
+
+            for (size_t i = 1; i + 1 < refs.size(); ++i) {
+                emit(refs[0]);
+                emit(refs[i]);
+                emit(refs[i + 1]);
+            }
+        }
+    }
+
+    load_hand_texture();
+    g_hand_model_loaded = !g_hand_vertices.empty();
+    if (g_hand_model_loaded) {
+        std::ostringstream out;
+        out << "hand model: loaded vertices=" << g_hand_vertices.size();
+        render_log(out.str());
+    } else {
+        render_log("hand model: OBJ loaded but no triangles found");
+    }
+    return g_hand_model_loaded;
+}
+
+Vec3 rotate_hand_local(Vec3 value, const VrCameraControls& controls) {
+    constexpr float kPi = 3.14159265358979323846f;
+    const float pitch = controls.hand_model_pitch_degrees * kPi / 180.0f;
+    const float yaw = controls.hand_model_yaw_degrees * kPi / 180.0f;
+    const float roll = controls.hand_model_roll_degrees * kPi / 180.0f;
+
+    const float cp = std::cos(pitch);
+    const float sp = std::sin(pitch);
+    value = {value.x, value.y * cp - value.z * sp, value.y * sp + value.z * cp};
+
+    const float cy = std::cos(yaw);
+    const float sy = std::sin(yaw);
+    value = {value.x * cy + value.z * sy, value.y, -value.x * sy + value.z * cy};
+
+    const float cr = std::cos(roll);
+    const float sr = std::sin(roll);
+    value = {value.x * cr - value.y * sr, value.x * sr + value.y * cr, value.z};
+    return value;
+}
+
+Vec3 transform_hand_vertex(const HandVertex& vertex, const float controller[12],
+                           bool right_hand, const VrCameraControls& controls) {
+    const float scale = 0.135f * std::clamp(controls.hand_model_scale, 0.10f, 5.0f);
+    constexpr float offset_x = 0.0f;
+    constexpr float offset_y = -0.035f;
+    constexpr float offset_z = -0.055f;
+
+    Vec3 local = vertex.position;
+    local.x -= 0.32f;
+    local.y -= 0.82f;
+    local.z += 0.04f;
+    local = rotate_hand_local(local, controls);
+    local.x *= right_hand ? -scale : scale;
+    local.y *= scale;
+    local.z *= scale;
+
+    const float x = local.x + offset_x;
+    const float y = local.y + offset_y;
+    const float z = local.z + offset_z;
+
+    Vec3 world{};
+    for (int row = 0; row < 3; ++row) {
+        const float controller_right = controller[row * 4 + 0];
+        const float controller_up = controller[row * 4 + 1];
+        const float controller_forward = -controller[row * 4 + 2];
+        const float origin = controller[row * 4 + 3];
+        (&world.x)[row] = origin +
+            controller_right * x +
+            controller_up * y +
+            controller_forward * z;
+    }
+    return world;
+}
+
+bool project_tracking_point_to_eye_ndc_raw(int eye, const float hmd[12],
+                                           const Vec3& absolute,
+                                           float& ndc_x, float& ndc_y,
+                                           float& depth) {
+    const float point[3]{absolute.x, absolute.y, absolute.z};
+    return project_tracking_point_to_eye_ndc(eye, hmd, point, ndc_x, ndc_y, depth);
+}
+
+Vec3 transform_hand_normal(const Vec3& normal, const float controller[12],
+                           bool right_hand, const VrCameraControls& controls) {
+    Vec3 local = rotate_hand_local(normal, controls);
+    const float x = local.x * (right_hand ? -1.0f : 1.0f);
+    const float y = local.y;
+    const float z = local.z;
+    Vec3 world{};
+    for (int row = 0; row < 3; ++row) {
+        const float controller_right = controller[row * 4 + 0];
+        const float controller_up = controller[row * 4 + 1];
+        const float controller_forward = -controller[row * 4 + 2];
+        (&world.x)[row] =
+            controller_right * x +
+            controller_up * y +
+            controller_forward * z;
+    }
+    const float length = std::sqrt(world.x * world.x + world.y * world.y + world.z * world.z);
+    if (length > 0.0001f) {
+        world.x /= length;
+        world.y /= length;
+        world.z /= length;
+    }
+    return world;
+}
+
+struct ProjectedHandVertex {
+    float x = 0.0f;
+    float y = 0.0f;
+    float depth = 0.0f;
+    float shade = 1.0f;
+    float u = 0.5f;
+    float v = 0.5f;
+};
+
+struct ProjectedHandTriangle {
+    ProjectedHandVertex v[3]{};
+    float depth = 0.0f;
+    float shade = 1.0f;
+    float red = 0.84f;
+    float green = 0.84f;
+    float blue = 0.80f;
+};
+
+struct HandDrawVertex {
+    float x = 0.0f;
+    float y = 0.0f;
+    float u = 0.5f;
+    float v = 0.5f;
+    float shade = 1.0f;
+};
+
+void fill_projected_triangle(const ProjectedHandTriangle& triangle,
+                             int width, int height) {
+    const float min_y_float = std::min({triangle.v[0].y, triangle.v[1].y, triangle.v[2].y});
+    const float max_y_float = std::max({triangle.v[0].y, triangle.v[1].y, triangle.v[2].y});
+    int min_y = std::clamp(static_cast<int>(std::floor(min_y_float)), 0, height - 1);
+    int max_y = std::clamp(static_cast<int>(std::ceil(max_y_float)), 0, height - 1);
+    if (max_y <= min_y) return;
+
+    glClearColor(triangle.red, triangle.green, triangle.blue, 1.0f);
+    const int row_step = 1;
+    const auto edge_crosses = [](float y, const ProjectedHandVertex& a,
+                                 const ProjectedHandVertex& b, float& x) {
+        if (std::fabs(a.y - b.y) < 0.001f) return false;
+        const float lower = std::min(a.y, b.y);
+        const float upper = std::max(a.y, b.y);
+        if (y < lower || y >= upper) return false;
+        const float t = (y - a.y) / (b.y - a.y);
+        x = a.x + (b.x - a.x) * t;
+        return std::isfinite(x);
+    };
+
+    for (int y = min_y; y <= max_y; y += row_step) {
+        const float sample_y = static_cast<float>(y) + 0.5f;
+        float intersections[3]{};
+        int count = 0;
+        for (int edge = 0; edge < 3; ++edge) {
+            float x = 0.0f;
+            if (edge_crosses(sample_y, triangle.v[edge], triangle.v[(edge + 1) % 3], x) &&
+                count < 3) {
+                intersections[count++] = x;
+            }
+        }
+        if (count < 2) continue;
+        float left = std::min(intersections[0], intersections[1]);
+        float right = std::max(intersections[0], intersections[1]);
+        if (count == 3) {
+            left = std::min(left, intersections[2]);
+            right = std::max(right, intersections[2]);
+        }
+
+        int x0 = std::clamp(static_cast<int>(std::floor(left)) - 1, 0, width - 1);
+        int x1 = std::clamp(static_cast<int>(std::ceil(right)) + 1, 0, width - 1);
+        if (x1 <= x0) continue;
+        clear_scissor_rect(x0, std::max(0, y - 1), x1 - x0 + 1, row_step + 1,
+                           width, height);
+    }
+}
+
+bool draw_projected_hand_triangles_gl(const std::vector<ProjectedHandTriangle>& triangles,
+                                      int width, int height) {
+    if (triangles.empty() || width <= 0 || height <= 0 || !ensure_hand_gl_renderer()) {
+        return false;
+    }
+
+    std::vector<HandDrawVertex> vertices;
+    vertices.reserve(triangles.size() * 3);
+    for (const ProjectedHandTriangle& triangle : triangles) {
+        for (const ProjectedHandVertex& vertex : triangle.v) {
+            HandDrawVertex out{};
+            out.x = (vertex.x / static_cast<float>(width)) * 2.0f - 1.0f;
+            out.y = (vertex.y / static_cast<float>(height)) * 2.0f - 1.0f;
+            out.u = vertex.u;
+            out.v = vertex.v;
+            out.shade = vertex.shade;
+            vertices.push_back(out);
+        }
+    }
+    if (vertices.empty()) return false;
+
+    GLint old_program = 0;
+    GLint old_vertex_array = 0;
+    GLint old_array_buffer = 0;
+    GLint old_active_texture = GL_TEXTURE0_VALUE;
+    GLint old_texture = 0;
+    GLint old_viewport[4]{};
+    GLboolean old_color_mask[4]{};
+    glGetIntegerv(GL_CURRENT_PROGRAM_VALUE, &old_program);
+    glGetIntegerv(GL_VERTEX_ARRAY_BINDING_VALUE, &old_vertex_array);
+    glGetIntegerv(GL_ARRAY_BUFFER_BINDING_VALUE, &old_array_buffer);
+    glGetIntegerv(GL_ACTIVE_TEXTURE_VALUE, &old_active_texture);
+    glGetIntegerv(GL_VIEWPORT_VALUE, old_viewport);
+    glGetBooleanv(GL_COLOR_WRITEMASK, old_color_mask);
+    g_gl_active_texture(GL_TEXTURE0_VALUE);
+    glGetIntegerv(GL_TEXTURE_BINDING_2D, &old_texture);
+
+    const GLboolean scissor_enabled = glIsEnabled(GL_SCISSOR_TEST);
+    const GLboolean depth_enabled = glIsEnabled(GL_DEPTH_TEST);
+    const GLboolean cull_enabled = glIsEnabled(GL_CULL_FACE);
+    const GLboolean blend_enabled = glIsEnabled(GL_BLEND);
+
+    glViewport(0, 0, width, height);
+    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    glDisable(GL_SCISSOR_TEST);
+    glDisable(GL_DEPTH_TEST);
+    glDisable(GL_CULL_FACE);
+    glDisable(GL_BLEND);
+
+    g_gl_use_program(g_hand_program);
+    g_gl_uniform_1i(g_hand_texture_uniform, 0);
+    glBindTexture(GL_TEXTURE_2D, g_hand_texture_gl);
+    g_gl_bind_vertex_array(g_hand_vao);
+    g_gl_bind_buffer(GL_ARRAY_BUFFER_VALUE, g_hand_vbo);
+    g_gl_buffer_data(GL_ARRAY_BUFFER_VALUE,
+                     static_cast<ptrdiff_t>(vertices.size() * sizeof(HandDrawVertex)),
+                     vertices.data(), GL_DYNAMIC_DRAW_VALUE);
+    g_gl_enable_vertex_attrib_array(0);
+    g_gl_enable_vertex_attrib_array(1);
+    g_gl_enable_vertex_attrib_array(2);
+    g_gl_vertex_attrib_pointer(0, 2, GL_FLOAT, GL_FALSE, sizeof(HandDrawVertex),
+                               reinterpret_cast<void*>(offsetof(HandDrawVertex, x)));
+    g_gl_vertex_attrib_pointer(1, 2, GL_FLOAT, GL_FALSE, sizeof(HandDrawVertex),
+                               reinterpret_cast<void*>(offsetof(HandDrawVertex, u)));
+    g_gl_vertex_attrib_pointer(2, 1, GL_FLOAT, GL_FALSE, sizeof(HandDrawVertex),
+                               reinterpret_cast<void*>(offsetof(HandDrawVertex, shade)));
+    glDrawArrays(GL_TRIANGLES, 0, static_cast<GLsizei>(vertices.size()));
+
+    if (blend_enabled) glEnable(GL_BLEND); else glDisable(GL_BLEND);
+    if (cull_enabled) glEnable(GL_CULL_FACE); else glDisable(GL_CULL_FACE);
+    if (depth_enabled) glEnable(GL_DEPTH_TEST); else glDisable(GL_DEPTH_TEST);
+    if (scissor_enabled) glEnable(GL_SCISSOR_TEST); else glDisable(GL_SCISSOR_TEST);
+    glColorMask(old_color_mask[0], old_color_mask[1], old_color_mask[2], old_color_mask[3]);
+    glViewport(old_viewport[0], old_viewport[1], old_viewport[2], old_viewport[3]);
+    g_gl_bind_buffer(GL_ARRAY_BUFFER_VALUE, static_cast<GLuint>(old_array_buffer));
+    g_gl_bind_vertex_array(static_cast<GLuint>(old_vertex_array));
+    g_gl_use_program(static_cast<GLuint>(old_program));
+    glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(old_texture));
+    g_gl_active_texture(static_cast<GLenum>(old_active_texture));
+    return glGetError() == GL_NO_ERROR;
 }
 
 struct ModuleRange {
@@ -524,6 +1641,10 @@ bool read_controls(VrCameraControls& controls) {
         controls.wide_culling_enabled = g_shared->wide_culling_enabled;
         controls.wide_culling_scale = g_shared->wide_culling_scale;
         controls.hmd_culling_view_enabled = g_shared->hmd_culling_view_enabled;
+        controls.hand_model_scale = g_shared->hand_model_scale;
+        controls.hand_model_pitch_degrees = g_shared->hand_model_pitch_degrees;
+        controls.hand_model_yaw_degrees = g_shared->hand_model_yaw_degrees;
+        controls.hand_model_roll_degrees = g_shared->hand_model_roll_degrees;
         MemoryBarrier();
         const LONG after = InterlockedCompareExchange(
             reinterpret_cast<volatile LONG*>(&g_shared->control_sequence), 0, 0);
@@ -1247,6 +2368,15 @@ bool initialize_vr_actions() {
     if (error == vr::VRInputError_None) {
         error = input->GetActionHandle("/actions/hytale/in/sprint", &g_action_sprint);
     }
+    // Optional: old installs may still have a cached action manifest without
+    // left_pose. Keep the rest of the controls working in that case.
+    if (error == vr::VRInputError_None) {
+        const auto left_pose_error =
+            input->GetActionHandle("/actions/hytale/in/left_pose", &g_action_left_pose);
+        if (left_pose_error != vr::VRInputError_None) {
+            g_action_left_pose = vr::k_ulInvalidActionHandle;
+        }
+    }
     if (error == vr::VRInputError_None) {
         error = input->GetActionHandle("/actions/hytale/in/right_pose", &g_action_right_pose);
     }
@@ -1330,6 +2460,7 @@ void update_vr_actions() {
     vr::InputDigitalActionData_t button_y{};
     vr::InputDigitalActionData_t button_b{};
     vr::InputDigitalActionData_t right_stick_click{};
+    vr::InputPoseActionData_t left_pose{};
     vr::InputPoseActionData_t right_pose{};
     const auto move_error = input->GetAnalogActionData(
         g_action_move, &move, sizeof(move), vr::k_ulInvalidInputValueHandle);
@@ -1356,6 +2487,12 @@ void update_vr_actions() {
     const auto right_stick_click_error = input->GetDigitalActionData(
         g_action_right_stick_click, &right_stick_click, sizeof(right_stick_click),
         vr::k_ulInvalidInputValueHandle);
+    vr::EVRInputError left_pose_error = vr::VRInputError_None;
+    if (g_action_left_pose != vr::k_ulInvalidActionHandle) {
+        left_pose_error = input->GetPoseActionDataRelativeToNow(
+            g_action_left_pose, vr::TrackingUniverseStanding, 0.0f,
+            &left_pose, sizeof(left_pose), vr::k_ulInvalidInputValueHandle);
+    }
     const auto pose_error = input->GetPoseActionDataRelativeToNow(
         g_action_right_pose, vr::TrackingUniverseStanding, 0.0f,
         &right_pose, sizeof(right_pose), vr::k_ulInvalidInputValueHandle);
@@ -1371,6 +2508,9 @@ void update_vr_actions() {
     const bool b_active = button_b_error == vr::VRInputError_None && button_b.bActive;
     const bool right_stick_click_active =
         right_stick_click_error == vr::VRInputError_None && right_stick_click.bActive;
+    const bool left_pose_active = g_action_left_pose != vr::k_ulInvalidActionHandle &&
+        left_pose_error == vr::VRInputError_None && left_pose.bActive &&
+        left_pose.pose.bDeviceIsConnected && left_pose.pose.bPoseIsValid;
     const bool pose_active = pose_error == vr::VRInputError_None && right_pose.bActive &&
         right_pose.pose.bDeviceIsConnected && right_pose.pose.bPoseIsValid;
 
@@ -1402,7 +2542,7 @@ void update_vr_actions() {
     const bool active_input = move_active || turn_active || trigger_active ||
         left_trigger_active || left_grip_active || right_grip_active ||
         x_active || legacy_left_x || y_active || b_active || right_stick_click_active ||
-        pose_active;
+        left_pose_active || pose_active;
     g_shared->controller_active = active_input ? 1u : 0u;
     g_shared->controller_move_x = move_active ? move.x : 0.0f;
     g_shared->controller_move_y = move_active ? move.y : 0.0f;
@@ -1455,6 +2595,15 @@ void update_vr_actions() {
     g_shared->controller_right_button_mask = right_button_mask;
     g_shared->controller_right_pose_active = pose_active ? 1u : 0u;
     AcquireSRWLockExclusive(&g_pose_lock);
+    g_left_controller_valid = left_pose_active;
+    if (left_pose_active) {
+        for (int row = 0; row < 3; ++row) {
+            for (int column = 0; column < 4; ++column) {
+                g_left_controller_pose[row * 4 + column] =
+                    left_pose.pose.mDeviceToAbsoluteTracking.m[row][column];
+            }
+        }
+    }
     g_right_controller_valid = pose_active;
     if (pose_active) {
         for (int row = 0; row < 3; ++row) {
@@ -2265,6 +3414,130 @@ void draw_controller_hand_proxy(int eye, int width, int height,
     if (!scissor_enabled) glDisable(GL_SCISSOR_TEST);
 }
 
+void draw_vr_hand_model(int eye, int width, int height,
+                        const VrCameraControls& controls) {
+    if (!controls.first_person_hand_hidden || !g_vr_system ||
+        width <= 0 || height <= 0 || !load_hand_model()) {
+        return;
+    }
+
+    float hmd[12]{};
+    float controller_poses[2][12]{};
+    bool controller_valid[2]{};
+    AcquireSRWLockShared(&g_pose_lock);
+    const bool hmd_valid = g_hmd_current_valid;
+    if (hmd_valid) {
+        std::copy(std::begin(g_hmd_current_pose), std::end(g_hmd_current_pose),
+                  std::begin(hmd));
+        controller_valid[0] = g_left_controller_valid;
+        controller_valid[1] = g_right_controller_valid;
+        if (controller_valid[0]) {
+            std::copy(std::begin(g_left_controller_pose), std::end(g_left_controller_pose),
+                      std::begin(controller_poses[0]));
+        }
+        if (controller_valid[1]) {
+            std::copy(std::begin(g_right_controller_pose), std::end(g_right_controller_pose),
+                      std::begin(controller_poses[1]));
+        }
+    }
+    ReleaseSRWLockShared(&g_pose_lock);
+    if (!hmd_valid || (!controller_valid[0] && !controller_valid[1])) return;
+    const Vec3 eye_position{hmd[3], hmd[7], hmd[11]};
+
+    std::vector<ProjectedHandTriangle> triangles;
+    triangles.reserve((g_hand_vertices.size() / 3) * 2);
+    const Vec3 light{-0.25f, 0.55f, -0.80f};
+    for (int hand = 0; hand < 2; ++hand) {
+        if (!controller_valid[hand]) continue;
+        const float* controller = controller_poses[hand];
+
+        for (size_t index = 0; index + 2 < g_hand_vertices.size(); index += 3) {
+            ProjectedHandTriangle triangle{};
+            bool valid = true;
+            float shade_sum = 0.0f;
+            float u_sum = 0.0f;
+            float v_sum = 0.0f;
+            Vec3 world_center{};
+            for (int corner = 0; corner < 3; ++corner) {
+                const HandVertex& source = g_hand_vertices[index + corner];
+                const Vec3 world = transform_hand_vertex(source, controller, hand == 1, controls);
+                world_center.x += world.x;
+                world_center.y += world.y;
+                world_center.z += world.z;
+                float ndc_x = 0.0f;
+                float ndc_y = 0.0f;
+                float depth = 0.0f;
+                if (!project_tracking_point_to_eye_ndc_raw(eye, hmd, world,
+                                                           ndc_x, ndc_y, depth)) {
+                    valid = false;
+                    break;
+                }
+                const Vec3 normal = transform_hand_normal(source.normal, controller, hand == 1, controls);
+                const float lit = std::clamp(
+                    normal.x * light.x + normal.y * light.y + normal.z * light.z,
+                    -1.0f, 1.0f);
+                const float shade = std::clamp(lit * 0.28f + 0.74f, 0.48f, 1.0f);
+                triangle.v[corner].x = (ndc_x * 0.5f + 0.5f) * static_cast<float>(width);
+                triangle.v[corner].y = (ndc_y * 0.5f + 0.5f) * static_cast<float>(height);
+                triangle.v[corner].depth = depth;
+                triangle.v[corner].shade = shade;
+                triangle.v[corner].u = source.u;
+                triangle.v[corner].v = source.v;
+                triangle.depth += depth;
+                shade_sum += shade;
+                u_sum += source.u;
+                v_sum += source.v;
+            }
+            if (!valid) continue;
+
+            world_center.x /= 3.0f;
+            world_center.y /= 3.0f;
+            world_center.z /= 3.0f;
+            const Vec3 eye_to_center{
+                world_center.x - eye_position.x,
+                world_center.y - eye_position.y,
+                world_center.z - eye_position.z};
+
+            const float area =
+                (triangle.v[1].x - triangle.v[0].x) * (triangle.v[2].y - triangle.v[0].y) -
+                (triangle.v[1].y - triangle.v[0].y) * (triangle.v[2].x - triangle.v[0].x);
+            if (!std::isfinite(area) || std::fabs(area) < 1.0f) continue;
+            triangle.depth =
+                eye_to_center.x * eye_to_center.x +
+                eye_to_center.y * eye_to_center.y +
+                eye_to_center.z * eye_to_center.z;
+            triangle.shade = shade_sum / 3.0f;
+            sample_hand_texture(u_sum / 3.0f, v_sum / 3.0f, triangle.shade,
+                                triangle.red, triangle.green, triangle.blue);
+            triangles.push_back(triangle);
+        }
+    }
+
+    std::sort(triangles.begin(), triangles.end(),
+              [](const ProjectedHandTriangle& a, const ProjectedHandTriangle& b) {
+                  return a.depth > b.depth;
+              });
+    if (draw_projected_hand_triangles_gl(triangles, width, height)) return;
+
+    const GLboolean scissor_enabled = glIsEnabled(GL_SCISSOR_TEST);
+    GLint old_scissor[4]{};
+    GLfloat old_clear[4]{};
+    GLboolean old_mask[4]{};
+    glGetIntegerv(GL_SCISSOR_BOX, old_scissor);
+    glGetFloatv(GL_COLOR_CLEAR_VALUE, old_clear);
+    glGetBooleanv(GL_COLOR_WRITEMASK, old_mask);
+    glEnable(GL_SCISSOR_TEST);
+    glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+    for (const ProjectedHandTriangle& triangle : triangles) {
+        fill_projected_triangle(triangle, width, height);
+    }
+
+    glColorMask(old_mask[0], old_mask[1], old_mask[2], old_mask[3]);
+    glClearColor(old_clear[0], old_clear[1], old_clear[2], old_clear[3]);
+    glScissor(old_scissor[0], old_scissor[1], old_scissor[2], old_scissor[3]);
+    if (!scissor_enabled) glDisable(GL_SCISSOR_TEST);
+}
+
 void draw_controller_pointer(int eye, int width, int height, float distance,
                              bool publish_state = true) {
     int x = 0;
@@ -2436,6 +3709,7 @@ bool capture_eye(int eye, const VrCameraControls& controls) {
                                   viewport[1] + source_height, 0, 0, width, height,
                                   GL_COLOR_BUFFER_BIT, samples > 1 ? GL_NEAREST : GL_LINEAR);
         }
+        draw_vr_hand_model(eye, width, height, controls);
         if (controls.hand_pointer_enabled) {
             const bool menu_overlay_active = g_shared && g_shared->ui_overlay_active != 0;
             if (!menu_overlay_active && controls.hide_center_reticle) {
@@ -2711,6 +3985,7 @@ void shutdown_stereo() {
     g_hmd_view_delta = identity_matrix();
     g_hmd_origin_valid = false;
     g_hmd_current_valid = false;
+    g_left_controller_valid = false;
     g_right_controller_valid = false;
     ReleaseSRWLockExclusive(&g_pose_lock);
     AcquireSRWLockExclusive(&g_camera_lock);
@@ -2735,6 +4010,7 @@ void shutdown_stereo() {
     g_action_turn = vr::k_ulInvalidActionHandle;
     g_action_jump = vr::k_ulInvalidActionHandle;
     g_action_sprint = vr::k_ulInvalidActionHandle;
+    g_action_left_pose = vr::k_ulInvalidActionHandle;
     g_action_right_pose = vr::k_ulInvalidActionHandle;
     g_action_right_trigger = vr::k_ulInvalidActionHandle;
     g_action_left_trigger = vr::k_ulInvalidActionHandle;

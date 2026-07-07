@@ -6,6 +6,10 @@
       "haptics": [],
       "poses": [
         {
+          "output": "/actions/hytale/in/left_pose",
+          "path": "/user/hand/left/pose/raw"
+        },
+        {
           "output": "/actions/hytale/in/right_pose",
           "path": "/user/hand/right/pose/raw"
         }

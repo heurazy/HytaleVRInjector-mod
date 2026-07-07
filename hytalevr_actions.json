@@ -23,6 +23,10 @@
       "type": "boolean"
     },
     {
+      "name": "/actions/hytale/in/left_pose",
+      "type": "pose"
+    },
+    {
       "name": "/actions/hytale/in/right_pose",
       "type": "pose"
     },
@@ -72,6 +76,7 @@
       "/actions/hytale/in/turn": "Turn",
       "/actions/hytale/in/jump": "Jump",
       "/actions/hytale/in/sprint": "Sprint",
+      "/actions/hytale/in/left_pose": "Left hand pose",
       "/actions/hytale/in/right_pose": "Right hand aim",
       "/actions/hytale/in/right_trigger": "Right trigger attack",
       "/actions/hytale/in/left_trigger": "Left trigger click",

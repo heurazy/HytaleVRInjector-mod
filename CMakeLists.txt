@@ -44,6 +44,9 @@ add_custom_command(TARGET hytale_vr_camera_hook POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
         "${CMAKE_CURRENT_SOURCE_DIR}/hytalevr_bindings_oculus_touch.json"
         "$<TARGET_FILE_DIR:hytale_vr_camera_hook>/hytalevr_bindings_oculus_touch.json"
+    COMMAND ${CMAKE_COMMAND} -E copy_directory
+        "${CMAKE_CURRENT_SOURCE_DIR}/assets"
+        "$<TARGET_FILE_DIR:hytale_vr_camera_hook>/assets"
 )
 
 target_compile_definitions(hytale_vr_camera_hook PRIVATE
@@ -57,6 +60,7 @@ target_include_directories(hytale_vr_camera_hook PRIVATE
 
 target_link_libraries(hytale_vr_camera_hook PRIVATE
     opengl32
+    gdiplus
     "${CMAKE_CURRENT_SOURCE_DIR}/third_party/openvr/lib/win64/openvr_api.lib"
 )
 
@@ -210,5 +214,9 @@ install(FILES
     "${CMAKE_CURRENT_SOURCE_DIR}/hytalevr.vrmanifest"
     "${CMAKE_CURRENT_SOURCE_DIR}/hytalevr_actions.json"
     "${CMAKE_CURRENT_SOURCE_DIR}/hytalevr_bindings_oculus_touch.json"
+    DESTINATION .
+)
+install(DIRECTORY
+    "${CMAKE_CURRENT_SOURCE_DIR}/assets"
     DESTINATION .
 )

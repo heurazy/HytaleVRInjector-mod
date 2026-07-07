@@ -3,6 +3,8 @@ build/
 build-*/
 out/
 dist/
+dist-*/
+release/
 install/
 CMakeFiles/
 CMakeCache.txt
@@ -20,6 +22,7 @@ Testing/
 *.vcxproj.user
 *.sln
 *.obj
+!assets/vr_hands/*.obj
 *.pdb
 *.ilk
 *.exp
