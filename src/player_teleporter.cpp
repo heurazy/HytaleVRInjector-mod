@@ -2630,11 +2630,14 @@ void update_vr_tracking() {
     set_float(IDC_TARGET_X, g_target.x);
     set_float(IDC_TARGET_Y, g_target.y);
     set_float(IDC_TARGET_Z, g_target.z);
-    wchar_t pose_text[96]{};
-    swprintf_s(pose_text, L"VR active | Hand %s | Ray %s",
-               g_vr_camera_shared && g_vr_camera_shared->controller_right_pose_active ? L"OK" : L"--",
-               g_vr_camera_shared && g_vr_camera_shared->controller_ray_active ? L"OK" : L"--");
-    SetWindowTextW(control(IDC_VR_POSE), pose_text);
+    wchar_t pose_text[64]{};
+    swprintf_s(pose_text, L"VR active");
+    wchar_t current_pose_text[64]{};
+    GetWindowTextW(control(IDC_VR_POSE), current_pose_text, static_cast<int>(std::size(current_pose_text)));
+    if (wcscmp(current_pose_text, pose_text) != 0) {
+        SetWindowTextW(control(IDC_VR_POSE), pose_text);
+        InvalidateRect(control(IDC_VR_POSE), nullptr, TRUE);
+    }
 }
 #endif
 

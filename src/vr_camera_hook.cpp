@@ -77,10 +77,16 @@ struct UiScaleShared {
     float firstPersonHandNdcY;
     float firstPersonHandDepth;
     volatile LONG firstPersonMatrixPatches;
+    volatile LONG sceneDepthTextureId;
+    volatile LONG sceneDepthTextureWidth;
+    volatile LONG sceneDepthTextureHeight;
+    volatile LONG sceneDepthTextureFrame;
+    float sceneDepthFarClip;
 };
 HANDLE g_ui_scale_mapping = nullptr;
 UiScaleShared* g_ui_scale_shared = nullptr;
 bool menu_visible_recently();
+bool ensure_ui_scale_mapping();
 bool controller_hand_ndc_for_eye(vr::EVREye eye, float& ndc_x, float& ndc_y, float& depth);
 bool project_tracking_point_to_eye_ndc(int eye, const float hmd[12],
                                        const float absolute[3],
@@ -120,6 +126,8 @@ using GlDeleteShaderFn = void(APIENTRY*)(GLuint);
 using GlUseProgramFn = void(APIENTRY*)(GLuint);
 using GlGetUniformLocationFn = GLint(APIENTRY*)(GLuint, const char*);
 using GlUniform1iFn = void(APIENTRY*)(GLint, GLint);
+using GlUniform1fFn = void(APIENTRY*)(GLint, GLfloat);
+using GlUniform2fFn = void(APIENTRY*)(GLint, GLfloat, GLfloat);
 using GlGenVertexArraysFn = void(APIENTRY*)(GLsizei, GLuint*);
 using GlBindVertexArrayFn = void(APIENTRY*)(GLuint);
 using GlGenBuffersFn = void(APIENTRY*)(GLsizei, GLuint*);
@@ -205,6 +213,8 @@ GlDeleteShaderFn g_gl_delete_shader = nullptr;
 GlUseProgramFn g_gl_use_program = nullptr;
 GlGetUniformLocationFn g_gl_get_uniform_location = nullptr;
 GlUniform1iFn g_gl_uniform_1i = nullptr;
+GlUniform1fFn g_gl_uniform_1f = nullptr;
+GlUniform2fFn g_gl_uniform_2f = nullptr;
 GlGenVertexArraysFn g_gl_gen_vertex_arrays = nullptr;
 GlBindVertexArrayFn g_gl_bind_vertex_array = nullptr;
 GlGenBuffersFn g_gl_gen_buffers = nullptr;
@@ -280,6 +290,7 @@ constexpr GLenum GL_VERTEX_ARRAY_BINDING_VALUE = 0x85B5;
 constexpr GLenum GL_DYNAMIC_DRAW_VALUE = 0x88E8;
 constexpr GLenum GL_ACTIVE_TEXTURE_VALUE = 0x84E0;
 constexpr GLenum GL_TEXTURE0_VALUE = 0x84C0;
+constexpr GLenum GL_TEXTURE1_VALUE = 0x84C1;
 constexpr GLenum GL_UNPACK_ALIGNMENT_VALUE = 0x0CF5;
 
 bool render_logging_enabled() {
@@ -356,6 +367,12 @@ GLuint g_hand_program = 0;
 GLuint g_hand_vao = 0;
 GLuint g_hand_vbo = 0;
 GLint g_hand_texture_uniform = -1;
+GLint g_hand_scene_depth_uniform = -1;
+GLint g_hand_use_scene_depth_uniform = -1;
+GLint g_hand_viewport_size_uniform = -1;
+GLint g_hand_depth_far_clip_uniform = -1;
+GLint g_hand_depth_bias_uniform = -1;
+GLint g_hand_depth_scale_uniform = -1;
 bool g_hand_gl_attempted = false;
 bool g_hand_gl_ready = false;
 
@@ -881,6 +898,8 @@ bool load_hand_gl_functions() {
     g_gl_use_program = load_gl_proc<GlUseProgramFn>("glUseProgram");
     g_gl_get_uniform_location = load_gl_proc<GlGetUniformLocationFn>("glGetUniformLocation");
     g_gl_uniform_1i = load_gl_proc<GlUniform1iFn>("glUniform1i");
+    g_gl_uniform_1f = load_gl_proc<GlUniform1fFn>("glUniform1f");
+    g_gl_uniform_2f = load_gl_proc<GlUniform2fFn>("glUniform2f");
     g_gl_gen_vertex_arrays = load_gl_proc<GlGenVertexArraysFn>("glGenVertexArrays");
     g_gl_bind_vertex_array = load_gl_proc<GlBindVertexArrayFn>("glBindVertexArray");
     g_gl_gen_buffers = load_gl_proc<GlGenBuffersFn>("glGenBuffers");
@@ -896,7 +915,8 @@ bool load_hand_gl_functions() {
         g_gl_get_shader_iv && g_gl_create_program && g_gl_attach_shader &&
         g_gl_bind_attrib_location && g_gl_link_program && g_gl_get_program_iv &&
         g_gl_delete_shader && g_gl_use_program && g_gl_get_uniform_location &&
-        g_gl_uniform_1i && g_gl_gen_vertex_arrays && g_gl_bind_vertex_array &&
+        g_gl_uniform_1i && g_gl_uniform_1f && g_gl_uniform_2f &&
+        g_gl_gen_vertex_arrays && g_gl_bind_vertex_array &&
         g_gl_gen_buffers && g_gl_bind_buffer && g_gl_buffer_data &&
         g_gl_enable_vertex_attrib_array && g_gl_vertex_attrib_pointer &&
         g_gl_active_texture;
@@ -937,21 +957,39 @@ bool ensure_hand_gl_renderer() {
 in vec2 aPos;
 in vec2 aUv;
 in float aShade;
+in float aDepth;
 out vec2 vUv;
 out float vShade;
+out float vDepth;
 void main() {
     vUv = vec2(aUv.x, 1.0 - aUv.y);
     vShade = aShade;
+    vDepth = aDepth;
     gl_Position = vec4(aPos, 0.0, 1.0);
 }
 )GLSL";
     constexpr const char* kFragmentSource = R"GLSL(
 #version 130
 uniform sampler2D uTexture;
+uniform sampler2D uSceneDepth;
+uniform int uUseSceneDepth;
+uniform vec2 uViewportSize;
+uniform float uDepthFarClip;
+uniform float uDepthBias;
+uniform float uHandDepthScale;
 in vec2 vUv;
 in float vShade;
+in float vDepth;
 out vec4 fragColor;
 void main() {
+    if (uUseSceneDepth != 0 && uViewportSize.x > 0.5 && uViewportSize.y > 0.5) {
+        vec2 depthUv = gl_FragCoord.xy / uViewportSize;
+        float sceneDepth = texture(uSceneDepth, depthUv).r * uDepthFarClip;
+        float handDepth = vDepth * uHandDepthScale;
+        if (sceneDepth > 0.001 && handDepth > sceneDepth + uDepthBias) {
+            discard;
+        }
+    }
     vec3 color = texture(uTexture, vUv).rgb * clamp(vShade, 0.35, 1.08);
     fragColor = vec4(color, 1.0);
 }
@@ -968,6 +1006,7 @@ void main() {
     g_gl_bind_attrib_location(g_hand_program, 0, "aPos");
     g_gl_bind_attrib_location(g_hand_program, 1, "aUv");
     g_gl_bind_attrib_location(g_hand_program, 2, "aShade");
+    g_gl_bind_attrib_location(g_hand_program, 3, "aDepth");
     g_gl_link_program(g_hand_program);
     g_gl_delete_shader(vertex);
     g_gl_delete_shader(fragment);
@@ -987,6 +1026,12 @@ void main() {
         return false;
     }
     g_hand_texture_uniform = g_gl_get_uniform_location(g_hand_program, "uTexture");
+    g_hand_scene_depth_uniform = g_gl_get_uniform_location(g_hand_program, "uSceneDepth");
+    g_hand_use_scene_depth_uniform = g_gl_get_uniform_location(g_hand_program, "uUseSceneDepth");
+    g_hand_viewport_size_uniform = g_gl_get_uniform_location(g_hand_program, "uViewportSize");
+    g_hand_depth_far_clip_uniform = g_gl_get_uniform_location(g_hand_program, "uDepthFarClip");
+    g_hand_depth_bias_uniform = g_gl_get_uniform_location(g_hand_program, "uDepthBias");
+    g_hand_depth_scale_uniform = g_gl_get_uniform_location(g_hand_program, "uHandDepthScale");
 
     GLint old_texture = 0;
     GLint old_unpack = 4;
@@ -1240,7 +1285,42 @@ struct HandDrawVertex {
     float u = 0.5f;
     float v = 0.5f;
     float shade = 1.0f;
+    float depth = 0.0f;
 };
+
+struct SceneDepthTextureSnapshot {
+    GLuint texture = 0;
+    int width = 0;
+    int height = 0;
+    uint32_t frame = 0;
+    float far_clip = 1024.0f;
+    bool valid = false;
+};
+
+SceneDepthTextureSnapshot scene_depth_texture_snapshot() {
+    SceneDepthTextureSnapshot snapshot{};
+    if (!ensure_ui_scale_mapping() || !g_ui_scale_shared) return snapshot;
+
+    const LONG texture = InterlockedCompareExchange(
+        &g_ui_scale_shared->sceneDepthTextureId, 0, 0);
+    const LONG width = InterlockedCompareExchange(
+        &g_ui_scale_shared->sceneDepthTextureWidth, 0, 0);
+    const LONG height = InterlockedCompareExchange(
+        &g_ui_scale_shared->sceneDepthTextureHeight, 0, 0);
+    const LONG frame = InterlockedCompareExchange(
+        &g_ui_scale_shared->sceneDepthTextureFrame, 0, 0);
+    if (texture <= 0 || width < 512 || height < 256) return snapshot;
+
+    snapshot.texture = static_cast<GLuint>(texture);
+    snapshot.width = static_cast<int>(width);
+    snapshot.height = static_cast<int>(height);
+    snapshot.frame = static_cast<uint32_t>((std::max)(0L, frame));
+    snapshot.far_clip = g_ui_scale_shared->sceneDepthFarClip > 1.0f
+        ? g_ui_scale_shared->sceneDepthFarClip
+        : 1024.0f;
+    snapshot.valid = true;
+    return snapshot;
+}
 
 void fill_projected_triangle(const ProjectedHandTriangle& triangle,
                              int width, int height) {
@@ -1306,6 +1386,7 @@ bool draw_projected_hand_triangles_gl(const std::vector<ProjectedHandTriangle>& 
             out.u = vertex.u;
             out.v = vertex.v;
             out.shade = vertex.shade;
+            out.depth = vertex.depth;
             vertices.push_back(out);
         }
     }
@@ -1315,7 +1396,8 @@ bool draw_projected_hand_triangles_gl(const std::vector<ProjectedHandTriangle>& 
     GLint old_vertex_array = 0;
     GLint old_array_buffer = 0;
     GLint old_active_texture = GL_TEXTURE0_VALUE;
-    GLint old_texture = 0;
+    GLint old_texture0 = 0;
+    GLint old_texture1 = 0;
     GLint old_viewport[4]{};
     GLboolean old_color_mask[4]{};
     glGetIntegerv(GL_CURRENT_PROGRAM_VALUE, &old_program);
@@ -1325,7 +1407,9 @@ bool draw_projected_hand_triangles_gl(const std::vector<ProjectedHandTriangle>& 
     glGetIntegerv(GL_VIEWPORT_VALUE, old_viewport);
     glGetBooleanv(GL_COLOR_WRITEMASK, old_color_mask);
     g_gl_active_texture(GL_TEXTURE0_VALUE);
-    glGetIntegerv(GL_TEXTURE_BINDING_2D, &old_texture);
+    glGetIntegerv(GL_TEXTURE_BINDING_2D, &old_texture0);
+    g_gl_active_texture(GL_TEXTURE1_VALUE);
+    glGetIntegerv(GL_TEXTURE_BINDING_2D, &old_texture1);
 
     const GLboolean scissor_enabled = glIsEnabled(GL_SCISSOR_TEST);
     const GLboolean depth_enabled = glIsEnabled(GL_DEPTH_TEST);
@@ -1341,7 +1425,31 @@ bool draw_projected_hand_triangles_gl(const std::vector<ProjectedHandTriangle>& 
 
     g_gl_use_program(g_hand_program);
     g_gl_uniform_1i(g_hand_texture_uniform, 0);
+    g_gl_uniform_1i(g_hand_scene_depth_uniform, 1);
+    g_gl_uniform_2f(g_hand_viewport_size_uniform,
+                    static_cast<float>(width), static_cast<float>(height));
+    const SceneDepthTextureSnapshot scene_depth = scene_depth_texture_snapshot();
+    const bool use_scene_depth = scene_depth.valid && scene_depth.texture != 0;
+    if (g_shared) {
+        g_shared->scene_depth_texture_id = scene_depth.texture;
+        g_shared->scene_depth_width = static_cast<uint32_t>((std::max)(0, scene_depth.width));
+        g_shared->scene_depth_height = static_cast<uint32_t>((std::max)(0, scene_depth.height));
+        g_shared->scene_depth_frame = scene_depth.frame;
+        InterlockedIncrement(reinterpret_cast<volatile LONG*>(&g_shared->hand_depth_draws));
+        if (use_scene_depth) {
+            InterlockedIncrement(reinterpret_cast<volatile LONG*>(&g_shared->hand_depth_active_draws));
+        }
+    }
+    g_gl_uniform_1i(g_hand_use_scene_depth_uniform, use_scene_depth ? 1 : 0);
+    g_gl_uniform_1f(g_hand_depth_far_clip_uniform, scene_depth.far_clip);
+    g_gl_uniform_1f(g_hand_depth_bias_uniform, 0.06f);
+    g_gl_uniform_1f(g_hand_depth_scale_uniform, 2.5f);
+    g_gl_active_texture(GL_TEXTURE0_VALUE);
     glBindTexture(GL_TEXTURE_2D, g_hand_texture_gl);
+    if (use_scene_depth) {
+        g_gl_active_texture(GL_TEXTURE1_VALUE);
+        glBindTexture(GL_TEXTURE_2D, scene_depth.texture);
+    }
     g_gl_bind_vertex_array(g_hand_vao);
     g_gl_bind_buffer(GL_ARRAY_BUFFER_VALUE, g_hand_vbo);
     g_gl_buffer_data(GL_ARRAY_BUFFER_VALUE,
@@ -1350,12 +1458,15 @@ bool draw_projected_hand_triangles_gl(const std::vector<ProjectedHandTriangle>& 
     g_gl_enable_vertex_attrib_array(0);
     g_gl_enable_vertex_attrib_array(1);
     g_gl_enable_vertex_attrib_array(2);
+    g_gl_enable_vertex_attrib_array(3);
     g_gl_vertex_attrib_pointer(0, 2, GL_FLOAT, GL_FALSE, sizeof(HandDrawVertex),
                                reinterpret_cast<void*>(offsetof(HandDrawVertex, x)));
     g_gl_vertex_attrib_pointer(1, 2, GL_FLOAT, GL_FALSE, sizeof(HandDrawVertex),
                                reinterpret_cast<void*>(offsetof(HandDrawVertex, u)));
     g_gl_vertex_attrib_pointer(2, 1, GL_FLOAT, GL_FALSE, sizeof(HandDrawVertex),
                                reinterpret_cast<void*>(offsetof(HandDrawVertex, shade)));
+    g_gl_vertex_attrib_pointer(3, 1, GL_FLOAT, GL_FALSE, sizeof(HandDrawVertex),
+                               reinterpret_cast<void*>(offsetof(HandDrawVertex, depth)));
     glDrawArrays(GL_TRIANGLES, 0, static_cast<GLsizei>(vertices.size()));
 
     if (blend_enabled) glEnable(GL_BLEND); else glDisable(GL_BLEND);
@@ -1367,7 +1478,10 @@ bool draw_projected_hand_triangles_gl(const std::vector<ProjectedHandTriangle>& 
     g_gl_bind_buffer(GL_ARRAY_BUFFER_VALUE, static_cast<GLuint>(old_array_buffer));
     g_gl_bind_vertex_array(static_cast<GLuint>(old_vertex_array));
     g_gl_use_program(static_cast<GLuint>(old_program));
-    glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(old_texture));
+    g_gl_active_texture(GL_TEXTURE1_VALUE);
+    glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(old_texture1));
+    g_gl_active_texture(GL_TEXTURE0_VALUE);
+    glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(old_texture0));
     g_gl_active_texture(static_cast<GLenum>(old_active_texture));
     return glGetError() == GL_NO_ERROR;
 }
@@ -1709,6 +1823,11 @@ bool ensure_ui_scale_mapping() {
     g_ui_scale_shared->firstPersonHandNdcY = 0.0f;
     g_ui_scale_shared->firstPersonHandDepth = 0.0f;
     g_ui_scale_shared->firstPersonMatrixPatches = 0;
+    g_ui_scale_shared->sceneDepthTextureId = 0;
+    g_ui_scale_shared->sceneDepthTextureWidth = 0;
+    g_ui_scale_shared->sceneDepthTextureHeight = 0;
+    g_ui_scale_shared->sceneDepthTextureFrame = 0;
+    g_ui_scale_shared->sceneDepthFarClip = 1024.0f;
     return true;
 }
 

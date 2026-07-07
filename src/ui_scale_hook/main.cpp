@@ -118,6 +118,7 @@ glUnmapBuffer_t real_glUnmapBuffer = nullptr;
 
 WNDPROC real_WndProc = nullptr;
 HWND g_gameHWND = NULL;
+HWND GetGameWindow();
 
 // Tracking State
 GLuint g_currentProgram = 0;
@@ -157,6 +158,11 @@ struct SharedData {
     float firstPersonHandNdcY;
     float firstPersonHandDepth;
     volatile LONG firstPersonMatrixPatches;
+    volatile LONG sceneDepthTextureId;
+    volatile LONG sceneDepthTextureWidth;
+    volatile LONG sceneDepthTextureHeight;
+    volatile LONG sceneDepthTextureFrame;
+    float sceneDepthFarClip;
 };
 SharedData* g_sharedData = nullptr;
 HANDLE g_hMapFile = NULL;
@@ -213,6 +219,7 @@ std::vector<GLuint> g_mapChunkAlphaPrograms;
 std::vector<GLuint> g_celestialBillboardPrograms;
 std::vector<GLuint> g_basicPrograms;
 std::vector<GLuint> g_skyPrograms;
+std::vector<GLuint> g_hizReprojectPrograms;
 std::vector<GLuint> g_possibleFirstPersonPrograms;
 std::vector<GLuint> g_uiBufferIDs;
 std::mutex g_programsMutex;
@@ -251,6 +258,7 @@ constexpr GLenum GL_FLOAT_VALUE = 0x1406;
 constexpr GLenum GL_COLOR_CLEAR_VALUE = 0x0C22;
 constexpr GLenum GL_TEXTURE_WIDTH_VALUE = 0x1000;
 constexpr GLenum GL_TEXTURE_HEIGHT_VALUE = 0x1001;
+constexpr GLenum GL_TEXTURE_INTERNAL_FORMAT_VALUE = 0x1003;
 constexpr GLenum GL_TRIANGLES_VALUE = 0x0004;
 constexpr GLbitfield GL_COLOR_BUFFER_BIT_VALUE = 0x00004000;
 DWORD g_lastSkyProgramUseTick = 0;
@@ -533,6 +541,12 @@ bool IsSkyProgram(GLuint program) {
            g_skyPrograms.end();
 }
 
+bool IsHiZReprojectProgram(GLuint program) {
+    std::lock_guard<std::mutex> lock(g_programsMutex);
+    return std::find(g_hizReprojectPrograms.begin(), g_hizReprojectPrograms.end(), program) !=
+           g_hizReprojectPrograms.end();
+}
+
 bool ContainsAny(const std::string& text, std::initializer_list<const char*> needles) {
     for (const char* needle : needles) {
         if (text.find(needle) != std::string::npos) return true;
@@ -548,6 +562,96 @@ void RegisterProgramOnce(std::vector<GLuint>& programs,
     programs.push_back(program);
     LogMessage(std::string("HytaleUIScaleHook: Registered ") + kind +
                " program! ID: " + std::to_string(program) + ", Label: " + label);
+}
+
+bool GetClientSize(int& width, int& height) {
+    width = 0;
+    height = 0;
+    if (!real_GetClientRect) return false;
+    HWND hwnd = GetGameWindow();
+    if (!hwnd) return false;
+
+    RECT rect{};
+    if (!real_GetClientRect(hwnd, &rect)) return false;
+    width = rect.right - rect.left;
+    height = rect.bottom - rect.top;
+    return width > 0 && height > 0;
+}
+
+bool IsLikelyLinearSceneDepthTexture(GLsizei width, GLsizei height) {
+    if (width < 512 || height < 256 || width > 4096 || height > 4096) {
+        return false;
+    }
+
+    int clientWidth = 0;
+    int clientHeight = 0;
+    if (GetClientSize(clientWidth, clientHeight)) {
+        const int toleranceX = (std::max)(8, clientWidth / 32);
+        const int toleranceY = (std::max)(8, clientHeight / 32);
+        const bool halfWindow =
+            std::abs(width * 2 - clientWidth) <= toleranceX &&
+            std::abs(height * 2 - clientHeight) <= toleranceY;
+        if (halfWindow) return true;
+    }
+
+    const float aspect = static_cast<float>(width) / static_cast<float>((std::max)(1, height));
+    return aspect >= 1.2f && aspect <= 2.4f;
+}
+
+void PublishSceneDepthTexture(GLuint texture, GLsizei width, GLsizei height, const char* source) {
+    if (!g_sharedData || texture == 0 || !IsLikelyLinearSceneDepthTexture(width, height)) {
+        return;
+    }
+
+    const LONG previousTexture = InterlockedCompareExchange(
+        &g_sharedData->sceneDepthTextureId, 0, 0);
+    const LONG previousWidth = InterlockedCompareExchange(
+        &g_sharedData->sceneDepthTextureWidth, 0, 0);
+    const LONG previousHeight = InterlockedCompareExchange(
+        &g_sharedData->sceneDepthTextureHeight, 0, 0);
+
+    InterlockedExchange(&g_sharedData->sceneDepthTextureId, static_cast<LONG>(texture));
+    InterlockedExchange(&g_sharedData->sceneDepthTextureWidth, static_cast<LONG>(width));
+    InterlockedExchange(&g_sharedData->sceneDepthTextureHeight, static_cast<LONG>(height));
+    g_sharedData->sceneDepthFarClip = 1024.0f;
+    InterlockedIncrement(&g_sharedData->sceneDepthTextureFrame);
+
+    if (previousTexture != static_cast<LONG>(texture) ||
+        previousWidth != static_cast<LONG>(width) ||
+        previousHeight != static_cast<LONG>(height)) {
+        LogMessage(std::string("HytaleUIScaleHook: scene depth texture published from ") +
+                   source + " texture=" + std::to_string(texture) +
+                   " size=" + std::to_string(width) + "x" + std::to_string(height));
+    }
+}
+
+void TryPublishBoundSceneDepthTexture(const char* source) {
+    if (!real_glGetIntegerv || !real_glGetTexLevelParameteriv) return;
+
+    GLint boundTexture = 0;
+    GLint width = 0;
+    GLint height = 0;
+    GLint internalFormat = 0;
+    real_glGetIntegerv(GL_TEXTURE_BINDING_2D_VALUE, &boundTexture);
+    if (boundTexture <= 0) return;
+
+    real_glGetTexLevelParameteriv(GL_TEXTURE_2D_VALUE, 0,
+                                  GL_TEXTURE_INTERNAL_FORMAT_VALUE, &internalFormat);
+    if (internalFormat != static_cast<GLint>(GL_R16F_VALUE)) return;
+
+    real_glGetTexLevelParameteriv(GL_TEXTURE_2D_VALUE, 0, GL_TEXTURE_WIDTH_VALUE, &width);
+    real_glGetTexLevelParameteriv(GL_TEXTURE_2D_VALUE, 0, GL_TEXTURE_HEIGHT_VALUE, &height);
+    PublishSceneDepthTexture(static_cast<GLuint>(boundTexture), width, height, source);
+}
+
+void TryPublishTexture0SceneDepth(const char* source) {
+    if (!real_glActiveTexture || !real_glGetIntegerv) return;
+
+    GLint previousActiveTexture = GL_TEXTURE0_VALUE;
+    real_glGetIntegerv(GL_ACTIVE_TEXTURE_VALUE, &previousActiveTexture);
+    real_glActiveTexture(GL_TEXTURE0_VALUE);
+    TryPublishBoundSceneDepthTexture(source);
+    real_glActiveTexture(static_cast<GLenum>(previousActiveTexture));
 }
 
 void NotePossibleFirstPersonProgram(GLuint program, const std::string& label) {
@@ -704,6 +808,11 @@ void RegisterProgramIfUI(GLuint program) {
             if (labelStr.find("SkyProgram") != std::string::npos) {
                 std::lock_guard<std::mutex> lock(g_programsMutex);
                 RegisterProgramOnce(g_skyPrograms, program, labelStr, "sky");
+            }
+            if (labelStr.find("HiZReprojectProgram") != std::string::npos ||
+                labelStr.find("HiZReproject") != std::string::npos) {
+                std::lock_guard<std::mutex> lock(g_programsMutex);
+                RegisterProgramOnce(g_hizReprojectPrograms, program, labelStr, "HiZ reprojection");
             }
             bool isUI = (labelStr.find("Batcher") != std::string::npos) || 
                         (labelStr.find("Text") != std::string::npos) ||
@@ -945,8 +1054,16 @@ void InitializeSharedMemory() {
             g_sharedData->firstPersonHandNdcY = 0.0f;
             g_sharedData->firstPersonHandDepth = 0.0f;
             g_sharedData->firstPersonMatrixPatches = 0;
+            g_sharedData->sceneDepthTextureId = 0;
+            g_sharedData->sceneDepthTextureWidth = 0;
+            g_sharedData->sceneDepthTextureHeight = 0;
+            g_sharedData->sceneDepthTextureFrame = 0;
+            g_sharedData->sceneDepthFarClip = 1024.0f;
         }
         g_sharedData->firstPersonMatrixPatches = 0;
+        if (g_sharedData->sceneDepthFarClip <= 0.0f) {
+            g_sharedData->sceneDepthFarClip = 1024.0f;
+        }
         LogMessage("HytaleUIScaleHook: Mapped shared memory. Scale: " + std::to_string(g_sharedData->uiScale) + ", OffsetX: " + std::to_string(g_sharedData->offsetX) + ", OffsetY: " + std::to_string(g_sharedData->offsetY) + ", DisableUboScaling: " + std::to_string(g_sharedData->disableUboScaling) + ", DisableShadows: " + std::to_string(g_sharedData->disableShadows) + ", DisableParticles: " + std::to_string(g_sharedData->disableParticles) + ", DisableDistortion: " + std::to_string(g_sharedData->disableDistortion) + ", HideFirstPerson: " + std::to_string(g_sharedData->hideFirstPerson) + ", MenuVisibleCounter: " + std::to_string(g_sharedData->menuVisibleCounter));
     } else {
         LogMessage("HytaleUIScaleHook: Shared memory mapping or view creation failed.");
@@ -1012,6 +1129,36 @@ void WINAPI hook_glUseProgram(GLuint program) {
     }
     real_glUseProgram(program);
     RegisterProgramIfUI(program);
+    if (program != 0 && IsHiZReprojectProgram(program)) {
+        TryPublishTexture0SceneDepth("HiZReprojectProgram use");
+    }
+}
+
+void WINAPI hook_glBindTexture(GLenum target, GLuint texture) {
+    real_glBindTexture(target, texture);
+    if (target != GL_TEXTURE_2D_VALUE || texture == 0 || g_currentProgram == 0 ||
+        !IsHiZReprojectProgram(g_currentProgram) || !real_glGetIntegerv) {
+        return;
+    }
+
+    GLint activeTexture = GL_TEXTURE0_VALUE;
+    real_glGetIntegerv(GL_ACTIVE_TEXTURE_VALUE, &activeTexture);
+    if (activeTexture == GL_TEXTURE0_VALUE) {
+        TryPublishBoundSceneDepthTexture("HiZReproject texture bind");
+    }
+}
+
+void WINAPI hook_glTexImage2D(GLenum target, GLint level, GLint internalformat,
+                              GLsizei width, GLsizei height, GLint border,
+                              GLenum format, GLenum type, const void* pixels) {
+    real_glTexImage2D(target, level, internalformat, width, height, border,
+                      format, type, pixels);
+    if (target == GL_TEXTURE_2D_VALUE && level == 0 && border == 0 &&
+        internalformat == static_cast<GLint>(GL_R16F_VALUE) &&
+        format == GL_RED_VALUE && type == GL_FLOAT_VALUE &&
+        IsLikelyLinearSceneDepthTexture(width, height)) {
+        TryPublishBoundSceneDepthTexture("R16F TexImage2D");
+    }
 }
 
 bool ShouldSkipShadowDraw() {
@@ -2101,6 +2248,16 @@ void InitializeHooks() {
         LPVOID target = (LPVOID)real_glUseProgram;
         status = MH_CreateHook(target, (LPVOID)hook_glUseProgram, (LPVOID*)&real_glUseProgram);
         LogMessage("HytaleUIScaleHook: Create glUseProgram hook status: " + std::string(MH_StatusToString(status)));
+    }
+    if (real_glBindTexture) {
+        LPVOID target = (LPVOID)real_glBindTexture;
+        status = MH_CreateHook(target, (LPVOID)hook_glBindTexture, (LPVOID*)&real_glBindTexture);
+        LogMessage("HytaleUIScaleHook: Create glBindTexture hook status: " + std::string(MH_StatusToString(status)));
+    }
+    if (real_glTexImage2D) {
+        LPVOID target = (LPVOID)real_glTexImage2D;
+        status = MH_CreateHook(target, (LPVOID)hook_glTexImage2D, (LPVOID*)&real_glTexImage2D);
+        LogMessage("HytaleUIScaleHook: Create glTexImage2D hook status: " + std::string(MH_StatusToString(status)));
     }
     if (real_glDrawArrays) {
         LPVOID target = (LPVOID)real_glDrawArrays;

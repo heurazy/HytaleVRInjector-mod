@@ -167,4 +167,10 @@ struct VrCameraShared {
     volatile float native_camera_yaw = 0.0f;
     volatile float body_camera_yaw = 0.0f;
     volatile uint32_t native_head_sync_active = 0;
+    volatile uint32_t scene_depth_texture_id = 0;
+    volatile uint32_t scene_depth_width = 0;
+    volatile uint32_t scene_depth_height = 0;
+    volatile uint32_t scene_depth_frame = 0;
+    volatile uint32_t hand_depth_draws = 0;
+    volatile uint32_t hand_depth_active_draws = 0;
 };
