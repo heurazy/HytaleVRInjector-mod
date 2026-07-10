@@ -1,5 +1,6 @@
 #include "vr_math.h"
 #include "vr_locomotion.h"
+#include "vr_physical_interactions.h"
 
 #include <cstdlib>
 #include <iostream>
@@ -123,6 +124,26 @@ int main() {
                                                      3.0f, true),
                                   expected_scaled_translation),
                      "translation gain and horizontal inversion must be explicit");
+
+    PhysicalMotionHistory motion_history{};
+    motion_history.add(0.0f, 1.50f, 0.0f, 0);
+    motion_history.add(0.3f, 1.56f, 0.0f, 100);
+    motion_history.add(0.6f, 1.62f, 0.0f, 200);
+    success &= check(std::fabs(motion_history.average_speed(200, 330) -
+                               3.0594f) < 0.001f,
+                     "physical swing history must average segment speeds");
+    success &= check(std::fabs(motion_history.net_vertical_movement(200, 250) -
+                               0.12f) < 0.0001f,
+                     "physical jump history must preserve vertical displacement");
+    success &= check(physical_jump_requested(1.62f, 1.50f, 0.12f) &&
+                         !physical_jump_requested(1.54f, 1.50f, 0.12f),
+                     "physical jump must use the configured height and movement thresholds");
+    success &= check(physical_sneak_requested(1.09f, 1.50f) &&
+                         !physical_sneak_requested(1.11f, 1.50f),
+                     "physical sneak must use the 0.4 meter threshold");
+    success &= check(physical_swing_requested(2.51f) &&
+                         !physical_swing_requested(2.49f),
+                     "physical swing must use the 2.5 meter per second threshold");
 
     DigitalStickState stick{};
     stick = digital_stick(0.40f, 0.70f, stick, 0.35f);

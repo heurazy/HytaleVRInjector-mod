@@ -22,6 +22,7 @@
 
 #include "vr_camera_shared.h"
 #include "vr_math.h"
+#include "vr_physical_interactions.h"
 
 namespace {
 
@@ -264,10 +265,23 @@ bool g_right_trigger_pressed = false;
 bool g_left_trigger_pressed = false;
 bool g_left_grip_pressed = false;
 bool g_right_grip_pressed = false;
+hytalevr::PhysicalMotionHistory g_hmd_motion_history;
+hytalevr::PhysicalMotionHistory g_controller_tip_history[2];
+float g_physical_standing_height = 0.0f;
+bool g_physical_standing_height_valid = false;
+bool g_physical_jump_armed = true;
+bool g_physical_swing_armed[2]{true, true};
+ULONGLONG g_physical_jump_until = 0;
+ULONGLONG g_physical_jump_cooldown_until = 0;
+ULONGLONG g_physical_swing_cooldown_until[2]{};
+int g_physical_attack_ray_hand = 1;
+ULONGLONG g_physical_attack_ray_until = 0;
 SRWLOCK g_game_ray_lock = SRWLOCK_INIT;
 float g_controller_ray_offset[3]{};
 float g_controller_ray_direction[3]{};
 bool g_controller_game_ray_valid = false;
+bool g_controller_game_ray_physical_active = false;
+constexpr bool kPhysicalAttacksEnabled = false;
 
 constexpr GLenum GL_READ_FRAMEBUFFER_VALUE = 0x8CA8;
 constexpr GLenum GL_DRAW_FRAMEBUFFER_VALUE = 0x8CA9;
@@ -1376,8 +1390,11 @@ bool draw_projected_hand_triangles_gl(const std::vector<ProjectedHandTriangle>& 
         return false;
     }
 
-    std::vector<HandDrawVertex> vertices;
-    vertices.reserve(triangles.size() * 3);
+    static thread_local std::vector<HandDrawVertex> vertices;
+    vertices.clear();
+    if (vertices.capacity() < triangles.size() * 3) {
+        vertices.reserve(triangles.size() * 3);
+    }
     for (const ProjectedHandTriangle& triangle : triangles) {
         for (const ProjectedHandVertex& vertex : triangle.v) {
             HandDrawVertex out{};
@@ -1483,7 +1500,7 @@ bool draw_projected_hand_triangles_gl(const std::vector<ProjectedHandTriangle>& 
     g_gl_active_texture(GL_TEXTURE0_VALUE);
     glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(old_texture0));
     g_gl_active_texture(static_cast<GLenum>(old_active_texture));
-    return glGetError() == GL_NO_ERROR;
+    return true;
 }
 
 struct ModuleRange {
@@ -2273,24 +2290,39 @@ void apply_vr_camera(void* object) {
         g_last_diag_valid = true;
     }
 
-    bool right_pose_valid = false;
-    Matrix4 right_view_delta = identity_matrix();
+    bool gameplay_pose_valid = false;
+    bool physical_ray_active = false;
+    Matrix4 gameplay_view_delta = identity_matrix();
     AcquireSRWLockShared(&g_pose_lock);
-    if (g_hmd_origin_valid && g_right_controller_valid) {
-        right_view_delta = hytalevr::relative_view_pose(
-            g_hmd_origin_pose, g_right_controller_pose,
+    physical_ray_active = kPhysicalAttacksEnabled &&
+                          GetTickCount64() < g_physical_attack_ray_until;
+    int gameplay_hand = physical_ray_active ? g_physical_attack_ray_hand : 1;
+    bool selected_pose_valid = gameplay_hand == 0
+        ? g_left_controller_valid
+        : g_right_controller_valid;
+    if (!selected_pose_valid && g_right_controller_valid) {
+        gameplay_hand = 1;
+        selected_pose_valid = true;
+    }
+    const float* gameplay_pose = gameplay_hand == 0
+        ? g_left_controller_pose
+        : g_right_controller_pose;
+    if (g_hmd_origin_valid && selected_pose_valid) {
+        gameplay_view_delta = hytalevr::relative_view_pose(
+            g_hmd_origin_pose, gameplay_pose,
             std::clamp(controls.translation_scale, 0.0f, 10.0f),
             std::clamp(controls.translation_y_scale, 0.0f, 10.0f),
             controls.invert_translation_xz != 0);
-        right_pose_valid = true;
+        gameplay_pose_valid = true;
     }
     ReleaseSRWLockShared(&g_pose_lock);
 
     float ray_offset[3]{};
     float ray_direction[3]{};
-    const bool ray_valid = controls.hand_pointer_enabled && right_pose_valid;
+    const bool ray_valid = (controls.hand_pointer_enabled || physical_ray_active) &&
+                           gameplay_pose_valid;
     if (ray_valid) {
-        const Matrix4 controller_view = multiply(right_view_delta, leveled_view);
+        const Matrix4 controller_view = multiply(gameplay_view_delta, leveled_view);
         hytalevr::view_pose(controller_view, ray_offset, ray_direction);
     }
     AcquireSRWLockExclusive(&g_game_ray_lock);
@@ -2299,6 +2331,7 @@ void apply_vr_camera(void* object) {
     std::copy(std::begin(ray_direction), std::end(ray_direction),
               std::begin(g_controller_ray_direction));
     g_controller_game_ray_valid = ray_valid;
+    g_controller_game_ray_physical_active = ray_valid && physical_ray_active;
     ReleaseSRWLockExclusive(&g_game_ray_lock);
 
     g_shared->controller_ray_origin_x = ray_offset[0];
@@ -2309,6 +2342,10 @@ void apply_vr_camera(void* object) {
     g_shared->controller_ray_direction_z = ray_direction[2];
     g_shared->controller_ray_active =
         ray_valid && g_shared->interaction_hook_active ? 1u : 0u;
+    g_shared->physical_attack_ray_sequence =
+        ray_valid && physical_ray_active
+            ? g_shared->physical_attack_sequence
+            : 0u;
     InterlockedIncrement(reinterpret_cast<volatile LONG*>(&g_shared->effects_stabilized));
     InterlockedIncrement(reinterpret_cast<volatile LONG*>(&g_shared->updates));
 }
@@ -2319,20 +2356,21 @@ void apply_controller_gameplay_ray(float* origin, float* direction) {
             reinterpret_cast<volatile LONG*>(&g_shared->interaction_ray_calls));
     }
     VrCameraControls controls{};
-    if (!origin || !direction || !read_controls(controls) || !controls.enabled ||
-        !controls.hand_pointer_enabled) return;
+    if (!origin || !direction || !read_controls(controls) || !controls.enabled) return;
 
     float offset[3]{};
     float controller_direction[3]{};
     bool valid = false;
+    bool physical = false;
     AcquireSRWLockShared(&g_game_ray_lock);
     valid = g_controller_game_ray_valid;
+    physical = g_controller_game_ray_physical_active;
     std::copy(std::begin(g_controller_ray_offset), std::end(g_controller_ray_offset),
               std::begin(offset));
     std::copy(std::begin(g_controller_ray_direction),
               std::end(g_controller_ray_direction), std::begin(controller_direction));
     ReleaseSRWLockShared(&g_game_ray_lock);
-    if (!valid) return;
+    if (!valid || (!controls.hand_pointer_enabled && !physical)) return;
 
     for (int axis = 0; axis < 3; ++axis) {
         origin[axis] += offset[axis];
@@ -2341,6 +2379,119 @@ void apply_controller_gameplay_ray(float* origin, float* direction) {
     if (g_shared) {
         InterlockedIncrement(
             reinterpret_cast<volatile LONG*>(&g_shared->interaction_ray_overrides));
+    }
+}
+
+void reset_physical_tracking_locked() {
+    g_hmd_motion_history.clear();
+    g_controller_tip_history[0].clear();
+    g_controller_tip_history[1].clear();
+    g_physical_standing_height = 0.0f;
+    g_physical_standing_height_valid = false;
+    g_physical_jump_armed = true;
+    g_physical_swing_armed[0] = true;
+    g_physical_swing_armed[1] = true;
+    g_physical_jump_until = 0;
+    g_physical_jump_cooldown_until = 0;
+    g_physical_swing_cooldown_until[0] = 0;
+    g_physical_swing_cooldown_until[1] = 0;
+    g_physical_attack_ray_hand = 1;
+    g_physical_attack_ray_until = 0;
+    if (g_shared) {
+        g_shared->physical_jump_active = 0;
+        g_shared->physical_sneak_active = 0;
+        g_shared->physical_attack_ray_sequence = 0;
+        g_shared->physical_attack_hand = 1;
+        g_shared->physical_hmd_height = 0.0f;
+        g_shared->physical_hmd_vertical_movement = 0.0f;
+        g_shared->physical_left_swing_speed = 0.0f;
+        g_shared->physical_right_swing_speed = 0.0f;
+    }
+}
+
+void update_physical_hmd_locked(const float current[12], ULONGLONG now,
+                                bool recentered) {
+    const float height = current[7];
+    if (recentered || !g_physical_standing_height_valid) {
+        g_hmd_motion_history.clear();
+        g_physical_standing_height = height;
+        g_physical_standing_height_valid = true;
+        g_physical_jump_armed = true;
+        g_physical_jump_until = 0;
+        g_physical_jump_cooldown_until = now + 350;
+    }
+
+    g_hmd_motion_history.add(current[3], height, current[11], now);
+    const float upward_movement = g_hmd_motion_history.net_vertical_movement(
+        now, hytalevr::kPhysicalJumpWindowMs);
+    const bool sneaking = hytalevr::physical_sneak_requested(
+        height, g_physical_standing_height);
+
+    if (height <= g_physical_standing_height + 0.02f && upward_movement <= 0.02f) {
+        g_physical_jump_armed = true;
+    }
+    if (g_physical_jump_armed && !sneaking &&
+        now >= g_physical_jump_cooldown_until &&
+        hytalevr::physical_jump_requested(height, g_physical_standing_height,
+                                          upward_movement)) {
+        g_physical_jump_armed = false;
+        g_physical_jump_until = now + 160;
+        g_physical_jump_cooldown_until = now + 600;
+    }
+
+    if (g_shared) {
+        g_shared->physical_hmd_height = height;
+        g_shared->physical_hmd_vertical_movement = upward_movement;
+        g_shared->physical_jump_active = now < g_physical_jump_until ? 1u : 0u;
+        g_shared->physical_sneak_active = sneaking ? 1u : 0u;
+    }
+}
+
+void update_physical_controller_locked(int hand, const vr::TrackedDevicePose_t& pose,
+                                       bool pose_active, ULONGLONG now) {
+    if (hand < 0 || hand > 1) return;
+    float speed = 0.0f;
+    if (!pose_active) {
+        g_controller_tip_history[hand].clear();
+        g_physical_swing_armed[hand] = true;
+    } else {
+        const auto& matrix = pose.mDeviceToAbsoluteTracking;
+        const float tip_x = matrix.m[0][3] -
+            matrix.m[0][2] * hytalevr::kPhysicalSwingTipOffset;
+        const float tip_y = matrix.m[1][3] -
+            matrix.m[1][2] * hytalevr::kPhysicalSwingTipOffset;
+        const float tip_z = matrix.m[2][3] -
+            matrix.m[2][2] * hytalevr::kPhysicalSwingTipOffset;
+        g_controller_tip_history[hand].add(tip_x, tip_y, tip_z, now);
+        speed = g_controller_tip_history[hand].average_speed(
+            now, hytalevr::kPhysicalSwingWindowMs);
+
+        if (speed < hytalevr::kPhysicalSwingRearmSpeed) {
+            g_physical_swing_armed[hand] = true;
+        }
+        const bool jumping = now < g_physical_jump_until;
+        if (!jumping && g_physical_swing_armed[hand] &&
+            now >= g_physical_swing_cooldown_until[hand] &&
+            hytalevr::physical_swing_requested(speed)) {
+            g_physical_swing_armed[hand] = false;
+            g_physical_swing_cooldown_until[hand] = now + 350;
+            g_physical_attack_ray_hand = hand;
+            g_physical_attack_ray_until = now + 350;
+            if (g_shared) {
+                g_shared->physical_attack_hand = static_cast<uint32_t>(hand);
+                MemoryBarrier();
+                InterlockedIncrement(reinterpret_cast<volatile LONG*>(
+                    &g_shared->physical_attack_sequence));
+            }
+        }
+    }
+
+    if (g_shared) {
+        if (hand == 0) {
+            g_shared->physical_left_swing_speed = speed;
+        } else {
+            g_shared->physical_right_swing_speed = speed;
+        }
     }
 }
 
@@ -2355,6 +2506,7 @@ void update_hmd_pose(const vr::TrackedDevicePose_t& pose,
         }
     }
 
+    const ULONGLONG now = GetTickCount64();
     AcquireSRWLockExclusive(&g_pose_lock);
     bool recentered = false;
     if (!g_hmd_origin_valid || controls.recenter_sequence != g_recenter_sequence) {
@@ -2367,12 +2519,12 @@ void update_hmd_pose(const vr::TrackedDevicePose_t& pose,
             << " poseY=" << std::fixed << std::setprecision(3) << current[7];
         render_log(out.str());
     }
+    update_physical_hmd_locked(current, now, recentered);
     g_hmd_view_delta = hytalevr::relative_view_pose(
         g_hmd_origin_pose, current,
         std::clamp(controls.translation_scale, 0.0f, 10.0f),
         std::clamp(controls.translation_y_scale, 0.0f, 10.0f),
         controls.invert_translation_xz != 0);
-    const ULONGLONG now = GetTickCount64();
     if (render_logging_enabled() &&
         (recentered || now - g_last_hmd_delta_diag_tick >= 1500)) {
         const Matrix4 identity = identity_matrix();
@@ -2569,7 +2721,6 @@ void update_vr_actions() {
         left_pose.pose.bDeviceIsConnected && left_pose.pose.bPoseIsValid;
     const bool pose_active = pose_error == vr::VRInputError_None && right_pose.bActive &&
         right_pose.pose.bDeviceIsConnected && right_pose.pose.bPoseIsValid;
-
     uint64_t left_button_mask = 0;
     uint64_t right_button_mask = 0;
     bool legacy_left_x = false;
@@ -2669,6 +2820,11 @@ void update_vr_actions() {
             }
         }
     }
+    if constexpr (kPhysicalAttacksEnabled) {
+        const ULONGLONG physical_now = GetTickCount64();
+        update_physical_controller_locked(0, left_pose.pose, left_pose_active, physical_now);
+        update_physical_controller_locked(1, right_pose.pose, pose_active, physical_now);
+    }
     ReleaseSRWLockExclusive(&g_pose_lock);
     g_shared->controller_input_error = static_cast<int32_t>(
         move_error != vr::VRInputError_None ? move_error :
@@ -2700,7 +2856,13 @@ bool synchronize_openvr(const VrCameraControls& controls) {
         render_poses, vr::k_unMaxTrackedDeviceCount, nullptr, 0);
     QueryPerformanceCounter(&end);
     if (error == vr::VRCompositorError_None) {
-        update_hmd_pose(render_poses[vr::k_unTrackedDeviceIndex_Hmd], controls);
+        const auto& hmd_pose = render_poses[vr::k_unTrackedDeviceIndex_Hmd];
+        if (hmd_pose.bDeviceIsConnected && hmd_pose.bPoseIsValid) {
+            update_hmd_pose(hmd_pose, controls);
+        } else if (g_shared) {
+            g_shared->physical_jump_active = 0;
+            g_shared->physical_sneak_active = 0;
+        }
     }
 
     if (g_shared) {
@@ -3476,6 +3638,7 @@ void draw_vr_hand_model(int eye, int width, int height,
         width <= 0 || height <= 0 || !load_hand_model()) {
         return;
     }
+    const bool hardware_hand_renderer = ensure_hand_gl_renderer();
 
     float hmd[12]{};
     float controller_poses[2][12]{};
@@ -3500,8 +3663,12 @@ void draw_vr_hand_model(int eye, int width, int height,
     if (!hmd_valid || (!controller_valid[0] && !controller_valid[1])) return;
     const Vec3 eye_position{hmd[3], hmd[7], hmd[11]};
 
-    std::vector<ProjectedHandTriangle> triangles;
-    triangles.reserve((g_hand_vertices.size() / 3) * 2);
+    static thread_local std::vector<ProjectedHandTriangle> triangles;
+    triangles.clear();
+    const size_t required_triangles = (g_hand_vertices.size() / 3) * 2;
+    if (triangles.capacity() < required_triangles) {
+        triangles.reserve(required_triangles);
+    }
     const Vec3 light{-0.25f, 0.55f, -0.80f};
     for (int hand = 0; hand < 2; ++hand) {
         if (!controller_valid[hand]) continue;
@@ -3563,8 +3730,10 @@ void draw_vr_hand_model(int eye, int width, int height,
                 eye_to_center.y * eye_to_center.y +
                 eye_to_center.z * eye_to_center.z;
             triangle.shade = shade_sum / 3.0f;
-            sample_hand_texture(u_sum / 3.0f, v_sum / 3.0f, triangle.shade,
-                                triangle.red, triangle.green, triangle.blue);
+            if (!hardware_hand_renderer) {
+                sample_hand_texture(u_sum / 3.0f, v_sum / 3.0f, triangle.shade,
+                                    triangle.red, triangle.green, triangle.blue);
+            }
             triangles.push_back(triangle);
         }
     }
@@ -3573,7 +3742,17 @@ void draw_vr_hand_model(int eye, int width, int height,
               [](const ProjectedHandTriangle& a, const ProjectedHandTriangle& b) {
                   return a.depth > b.depth;
               });
-    if (draw_projected_hand_triangles_gl(triangles, width, height)) return;
+    if (hardware_hand_renderer &&
+        draw_projected_hand_triangles_gl(triangles, width, height)) return;
+
+    if (hardware_hand_renderer) {
+        for (ProjectedHandTriangle& triangle : triangles) {
+            const float u = (triangle.v[0].u + triangle.v[1].u + triangle.v[2].u) / 3.0f;
+            const float v = (triangle.v[0].v + triangle.v[1].v + triangle.v[2].v) / 3.0f;
+            sample_hand_texture(u, v, triangle.shade,
+                                triangle.red, triangle.green, triangle.blue);
+        }
+    }
 
     const GLboolean scissor_enabled = glIsEnabled(GL_SCISSOR_TEST);
     GLint old_scissor[4]{};
@@ -3635,6 +3814,7 @@ void draw_controller_pointer(int eye, int width, int height, float distance,
 }
 
 bool capture_eye(int eye, const VrCameraControls& controls) {
+    const bool check_gl_errors = render_logging_enabled();
     GLint viewport[4]{};
     glGetIntegerv(GL_VIEWPORT, viewport);
     GLint samples = 0;
@@ -3714,7 +3894,9 @@ bool capture_eye(int eye, const VrCameraControls& controls) {
             return false;
         }
         g_gl_bind_framebuffer(GL_READ_FRAMEBUFFER_VALUE, static_cast<GLuint>(previous_read_fbo));
-        while (glGetError() != GL_NO_ERROR) {}
+        if (check_gl_errors) {
+            while (glGetError() != GL_NO_ERROR) {}
+        }
         int overlay_source_x = viewport[0];
         int overlay_source_y = viewport[1];
         bool overlay_source_multisampled = samples > 1;
@@ -3802,7 +3984,7 @@ bool capture_eye(int eye, const VrCameraControls& controls) {
         } else if (g_shared) {
             publish_pointer(false, 0, 0, 0, 0, false);
         }
-        const GLenum blit_error = glGetError();
+        const GLenum blit_error = check_gl_errors ? glGetError() : GL_NO_ERROR;
         g_gl_bind_framebuffer(GL_READ_FRAMEBUFFER_VALUE, static_cast<GLuint>(previous_read_fbo));
         g_gl_bind_framebuffer(GL_DRAW_FRAMEBUFFER_VALUE, static_cast<GLuint>(previous_draw_fbo));
         if (blit_error != GL_NO_ERROR) {
@@ -4043,6 +4225,7 @@ void shutdown_stereo() {
     g_hmd_current_valid = false;
     g_left_controller_valid = false;
     g_right_controller_valid = false;
+    reset_physical_tracking_locked();
     ReleaseSRWLockExclusive(&g_pose_lock);
     AcquireSRWLockExclusive(&g_camera_lock);
     g_neutral_view_valid = false;
@@ -4082,6 +4265,7 @@ void shutdown_stereo() {
     g_right_grip_pressed = false;
     AcquireSRWLockExclusive(&g_game_ray_lock);
     g_controller_game_ray_valid = false;
+    g_controller_game_ray_physical_active = false;
     ReleaseSRWLockExclusive(&g_game_ray_lock);
     if (g_shared) {
         g_shared->stereo_active = 0;
@@ -4648,6 +4832,7 @@ bool restore_interaction_hook() {
     g_interaction_hook_target = nullptr;
     AcquireSRWLockExclusive(&g_game_ray_lock);
     g_controller_game_ray_valid = false;
+    g_controller_game_ray_physical_active = false;
     ReleaseSRWLockExclusive(&g_game_ray_lock);
     if (g_shared) {
         g_shared->interaction_hook_active = 0;

@@ -175,4 +175,13 @@ struct VrCameraShared {
     volatile uint32_t scene_depth_frame = 0;
     volatile uint32_t hand_depth_draws = 0;
     volatile uint32_t hand_depth_active_draws = 0;
+    volatile uint32_t physical_jump_active = 0;
+    volatile uint32_t physical_sneak_active = 0;
+    volatile uint32_t physical_attack_sequence = 0;
+    volatile uint32_t physical_attack_ray_sequence = 0;
+    volatile uint32_t physical_attack_hand = 1;
+    volatile float physical_hmd_height = 0.0f;
+    volatile float physical_hmd_vertical_movement = 0.0f;
+    volatile float physical_left_swing_speed = 0.0f;
+    volatile float physical_right_swing_speed = 0.0f;
 };

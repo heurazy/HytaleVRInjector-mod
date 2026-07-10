@@ -8,6 +8,7 @@
 #include <cmath>
 #include <cstdint>
 #include <initializer_list>
+#include <unordered_set>
 #include <MinHook.h>
 
 // Basic OpenGL Type Definitions
@@ -222,7 +223,26 @@ std::vector<GLuint> g_skyPrograms;
 std::vector<GLuint> g_hizReprojectPrograms;
 std::vector<GLuint> g_possibleFirstPersonPrograms;
 std::vector<GLuint> g_uiBufferIDs;
+std::unordered_set<GLuint> g_scannedPrograms;
 std::mutex g_programsMutex;
+struct CurrentProgramFlags {
+    bool ui = false;
+    GLint uiMvpLocation = -1;
+    bool batcher2D = false;
+    bool shadow = false;
+    bool sunOcclusion = false;
+    bool ssao = false;
+    bool cloudShadow = false;
+    bool particle = false;
+    bool postEffect = false;
+    bool mapChunkAlpha = false;
+    bool celestialBillboard = false;
+    bool basic = false;
+    bool sky = false;
+    bool hizReproject = false;
+    bool possibleFirstPerson = false;
+};
+CurrentProgramFlags g_currentProgramFlags;
 GLuint g_neutralDistortionTexture = 0;
 GLuint g_blackTexture = 0;
 GLuint g_flatNormalTexture = 0;
@@ -262,11 +282,51 @@ constexpr GLenum GL_TEXTURE_INTERNAL_FORMAT_VALUE = 0x1003;
 constexpr GLenum GL_TRIANGLES_VALUE = 0x0004;
 constexpr GLbitfield GL_COLOR_BUFFER_BIT_VALUE = 0x00004000;
 DWORD g_lastSkyProgramUseTick = 0;
+GLuint g_cachedSceneDepthTexture = 0;
+GLsizei g_cachedSceneDepthWidth = 0;
+GLsizei g_cachedSceneDepthHeight = 0;
 
 std::vector<GLuint> g_loggedBufferIDs;
 std::mutex g_loggedBuffersMutex;
 
+bool ProgramListContains(const std::vector<GLuint>& programs, GLuint program) {
+    return std::find(programs.begin(), programs.end(), program) != programs.end();
+}
+
+void RefreshCurrentProgramFlags(GLuint program) {
+    CurrentProgramFlags flags{};
+    if (program != 0) {
+        std::lock_guard<std::mutex> lock(g_programsMutex);
+        for (const auto& candidate : g_uiPrograms) {
+            if (candidate.id == program) {
+                flags.ui = true;
+                flags.uiMvpLocation = candidate.uMVPMatrixLocation;
+                break;
+            }
+        }
+        flags.batcher2D = ProgramListContains(g_batcher2DPrograms, program);
+        flags.shadow = ProgramListContains(g_shadowPrograms, program);
+        flags.sunOcclusion = ProgramListContains(g_sunOcclusionPrograms, program);
+        flags.ssao = ProgramListContains(g_ssaoPrograms, program);
+        flags.cloudShadow = ProgramListContains(g_cloudShadowPrograms, program);
+        flags.particle = ProgramListContains(g_particlePrograms, program);
+        flags.postEffect = ProgramListContains(g_postEffectPrograms, program);
+        flags.mapChunkAlpha = ProgramListContains(g_mapChunkAlphaPrograms, program);
+        flags.celestialBillboard = ProgramListContains(g_celestialBillboardPrograms, program);
+        flags.basic = ProgramListContains(g_basicPrograms, program);
+        flags.sky = ProgramListContains(g_skyPrograms, program);
+        flags.hizReproject = ProgramListContains(g_hizReprojectPrograms, program);
+        flags.possibleFirstPerson = ProgramListContains(g_possibleFirstPersonPrograms, program);
+    }
+    g_currentProgramFlags = flags;
+}
+
 bool IsUIProgram(GLuint program, GLint location, GLint& outLoc) {
+    if (program == g_currentProgram) {
+        outLoc = g_currentProgramFlags.uiMvpLocation;
+        return g_currentProgramFlags.ui &&
+               (location == -1 || location == g_currentProgramFlags.uiMvpLocation);
+    }
     std::lock_guard<std::mutex> lock(g_programsMutex);
     for (const auto& p : g_uiPrograms) {
         if (p.id == program) {
@@ -280,6 +340,7 @@ bool IsUIProgram(GLuint program, GLint location, GLint& outLoc) {
 }
 
 bool IsBatcher2DProgram(GLuint program) {
+    if (program == g_currentProgram) return g_currentProgramFlags.batcher2D;
     std::lock_guard<std::mutex> lock(g_programsMutex);
     return std::find(g_batcher2DPrograms.begin(), g_batcher2DPrograms.end(), program) !=
            g_batcher2DPrograms.end();
@@ -477,45 +538,53 @@ bool CaptureOrSuppressBatcher2DMenuDraw(GLenum mode, GLsizei count, GLenum type,
 }
 
 bool IsShadowProgram(GLuint program) {
+    if (program == g_currentProgram) return g_currentProgramFlags.shadow;
     std::lock_guard<std::mutex> lock(g_programsMutex);
     return std::find(g_shadowPrograms.begin(), g_shadowPrograms.end(), program) != g_shadowPrograms.end();
 }
 
 bool IsSunOcclusionProgram(GLuint program) {
+    if (program == g_currentProgram) return g_currentProgramFlags.sunOcclusion;
     std::lock_guard<std::mutex> lock(g_programsMutex);
     return std::find(g_sunOcclusionPrograms.begin(), g_sunOcclusionPrograms.end(), program) !=
            g_sunOcclusionPrograms.end();
 }
 
 bool IsSsaoProgram(GLuint program) {
+    if (program == g_currentProgram) return g_currentProgramFlags.ssao;
     std::lock_guard<std::mutex> lock(g_programsMutex);
     return std::find(g_ssaoPrograms.begin(), g_ssaoPrograms.end(), program) !=
            g_ssaoPrograms.end();
 }
 
 bool IsCloudShadowProgram(GLuint program) {
+    if (program == g_currentProgram) return g_currentProgramFlags.cloudShadow;
     std::lock_guard<std::mutex> lock(g_programsMutex);
     return std::find(g_cloudShadowPrograms.begin(), g_cloudShadowPrograms.end(), program) !=
            g_cloudShadowPrograms.end();
 }
 
 bool IsParticleProgram(GLuint program) {
+    if (program == g_currentProgram) return g_currentProgramFlags.particle;
     std::lock_guard<std::mutex> lock(g_programsMutex);
     return std::find(g_particlePrograms.begin(), g_particlePrograms.end(), program) != g_particlePrograms.end();
 }
 
 bool IsPostEffectProgram(GLuint program) {
+    if (program == g_currentProgram) return g_currentProgramFlags.postEffect;
     std::lock_guard<std::mutex> lock(g_programsMutex);
     return std::find(g_postEffectPrograms.begin(), g_postEffectPrograms.end(), program) != g_postEffectPrograms.end();
 }
 
 bool IsMapChunkAlphaProgram(GLuint program) {
+    if (program == g_currentProgram) return g_currentProgramFlags.mapChunkAlpha;
     std::lock_guard<std::mutex> lock(g_programsMutex);
     return std::find(g_mapChunkAlphaPrograms.begin(), g_mapChunkAlphaPrograms.end(), program) !=
            g_mapChunkAlphaPrograms.end();
 }
 
 bool IsPossibleFirstPersonProgram(GLuint program) {
+    if (program == g_currentProgram) return g_currentProgramFlags.possibleFirstPerson;
     std::lock_guard<std::mutex> lock(g_programsMutex);
     return std::find(g_possibleFirstPersonPrograms.begin(),
                      g_possibleFirstPersonPrograms.end(), program) !=
@@ -523,6 +592,7 @@ bool IsPossibleFirstPersonProgram(GLuint program) {
 }
 
 bool IsCelestialBillboardProgram(GLuint program) {
+    if (program == g_currentProgram) return g_currentProgramFlags.celestialBillboard;
     std::lock_guard<std::mutex> lock(g_programsMutex);
     return std::find(g_celestialBillboardPrograms.begin(),
                      g_celestialBillboardPrograms.end(), program) !=
@@ -530,18 +600,21 @@ bool IsCelestialBillboardProgram(GLuint program) {
 }
 
 bool IsBasicProgram(GLuint program) {
+    if (program == g_currentProgram) return g_currentProgramFlags.basic;
     std::lock_guard<std::mutex> lock(g_programsMutex);
     return std::find(g_basicPrograms.begin(), g_basicPrograms.end(), program) !=
            g_basicPrograms.end();
 }
 
 bool IsSkyProgram(GLuint program) {
+    if (program == g_currentProgram) return g_currentProgramFlags.sky;
     std::lock_guard<std::mutex> lock(g_programsMutex);
     return std::find(g_skyPrograms.begin(), g_skyPrograms.end(), program) !=
            g_skyPrograms.end();
 }
 
 bool IsHiZReprojectProgram(GLuint program) {
+    if (program == g_currentProgram) return g_currentProgramFlags.hizReproject;
     std::lock_guard<std::mutex> lock(g_programsMutex);
     return std::find(g_hizReprojectPrograms.begin(), g_hizReprojectPrograms.end(), program) !=
            g_hizReprojectPrograms.end();
@@ -615,6 +688,9 @@ void PublishSceneDepthTexture(GLuint texture, GLsizei width, GLsizei height, con
     InterlockedExchange(&g_sharedData->sceneDepthTextureHeight, static_cast<LONG>(height));
     g_sharedData->sceneDepthFarClip = 1024.0f;
     InterlockedIncrement(&g_sharedData->sceneDepthTextureFrame);
+    g_cachedSceneDepthTexture = texture;
+    g_cachedSceneDepthWidth = width;
+    g_cachedSceneDepthHeight = height;
 
     if (previousTexture != static_cast<LONG>(texture) ||
         previousWidth != static_cast<LONG>(width) ||
@@ -623,6 +699,17 @@ void PublishSceneDepthTexture(GLuint texture, GLsizei width, GLsizei height, con
                    source + " texture=" + std::to_string(texture) +
                    " size=" + std::to_string(width) + "x" + std::to_string(height));
     }
+}
+
+void RefreshCachedSceneDepthTexture() {
+    if (!g_sharedData || g_cachedSceneDepthTexture == 0) return;
+    InterlockedExchange(&g_sharedData->sceneDepthTextureId,
+                        static_cast<LONG>(g_cachedSceneDepthTexture));
+    InterlockedExchange(&g_sharedData->sceneDepthTextureWidth,
+                        static_cast<LONG>(g_cachedSceneDepthWidth));
+    InterlockedExchange(&g_sharedData->sceneDepthTextureHeight,
+                        static_cast<LONG>(g_cachedSceneDepthHeight));
+    InterlockedIncrement(&g_sharedData->sceneDepthTextureFrame);
 }
 
 void TryPublishBoundSceneDepthTexture(const char* source) {
@@ -737,13 +824,10 @@ bool TryPatchFirstPersonMatrix(GLuint program,
 
 void RegisterProgramIfUI(GLuint program) {
     if (program == 0) return;
-    
-    // Check if already registered
+
     {
         std::lock_guard<std::mutex> lock(g_programsMutex);
-        for (const auto& p : g_uiPrograms) {
-            if (p.id == program) return;
-        }
+        if (!g_scannedPrograms.insert(program).second) return;
     }
     
     if (real_glGetObjectLabel && real_glGetUniformLocation) {
@@ -826,8 +910,15 @@ void RegisterProgramIfUI(GLuint program) {
                 p.name = labelStr;
                 
                 std::lock_guard<std::mutex> lock(g_programsMutex);
-                g_uiPrograms.push_back(p);
-                LogMessage("HytaleUIScaleHook: Registered UI program! ID: " + std::to_string(program) + ", Label: " + labelStr + ", uMVPMatrix Location: " + std::to_string(loc));
+                const bool alreadyRegistered = std::any_of(
+                    g_uiPrograms.begin(), g_uiPrograms.end(),
+                    [program](const UIProgram& candidate) {
+                        return candidate.id == program;
+                    });
+                if (!alreadyRegistered) {
+                    g_uiPrograms.push_back(p);
+                    LogMessage("HytaleUIScaleHook: Registered UI program! ID: " + std::to_string(program) + ", Label: " + labelStr + ", uMVPMatrix Location: " + std::to_string(loc));
+                }
             }
         }
     }
@@ -1110,7 +1201,12 @@ void WINAPI hook_glObjectLabel(GLenum identifier, GLuint name, GLsizei length, c
         
         LogMessage("HytaleUIScaleHook: glObjectLabel called on GL_PROGRAM " + std::to_string(name) + " - Label: " + labelStr);
         real_glObjectLabel(identifier, name, length, label);
+        {
+            std::lock_guard<std::mutex> lock(g_programsMutex);
+            g_scannedPrograms.erase(name);
+        }
         RegisterProgramIfUI(name);
+        if (name == g_currentProgram) RefreshCurrentProgramFlags(name);
         return;
     }
     real_glObjectLabel(identifier, name, length, label);
@@ -1118,26 +1214,37 @@ void WINAPI hook_glObjectLabel(GLenum identifier, GLuint name, GLsizei length, c
 
 void WINAPI hook_glLinkProgram(GLuint program) {
     real_glLinkProgram(program);
+    {
+        std::lock_guard<std::mutex> lock(g_programsMutex);
+        g_scannedPrograms.erase(program);
+    }
     RegisterProgramIfUI(program);
+    if (program == g_currentProgram) RefreshCurrentProgramFlags(program);
 }
 
 void WINAPI hook_glUseProgram(GLuint program) {
     g_currentProgram = program;
     g_firstPersonMatrixUniformSerial = 0;
-    if (program != 0 && IsSkyProgram(program)) {
-        g_lastSkyProgramUseTick = GetTickCount();
-    }
     real_glUseProgram(program);
     RegisterProgramIfUI(program);
-    if (program != 0 && IsHiZReprojectProgram(program)) {
-        TryPublishTexture0SceneDepth("HiZReprojectProgram use");
+    RefreshCurrentProgramFlags(program);
+    if (g_currentProgramFlags.sky) {
+        g_lastSkyProgramUseTick = GetTickCount();
+    }
+    if (g_currentProgramFlags.hizReproject) {
+        if (g_cachedSceneDepthTexture != 0) {
+            RefreshCachedSceneDepthTexture();
+        } else {
+            TryPublishTexture0SceneDepth("HiZReprojectProgram use");
+        }
     }
 }
 
 void WINAPI hook_glBindTexture(GLenum target, GLuint texture) {
     real_glBindTexture(target, texture);
     if (target != GL_TEXTURE_2D_VALUE || texture == 0 || g_currentProgram == 0 ||
-        !IsHiZReprojectProgram(g_currentProgram) || !real_glGetIntegerv) {
+        !g_currentProgramFlags.hizReproject || !real_glGetIntegerv ||
+        g_cachedSceneDepthTexture != 0) {
         return;
     }
 
@@ -1562,10 +1669,6 @@ void WINAPI hook_glDrawElements(GLenum mode, GLsizei count, GLenum type, const v
 }
 
 void WINAPI hook_glUniformMatrix4fv(GLint location, GLsizei count, GLboolean transpose, const GLfloat *value) {
-    if (g_currentProgram != 0) {
-        RegisterProgramIfUI(g_currentProgram);
-    }
-    
     GLint mvpLoc = -1;
     float scale = (g_sharedData != nullptr) ? g_sharedData->uiScale : 1.0f;
     float offsetX = (g_sharedData != nullptr) ? g_sharedData->offsetX : 0.0f;

@@ -1887,7 +1887,7 @@ void send_middle_click() {
 }
 
 void update_right_hand_attack() {
-    const bool enabled =
+    const bool pointer_enabled =
         IsDlgButtonChecked(g_window, IDC_VR_HAND_POINTER) == BST_CHECKED;
     const bool right_trigger = g_vr_camera_shared &&
         g_vr_camera_shared->controller_right_trigger_pressed != 0;
@@ -1897,9 +1897,12 @@ void update_right_hand_attack() {
         g_vr_camera_shared->controller_ray_active != 0;
     const bool pose_ready = g_vr_camera_shared &&
         g_vr_camera_shared->controller_right_pose_active != 0;
-    const bool can_click = enabled && ray_ready && pose_ready && hytale_has_input_focus();
-    set_injected_left_mouse(can_click && right_trigger);
-    set_injected_right_mouse(can_click && left_trigger);
+    const bool focused = hytale_has_input_focus();
+
+    const bool trigger_can_click =
+        pointer_enabled && ray_ready && pose_ready && focused;
+    set_injected_left_mouse(trigger_can_click && right_trigger);
+    set_injected_right_mouse(trigger_can_click && left_trigger);
 }
 
 void update_quest_button_actions() {
@@ -1930,6 +1933,7 @@ void update_quest_button_actions() {
     const bool left_grip = g_vr_camera_shared->controller_left_grip != 0;
     const bool right_grip = g_vr_camera_shared->controller_right_grip != 0;
     const bool right_stick_click = g_vr_camera_shared->controller_right_stick_click != 0;
+    const bool physical_sneak = g_vr_camera_shared->physical_sneak_active != 0;
 
     if (button_x && !g_prev_button_x) {
         const WORD use_key = key_override(IDC_VR_KEY_USE, 'F');
@@ -1947,8 +1951,9 @@ void update_quest_button_actions() {
     if (right_grip && !g_prev_right_grip) send_mouse_wheel(WHEEL_DELTA);
     if (right_stick_click && !g_prev_right_stick_click) {
         g_sneak_toggled = !g_sneak_toggled;
-        set_injected_key(g_sneak_key, VK_CONTROL, g_sneak_toggled);
     }
+    set_injected_key(g_sneak_key, VK_CONTROL,
+                     g_sneak_toggled || physical_sneak);
 
     g_prev_button_x = button_x;
     g_prev_button_y = button_y;
@@ -2105,7 +2110,8 @@ bool read_quest_controls(float& x, float& y, bool& jump, bool& sprint) {
     if (!g_vr_camera_shared || !g_vr_camera_shared->controller_active) return false;
     x = g_vr_camera_shared->controller_move_x;
     y = g_vr_camera_shared->controller_move_y;
-    jump = g_vr_camera_shared->controller_jump != 0;
+    jump = g_vr_camera_shared->controller_jump != 0 ||
+           g_vr_camera_shared->physical_jump_active != 0;
     sprint = g_vr_camera_shared->controller_sprint != 0;
     return true;
 }
@@ -2114,14 +2120,32 @@ void update_quest_locomotion() {
     const bool enabled = IsDlgButtonChecked(g_window, IDC_VR_QUEST_LOCOMOTION) == BST_CHECKED;
     bool jump = false;
     bool sprint = false;
+    const bool physical_jump = g_vr_camera_shared &&
+        g_vr_camera_shared->physical_jump_active != 0;
     g_quest_controller_connected = enabled &&
         read_quest_controls(g_quest_stick_x, g_quest_stick_y, jump, sprint);
-    if (!g_quest_controller_connected || !hytale_has_input_focus()) {
+    if (!hytale_has_input_focus()) {
         release_quest_keys();
-        if (!g_quest_controller_connected) {
-            g_quest_stick_x = 0.0f;
-            g_quest_stick_y = 0.0f;
-        }
+        return;
+    }
+
+    const MovementKeys movement_keys = movement_keys_for_current_layout();
+    if (!g_quest_controller_connected) {
+        g_quest_stick_x = 0.0f;
+        g_quest_stick_y = 0.0f;
+        g_quest_stick_state = {};
+        set_injected_key(g_injected_keys.forward,
+                         key_override(IDC_VR_KEY_FORWARD, movement_keys.forward), false);
+        set_injected_key(g_injected_keys.backward,
+                         key_override(IDC_VR_KEY_BACKWARD, movement_keys.backward), false);
+        set_injected_key(g_injected_keys.left,
+                         key_override(IDC_VR_KEY_LEFT, movement_keys.left), false);
+        set_injected_key(g_injected_keys.right,
+                         key_override(IDC_VR_KEY_RIGHT, movement_keys.right), false);
+        set_injected_key(g_injected_keys.jump,
+                         key_override(IDC_VR_KEY_JUMP, VK_SPACE), physical_jump);
+        set_injected_key(g_injected_keys.sprint,
+                         key_override(IDC_VR_KEY_SPRINT, VK_SHIFT), false);
         return;
     }
 
@@ -2129,7 +2153,6 @@ void update_quest_locomotion() {
                                       0.10f, 0.90f);
     g_quest_stick_state = hytalevr::digital_stick(
         g_quest_stick_x, g_quest_stick_y, g_quest_stick_state, deadzone);
-    const MovementKeys movement_keys = movement_keys_for_current_layout();
     set_injected_key(g_injected_keys.forward,
                      key_override(IDC_VR_KEY_FORWARD, movement_keys.forward),
                      g_quest_stick_state.forward);
@@ -2529,7 +2552,7 @@ void start_vr_tracking() {
     ++g_vr_recenter_sequence;
     SetTimer(g_window, kVrTimer, 8, nullptr);
     publish_vr_controls(true, false);
-    set_status(L"VR tracking active. Camera 6DoF is enabled; Hytale keeps locomotion and gravity.");
+    set_status(L"VR active. Standing height calibrated; physical jump and crouch are enabled.");
 }
 
 void update_vr_tracking() {
