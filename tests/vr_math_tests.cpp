@@ -29,6 +29,24 @@ int main() {
     success &= check(nearly_equal(relative_view_rotation(origin, origin), identity),
                      "recentered pose must produce identity");
 
+    constexpr float half_sqrt_three = 0.8660254037844386f;
+    const float pitched_recenter_pose[12]{
+        1.0f, 0.0f, 0.0f, 0.0f,
+        0.0f, half_sqrt_three, -0.5f, 1.6f,
+        0.0f, 0.5f, half_sqrt_three, 0.0f,
+    };
+    float standing_origin[12]{};
+    make_yaw_only_tracking_origin(pitched_recenter_pose, standing_origin);
+    success &= check(std::fabs(standing_origin[1]) < 0.0001f &&
+                         std::fabs(standing_origin[5] - 1.0f) < 0.0001f &&
+                         std::fabs(standing_origin[9]) < 0.0001f,
+                     "recenter origin must keep SteamVR's physical up axis");
+    const Matrix4 standing_pitch_view =
+        relative_view_pose(standing_origin, pitched_recenter_pose);
+    success &= check(!nearly_equal(standing_pitch_view, identity) &&
+                         std::fabs(standing_pitch_view.value[6] + 0.5f) < 0.0001f,
+                     "recenter must not absorb headset pitch into the floor");
+
     const float yaw_positive_90[9]{
          0.0f, 0.0f, 1.0f,
          0.0f, 1.0f, 0.0f,

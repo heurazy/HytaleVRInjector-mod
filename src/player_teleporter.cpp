@@ -83,8 +83,6 @@ enum ControlId {
     IDC_VR_MENU_MOUSE,
     IDC_VR_NO_UBO_UI,
     IDC_VR_MENU_IGNORE_DRAW,
-    IDC_VR_FLOOR_TILT,
-    IDC_VR_CALIBRATE_FLOOR,
     IDC_VR_HIDE_FIRST_PERSON_HAND,
     IDC_VR_HAND_MODEL_SCALE,
     IDC_VR_HAND_MODEL_PITCH,
@@ -467,7 +465,7 @@ LRESULT CALLBACK ButtonSubclassProc(HWND hwnd, UINT uMsg, WPARAM wParam, LPARAM 
             int id = GetDlgCtrlID(hwnd);
             bool isSidebarBtn = (id >= IDC_TAB_DASHBOARD && id <= IDC_TAB_UI);
             bool isSecondaryAction = (id == IDC_VR_CENTER || id == IDC_ATTACH ||
-                                      id == IDC_RESTORE || id == IDC_VR_CALIBRATE_FLOOR);
+                                      id == IDC_RESTORE);
 
             g.Clear(isSidebarBtn ? gdip_rgb(12, 12, 16) : gdip_rgb(13, 13, 17));
             
@@ -846,8 +844,7 @@ void update_tab_visibility() {
     // Column 1 IDs
     int showTab1 = ((g_current_tab == 0 && advanced) || g_current_tab == 1) ? SW_SHOW : SW_HIDE;
     int col1_ids[] = {
-        IDC_CURRENT_X, IDC_CURRENT_Y, IDC_CURRENT_Z, IDC_TOLERANCE,
-        IDC_VR_FLOOR_TILT, IDC_VR_CALIBRATE_FLOOR
+        IDC_CURRENT_X, IDC_CURRENT_Y, IDC_CURRENT_Z, IDC_TOLERANCE
     };
     for (int id : col1_ids) ShowWindow(control(id), showTab1);
     
@@ -908,8 +905,6 @@ void layout_controls_for_current_tab() {
         setPos(IDC_CURRENT_Y, 235, 334, 135, 24);
         setPos(IDC_CURRENT_Z, 235, 364, 135, 24);
         setPos(IDC_TOLERANCE, 295, 394, 75, 24);
-        setPos(IDC_VR_FLOOR_TILT, 295, 424, 75, 24);
-        setPos(IDC_VR_CALIBRATE_FLOOR, 235, 456, 135, 24);
         
         // Candidates list box
         setPos(IDC_CANDIDATES, 215, 166, 845, 46);
@@ -963,8 +958,6 @@ void layout_controls_for_current_tab() {
         setPos(IDC_CURRENT_Y, 380, 205, 200, 24);
         setPos(IDC_CURRENT_Z, 380, 235, 200, 24);
         setPos(IDC_TOLERANCE, 380, 265, 200, 24);
-        setPos(IDC_VR_FLOOR_TILT, 380, 295, 90, 24);
-        setPos(IDC_VR_CALIBRATE_FLOOR, 480, 295, 100, 24);
     } 
     else if (g_current_tab == 2) {
         // Rendering layout
@@ -1567,15 +1560,6 @@ float hmd_yaw_from_rotation(const float rotation[9]) {
     const float forward_x = -rotation[2];
     const float forward_z = -rotation[8];
     return std::atan2(forward_x, -forward_z);
-}
-
-float hmd_pitch_degrees_from_rotation(const float rotation[9]) {
-    const float forward_x = -rotation[2];
-    const float forward_y = -rotation[5];
-    const float forward_z = -rotation[8];
-    const float horizontal = std::sqrt(forward_x * forward_x + forward_z * forward_z);
-    constexpr float radians_to_degrees = 57.2957795130823208768f;
-    return std::atan2(forward_y, horizontal) * radians_to_degrees;
 }
 
 float normalize_angle(float radians) {
@@ -2415,8 +2399,8 @@ void publish_vr_controls(bool enabled, bool shutdown_requested, bool unload_requ
         std::clamp(get_float(IDC_VR_POINTER_DISTANCE, 4.0f), 0.5f, 10.0f);
     g_vr_camera_shared->turn_speed =
         std::clamp(get_float(IDC_VR_TURN_SPEED, 450.0f), 50.0f, 2000.0f);
-    g_vr_camera_shared->floor_tilt_degrees =
-        std::clamp(get_float(IDC_VR_FLOOR_TILT, -15.0f), -45.0f, 45.0f);
+    // SteamVR Standing space is the sole source of floor pitch and roll.
+    g_vr_camera_shared->floor_tilt_degrees = 0.0f;
     g_vr_camera_shared->first_person_hand_hidden =
         IsDlgButtonChecked(g_window, IDC_VR_HIDE_FIRST_PERSON_HAND) == BST_CHECKED ? 1u : 0u;
     g_vr_camera_shared->wide_culling_enabled = 0u;
@@ -2437,62 +2421,6 @@ void publish_vr_controls(bool enabled, bool shutdown_requested, bool unload_requ
     g_vr_camera_shared->recenter_sequence = g_vr_recenter_sequence;
     MemoryBarrier();
     InterlockedIncrement(reinterpret_cast<volatile LONG*>(&g_vr_camera_shared->control_sequence));
-}
-
-bool ensure_openvr_for_calibration() {
-    if (g_vr_system) return true;
-    vr::EVRInitError error = vr::VRInitError_None;
-    g_vr_system = vr::VR_Init(&error, vr::VRApplication_Background);
-    if (error != vr::VRInitError_None || !g_vr_system) {
-        g_vr_system = nullptr;
-        set_status(L"SteamVR/OpenVR unavailable. Start SteamVR and wake the headset.");
-        return false;
-    }
-    return true;
-}
-
-void calibrate_floor_tilt() {
-    if (!ensure_openvr_for_calibration()) return;
-
-    constexpr int kSamples = 24;
-    constexpr float kMaxSampleSpreadDegrees = 3.5f;
-    float sum = 0.0f;
-    float minimum = 1000.0f;
-    float maximum = -1000.0f;
-    int samples = 0;
-
-    set_status(L"Calibrating floor tilt... keep your head steady and look naturally forward.");
-    for (int i = 0; i < kSamples; ++i) {
-        Vec3 position{};
-        float rotation[9]{};
-        if (read_hmd_pose(position, rotation)) {
-            const float pitch = std::clamp(hmd_pitch_degrees_from_rotation(rotation), -45.0f, 45.0f);
-            sum += pitch;
-            minimum = std::min(minimum, pitch);
-            maximum = std::max(maximum, pitch);
-            ++samples;
-        }
-        Sleep(10);
-    }
-
-    if (samples < 8) {
-        set_status(L"Floor calibration failed: headset pose was not stable/valid.");
-        return;
-    }
-    if (maximum - minimum > kMaxSampleSpreadDegrees) {
-        set_status(L"Floor calibration cancelled: head moved too much. Try again while steady.");
-        return;
-    }
-
-    const float calibrated = std::clamp(sum / static_cast<float>(samples), -45.0f, 45.0f);
-    set_float(IDC_VR_FLOOR_TILT, calibrated);
-    if (g_vr_tracking) {
-        publish_vr_controls(true, false);
-    }
-
-    wchar_t status[180]{};
-    swprintf_s(status, L"Floor tilt calibrated to %.2f degrees.", calibrated);
-    set_status(status);
 }
 
 void recenter_vr_tracking() {
@@ -2758,8 +2686,6 @@ void create_ui(HWND window) {
     add(L"EDIT", L"121.000", WS_BORDER | ES_AUTOHSCROLL, 235, 334, 135, 24, IDC_CURRENT_Y);
     add(L"EDIT", L"256.118", WS_BORDER | ES_AUTOHSCROLL, 235, 364, 135, 24, IDC_CURRENT_Z);
     add(L"EDIT", L"0.10", WS_BORDER | ES_AUTOHSCROLL, 295, 394, 75, 24, IDC_TOLERANCE);
-    add(L"EDIT", L"-15", WS_BORDER | ES_AUTOHSCROLL, 295, 424, 75, 24, IDC_VR_FLOOR_TILT);
-    add(L"BUTTON", L"Calibrate floor", BS_PUSHBUTTON, 235, 456, 135, 24, IDC_VR_CALIBRATE_FLOOR);
 
     // Column 2 inputs/toggles
     add(L"BUTTON", L"SteamVR stereo", BS_AUTOCHECKBOX, 405, 304, 175, 20, IDC_VR_STEREO);
@@ -3026,7 +2952,6 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
                     g.DrawString(L"Y", -1, &labelFont, Gdiplus::PointF(215.0f, 338.0f), &labelBrush);
                     g.DrawString(L"Z", -1, &labelFont, Gdiplus::PointF(215.0f, 368.0f), &labelBrush);
                     g.DrawString(L"Tolerance", -1, &labelFont, Gdiplus::PointF(215.0f, 398.0f), &labelBrush);
-                    g.DrawString(L"floor tilt", -1, &labelFont, Gdiplus::PointF(215.0f, 428.0f), &labelBrush);
                     g.DrawString(L"IPD mm", -1, &labelFont, Gdiplus::PointF(405.0f, 504.0f), &labelBrush);
                     g.DrawString(L"Separation %", -1, &labelFont, Gdiplus::PointF(405.0f, 532.0f), &labelBrush);
                     g.DrawString(L"VR Resolution", -1, &labelFont, Gdiplus::PointF(405.0f, 560.0f), &labelBrush);
@@ -3064,7 +2989,6 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
                 g.DrawString(L"Y Coordinate", -1, &labelFont, Gdiplus::PointF(220.0f, 208.0f), &labelBrush);
                 g.DrawString(L"Z Coordinate", -1, &labelFont, Gdiplus::PointF(220.0f, 238.0f), &labelBrush);
                 g.DrawString(L"Tolerance", -1, &labelFont, Gdiplus::PointF(220.0f, 268.0f), &labelBrush);
-                g.DrawString(L"floor tilt", -1, &labelFont, Gdiplus::PointF(220.0f, 298.0f), &labelBrush);
             } else if (g_current_tab == 2) {
                 drawPanel(200.0f, 20.0f, 780.0f, 570.0f, L"Rendering Settings");
                 
@@ -3177,7 +3101,6 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
             populate_candidate_list();
             return 0;
         case IDC_VR_CENTER: recenter_vr_tracking(); return 0;
-        case IDC_VR_CALIBRATE_FLOOR: calibrate_floor_tilt(); return 0;
         case IDC_VR_STOP:
             shutdown_vr();
             set_status(L"VR tracking stopped.");

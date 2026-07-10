@@ -1917,10 +1917,6 @@ vr::EVREye current_camera_eye(const VrCameraControls& controls) {
     return left ? vr::Eye_Left : vr::Eye_Right;
 }
 
-Matrix4 floor_tilt_correction(float degrees);
-Matrix4 apply_floor_tilt_correction(const Matrix4& delta,
-                                    const VrCameraControls& controls);
-
 Matrix4 from_openvr(const vr::HmdMatrix44_t& source) {
     Matrix4 result{};
     for (int row = 0; row < 4; ++row) {
@@ -2168,8 +2164,6 @@ void apply_vr_camera(void* object) {
     const Matrix4 leveled_view =
         aggressive_game_view(view, controls, aggressive_native_delta,
                              aggressive_snap_suppressed);
-    const Matrix4 floor_corrected_view =
-        multiply(floor_tilt_correction(controls.floor_tilt_degrees), leveled_view);
     g_last_aggressive_native_delta = aggressive_native_delta;
     if (g_shared) {
         g_shared->native_camera_yaw = yaw_from_view(view);
@@ -2177,14 +2171,16 @@ void apply_vr_camera(void* object) {
         g_shared->camera_yaw_valid = 1;
     }
 
-    const Matrix4 center_view = multiply(delta, floor_corrected_view);
+    // Hytale contributes position and yaw only. Headset pitch and roll remain
+    // absolute in SteamVR's Standing space, so the physical floor stays level.
+    const Matrix4 center_view = multiply(delta, leveled_view);
     const Matrix4 culling_view =
-        controls.hmd_culling_view_enabled ? hytalevr::horizontal_view(center_view) : floor_corrected_view;
-    const Matrix4 neutral_view_projection = multiply(projection, floor_corrected_view);
+        controls.hmd_culling_view_enabled ? hytalevr::horizontal_view(center_view) : leveled_view;
+    const Matrix4 neutral_view_projection = multiply(projection, leveled_view);
     const Matrix4 culling_projection = widen_projection_for_culling(projection, controls);
     const Matrix4 culling_view_projection = multiply(culling_projection, culling_view);
     AcquireSRWLockExclusive(&g_camera_lock);
-    g_neutral_view = floor_corrected_view;
+    g_neutral_view = leveled_view;
     g_neutral_view_valid = true;
     g_culling_view = culling_view;
     g_culling_view_valid = controls.hmd_culling_view_enabled != 0;
@@ -2258,7 +2254,7 @@ void apply_vr_camera(void* object) {
             << " wideCull=" << controls.wide_culling_enabled
             << " cullScale=" << controls.wide_culling_scale
             << " hmdCull=" << controls.hmd_culling_view_enabled
-            << " floorTilt=" << controls.floor_tilt_degrees
+            << " trackingSpace=standing"
             << " hmdOrigin=" << (g_hmd_origin_valid ? 1 : 0)
             << " hmdCurrent=" << (g_hmd_current_valid ? 1 : 0)
             << " selfCullView=" << (reused_cached_native_view ? 1 : 0)
@@ -2294,7 +2290,7 @@ void apply_vr_camera(void* object) {
     float ray_direction[3]{};
     const bool ray_valid = controls.hand_pointer_enabled && right_pose_valid;
     if (ray_valid) {
-        const Matrix4 controller_view = multiply(right_view_delta, floor_corrected_view);
+        const Matrix4 controller_view = multiply(right_view_delta, leveled_view);
         hytalevr::view_pose(controller_view, ray_offset, ray_direction);
     }
     AcquireSRWLockExclusive(&g_game_ray_lock);
@@ -2348,65 +2344,6 @@ void apply_controller_gameplay_ray(float* origin, float* direction) {
     }
 }
 
-Matrix4 floor_tilt_correction(float degrees) {
-    const float clamped = std::clamp(degrees, -45.0f, 45.0f);
-    const float radians = clamped * 0.01745329251994329576923690768489f;
-    if (std::fabs(radians) < 0.00001f) return identity_matrix();
-
-    Matrix4 result = identity_matrix();
-    const float c = std::cos(radians);
-    const float s = std::sin(radians);
-    result.value[5] = c;
-    result.value[6] = s;
-    result.value[9] = -s;
-    result.value[10] = c;
-    return result;
-}
-
-Matrix4 apply_floor_tilt_correction(const Matrix4& delta, const VrCameraControls& controls) {
-    const Matrix4 correction = floor_tilt_correction(controls.floor_tilt_degrees);
-    return multiply(correction, delta);
-}
-
-void make_yaw_only_tracking_origin(const float current[12], float origin[12]) {
-    std::copy(current, current + 12, origin);
-
-    float forward[3]{
-        -current[2],
-        -current[6],
-        -current[10],
-    };
-    forward[1] = 0.0f;
-    float forward_length = std::sqrt(forward[0] * forward[0] +
-                                     forward[2] * forward[2]);
-    if (forward_length < 0.0001f) {
-        forward[0] = 0.0f;
-        forward[2] = -1.0f;
-        forward_length = 1.0f;
-    }
-    forward[0] /= forward_length;
-    forward[2] /= forward_length;
-
-    const float right[3]{
-        -forward[2],
-        0.0f,
-        forward[0],
-    };
-
-    origin[0] = right[0];
-    origin[4] = right[1];
-    origin[8] = right[2];
-    origin[1] = 0.0f;
-    origin[5] = 1.0f;
-    origin[9] = 0.0f;
-    origin[2] = -forward[0];
-    origin[6] = -forward[1];
-    origin[10] = -forward[2];
-    origin[3] = current[3];
-    origin[7] = current[7];
-    origin[11] = current[11];
-}
-
 void update_hmd_pose(const vr::TrackedDevicePose_t& pose,
                      const VrCameraControls& controls) {
     if (!pose.bDeviceIsConnected || !pose.bPoseIsValid) return;
@@ -2421,12 +2358,12 @@ void update_hmd_pose(const vr::TrackedDevicePose_t& pose,
     AcquireSRWLockExclusive(&g_pose_lock);
     bool recentered = false;
     if (!g_hmd_origin_valid || controls.recenter_sequence != g_recenter_sequence) {
-        std::copy(std::begin(current), std::end(current), std::begin(g_hmd_origin_pose));
+        hytalevr::make_yaw_only_tracking_origin(current, g_hmd_origin_pose);
         g_recenter_sequence = controls.recenter_sequence;
         g_hmd_origin_valid = true;
         recentered = true;
         std::ostringstream out;
-        out << "hmd recenter: raw origin seq=" << controls.recenter_sequence
+        out << "hmd recenter: standing yaw-only origin seq=" << controls.recenter_sequence
             << " poseY=" << std::fixed << std::setprecision(3) << current[7];
         render_log(out.str());
     }

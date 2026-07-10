@@ -36,7 +36,8 @@ struct VrCameraControls {
     uint32_t menu_ignore_draw_threshold = 1;
     float hand_pointer_distance = 4.0f;
     float turn_speed = 450.0f;
-    float floor_tilt_degrees = -15.0f;
+    // Legacy ABI slot. Floor orientation now comes from SteamVR Standing space.
+    float floor_tilt_degrees = 0.0f;
     uint32_t first_person_hand_hidden = 1;
     uint32_t wide_culling_enabled = 1;
     float wide_culling_scale = 0.50f;
@@ -82,7 +83,8 @@ struct VrCameraShared {
     uint32_t menu_ignore_draw_threshold = 1;
     float hand_pointer_distance = 4.0f;
     float turn_speed = 450.0f;
-    float floor_tilt_degrees = -15.0f;
+    // Legacy ABI slot. Kept so dashboard/hook field offsets remain compatible.
+    float floor_tilt_degrees = 0.0f;
     uint32_t first_person_hand_hidden = 1;
     uint32_t wide_culling_enabled = 1;
     float wide_culling_scale = 0.50f;

@@ -31,6 +31,39 @@ inline Matrix4 multiply(const Matrix4& a, const Matrix4& b) {
     return result;
 }
 
+// Builds a recenter origin that preserves room position and heading while
+// keeping pitch and roll tied to SteamVR's Standing tracking space. A recenter
+// must never redefine the physical floor from the headset's current tilt.
+inline void make_yaw_only_tracking_origin(const float current[12], float origin[12]) {
+    for (int index = 0; index < 12; ++index) origin[index] = current[index];
+
+    float forward[3]{
+        -current[2],
+        0.0f,
+        -current[10],
+    };
+    float length = std::sqrt(forward[0] * forward[0] +
+                             forward[2] * forward[2]);
+    if (length < 0.0001f) {
+        forward[0] = 0.0f;
+        forward[2] = -1.0f;
+        length = 1.0f;
+    }
+    forward[0] /= length;
+    forward[2] /= length;
+
+    const float right[3]{-forward[2], 0.0f, forward[0]};
+    origin[0] = right[0];
+    origin[4] = right[1];
+    origin[8] = right[2];
+    origin[1] = 0.0f;
+    origin[5] = 1.0f;
+    origin[9] = 0.0f;
+    origin[2] = -forward[0];
+    origin[6] = 0.0f;
+    origin[10] = -forward[2];
+}
+
 // Builds the inverse of the headset rotation relative to its recentered pose:
 // R_view = R_current^T * R_origin. Inputs are row-major 3x3 device poses and
 // the result is a column-major OpenGL matrix.
