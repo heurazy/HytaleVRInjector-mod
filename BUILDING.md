@@ -21,12 +21,12 @@ The final rebuildable package is written to `dist`.
 
 The dashboard build copies these files next to `hytale_camera_dashboard.exe`:
 
-- `hytale_vr_camera_hook_v120_native_hand.dll`
+- `hytale_vr_camera_hook_v122_floor_aligned.dll`
 - `HytaleUIScaleHook.dll`
 - `openvr_api.dll`
 - `hytalevr.vrmanifest`
 - `hytalevr_actions.json`
-- `hytalevr_bindings_oculus_touch.json`
+- SteamVR controller binding JSON files
 
 ## Debug logging
 

@@ -31,6 +31,53 @@ inline Matrix4 multiply(const Matrix4& a, const Matrix4& b) {
     return result;
 }
 
+inline bool inverse(const Matrix4& matrix, Matrix4& result) {
+    float augmented[4][8]{};
+    for (int row = 0; row < 4; ++row) {
+        for (int column = 0; column < 4; ++column) {
+            augmented[row][column] = matrix.value[column * 4 + row];
+        }
+        augmented[row][row + 4] = 1.0f;
+    }
+
+    for (int column = 0; column < 4; ++column) {
+        int pivot = column;
+        for (int row = column + 1; row < 4; ++row) {
+            if (std::fabs(augmented[row][column]) >
+                std::fabs(augmented[pivot][column])) {
+                pivot = row;
+            }
+        }
+        if (std::fabs(augmented[pivot][column]) < 0.000001f) return false;
+        if (pivot != column) {
+            for (int entry = 0; entry < 8; ++entry) {
+                const float temporary = augmented[column][entry];
+                augmented[column][entry] = augmented[pivot][entry];
+                augmented[pivot][entry] = temporary;
+            }
+        }
+
+        const float divisor = augmented[column][column];
+        for (int entry = 0; entry < 8; ++entry) {
+            augmented[column][entry] /= divisor;
+        }
+        for (int row = 0; row < 4; ++row) {
+            if (row == column) continue;
+            const float factor = augmented[row][column];
+            for (int entry = 0; entry < 8; ++entry) {
+                augmented[row][entry] -= factor * augmented[column][entry];
+            }
+        }
+    }
+
+    for (int row = 0; row < 4; ++row) {
+        for (int column = 0; column < 4; ++column) {
+            result.value[column * 4 + row] = augmented[row][column + 4];
+        }
+    }
+    return true;
+}
+
 // Builds a recenter origin that preserves room position and heading while
 // keeping pitch and roll tied to SteamVR's Standing tracking space. A recenter
 // must never redefine the physical floor from the headset's current tilt.
@@ -111,6 +158,15 @@ inline Matrix4 relative_view_pose(const float origin[12], const float current[12
     result.value[13] = translation[1] * vertical_scale;
     result.value[14] = translation[2] * horizontal_scale * horizontal_sign;
     return result;
+}
+
+// Raises the virtual camera in world space without coupling the correction to
+// the headset's pitch or roll. This keeps a calibrated floor stable while the
+// player looks around.
+inline Matrix4 apply_camera_height_offset(const Matrix4& view, float offset) {
+    Matrix4 translation = identity_matrix();
+    translation.value[13] = -offset;
+    return multiply(translation, view);
 }
 
 // Extracts a rigid camera pose from a column-major world-to-view matrix.

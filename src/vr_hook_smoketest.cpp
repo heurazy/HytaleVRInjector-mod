@@ -206,18 +206,18 @@ int wmain(int argc, wchar_t** argv) {
                                      PROCESS_VM_OPERATION | PROCESS_VM_WRITE | PROCESS_VM_READ,
                                  FALSE, pid);
     if (!process) return 5;
-    if (has_incompatible_hook(pid, L"hytale_vr_camera_hook_v120_native_hand.dll")) {
+    if (has_incompatible_hook(pid, L"hytale_vr_camera_hook_v122_floor_aligned.dll")) {
         std::wcerr << L"Une ancienne version du hook est chargee; relance Hytale avant le test.\n";
         CloseHandle(process);
         return 2;
     }
-    const ModuleInfo existing_hook = module_info(pid, L"hytale_vr_camera_hook_v120_native_hand.dll");
+    const ModuleInfo existing_hook = module_info(pid, L"hytale_vr_camera_hook_v122_floor_aligned.dll");
     bool loaded = false;
     bool rearm_existing = false;
     if (existing_hook.base) {
         if (!mapping_existed || shared->magic != kVrCameraMagic ||
             shared->version != kVrCameraVersion || shared->hook_active) {
-            std::wcerr << L"Le hook v100 ignore draw est deja actif; utilise le dashboard pour l'arreter.\n";
+            std::wcerr << L"Le hook v122 est deja actif; utilise le dashboard pour l'arreter.\n";
             CloseHandle(process);
             return 2;
         }
@@ -241,7 +241,7 @@ int wmain(int argc, wchar_t** argv) {
         const std::wstring directory = executable_directory();
         loaded = remote_load_library(process, directory + L"\\HytaleUIScaleHook.dll") &&
                  remote_load_library(process, directory + L"\\openvr_api.dll") &&
-                 remote_load_library(process, directory + L"\\hytale_vr_camera_hook_v120_native_hand.dll");
+                 remote_load_library(process, directory + L"\\hytale_vr_camera_hook_v122_floor_aligned.dll");
     } else if (rearm_existing) {
         publish_install(shared);
     }
@@ -291,6 +291,15 @@ int wmain(int argc, wchar_t** argv) {
         CloseHandle(process);
         return 9;
     }
+    for (int i = 0; i < 1200 &&
+         module_info(pid, L"hytale_vr_camera_hook_v122_floor_aligned.dll").base; ++i) {
+        Sleep(5);
+    }
+    if (module_info(pid, L"hytale_vr_camera_hook_v122_floor_aligned.dll").base) {
+        std::wcerr << L"Les hooks sont restaures, mais la DLL VR est toujours chargee.\n";
+        CloseHandle(process);
+        return 11;
+    }
 
     const uintptr_t base = module_info(pid, L"HytaleClient.exe").base;
     std::array<unsigned char, 16> bytes{};
@@ -319,6 +328,6 @@ int wmain(int argc, wchar_t** argv) {
         std::wcerr << L"Les octets camera, interaction ou SDL originaux ne sont pas restaures.\n";
         return 10;
     }
-    std::wcout << L"Restauration camera/interaction/SDL confirmee; module v100 ignore draw pret a etre rearme.\n";
+    std::wcout << L"Restauration camera/interaction/SDL et dechargement du module v122 confirmes.\n";
     return 0;
 }

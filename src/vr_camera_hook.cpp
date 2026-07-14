@@ -21,8 +21,11 @@
 #include <vector>
 
 #include "vr_camera_shared.h"
+#include "vr_hand_depth.h"
+#include "vr_hook_validation.h"
 #include "vr_math.h"
 #include "vr_physical_interactions.h"
+#include "vr_render_resolution.h"
 
 namespace {
 
@@ -33,8 +36,11 @@ using hytalevr::multiply;
 HMODULE g_module = nullptr;
 HANDLE g_mapping = nullptr;
 VrCameraShared* g_shared = nullptr;
+volatile LONG g_hook_callbacks_in_flight = 0;
+SRWLOCK g_hook_lifecycle_lock = SRWLOCK_INIT;
 std::mutex g_render_log_mutex;
 ULONGLONG g_last_camera_diag_tick = 0;
+ULONGLONG g_last_camera_layout_error_tick = 0;
 ULONGLONG g_last_capture_diag_tick = 0;
 ULONGLONG g_last_swap_diag_tick = 0;
 ULONGLONG g_last_hmd_delta_diag_tick = 0;
@@ -53,6 +59,21 @@ bool g_last_observed_native_yaw_valid = false;
 uint32_t g_aggressive_recenter_sequence = 0;
 uint32_t g_aggressive_suppressed_snaps = 0;
 float g_last_aggressive_native_delta = 0.0f;
+
+class HookCallbackScope {
+public:
+    HookCallbackScope() {
+        InterlockedIncrement(&g_hook_callbacks_in_flight);
+    }
+
+    ~HookCallbackScope() {
+        InterlockedDecrement(&g_hook_callbacks_in_flight);
+    }
+
+    HookCallbackScope(const HookCallbackScope&) = delete;
+    HookCallbackScope& operator=(const HookCallbackScope&) = delete;
+};
+
 struct UiScaleShared {
     float uiScale;
     float offsetX;
@@ -70,6 +91,7 @@ struct UiScaleShared {
     volatile LONG menuTextureFrame;
     volatile LONG menuCaptureError;
     volatile LONG currentEye;
+    volatile LONG renderFrameSequence;
     volatile LONG suppressMenuInGame;
     volatile LONG menuIgnoreDrawThreshold;
     int firstPersonControllerReanchor;
@@ -129,6 +151,7 @@ using GlGetUniformLocationFn = GLint(APIENTRY*)(GLuint, const char*);
 using GlUniform1iFn = void(APIENTRY*)(GLint, GLint);
 using GlUniform1fFn = void(APIENTRY*)(GLint, GLfloat);
 using GlUniform2fFn = void(APIENTRY*)(GLint, GLfloat, GLfloat);
+using GlUniformMatrix4fvFn = void(APIENTRY*)(GLint, GLsizei, GLboolean, const GLfloat*);
 using GlGenVertexArraysFn = void(APIENTRY*)(GLsizei, GLuint*);
 using GlBindVertexArrayFn = void(APIENTRY*)(GLuint);
 using GlGenBuffersFn = void(APIENTRY*)(GLsizei, GLuint*);
@@ -158,12 +181,15 @@ bool g_noesis_hooks_active = false;
 vr::IVRSystem* g_vr_system = nullptr;
 vr::VROverlayHandle_t g_ui_overlay = vr::k_ulOverlayHandleInvalid;
 GLuint g_eye_textures[2]{};
+GLuint g_afw_source_texture = 0;
+GLuint g_eye_depth_textures[2]{};
 bool g_eye_valid[2]{};
+bool g_eye_depth_valid[2]{};
 bool g_pre_ui_captured[2]{};
 int g_texture_width = 0;
 int g_texture_height = 0;
-int g_eye_target_width = 0;
-int g_eye_target_height = 0;
+int g_source_texture_width = 0;
+int g_source_texture_height = 0;
 volatile LONG g_render_eye = 0;
 uint32_t g_last_swap_recenter_sequence = 0;
 uint32_t g_consecutive_submit_failures = 0;
@@ -179,10 +205,14 @@ bool g_hmd_current_valid = false;
 bool g_left_controller_valid = false;
 bool g_right_controller_valid = false;
 uint32_t g_recenter_sequence = 0;
+uint32_t g_floor_height_alignment_sequence = ~0u;
+float g_floor_height_offset = 0.0f;
+float g_floor_height_world_scale = 1.30f;
+float g_native_standing_camera_y = 0.0f;
+bool g_native_standing_camera_y_valid = false;
+float g_last_sneak_height_compensation = 0.0f;
 bool g_runtime_active = false;
 GLuint g_capture_fbo = 0;
-GLuint g_resolve_fbo = 0;
-GLuint g_resolve_texture = 0;
 GLuint g_ui_fbo = 0;
 GLuint g_ui_texture = 0;
 int g_ui_width = 0;
@@ -191,8 +221,6 @@ bool g_ui_redirect_active = false;
 GLint g_ui_saved_draw_fbo = 0;
 GLint g_ui_saved_read_fbo = 0;
 GLint g_ui_saved_viewport[4]{};
-int g_resolve_width = 0;
-int g_resolve_height = 0;
 GlGenFramebuffersFn g_gl_gen_framebuffers = nullptr;
 GlDeleteFramebuffersFn g_gl_delete_framebuffers = nullptr;
 GlBindFramebufferFn g_gl_bind_framebuffer = nullptr;
@@ -216,6 +244,7 @@ GlGetUniformLocationFn g_gl_get_uniform_location = nullptr;
 GlUniform1iFn g_gl_uniform_1i = nullptr;
 GlUniform1fFn g_gl_uniform_1f = nullptr;
 GlUniform2fFn g_gl_uniform_2f = nullptr;
+GlUniformMatrix4fvFn g_gl_uniform_matrix_4fv = nullptr;
 GlGenVertexArraysFn g_gl_gen_vertex_arrays = nullptr;
 GlBindVertexArrayFn g_gl_bind_vertex_array = nullptr;
 GlGenBuffersFn g_gl_gen_buffers = nullptr;
@@ -290,6 +319,8 @@ constexpr GLenum GL_DRAW_FRAMEBUFFER_BINDING_VALUE = 0x8CA6;
 constexpr GLenum GL_COLOR_ATTACHMENT0_VALUE = 0x8CE0;
 constexpr GLenum GL_FRAMEBUFFER_COMPLETE_VALUE = 0x8CD5;
 constexpr GLenum GL_CLAMP_TO_EDGE_VALUE = 0x812F;
+constexpr GLint GL_R16F_VALUE = 0x822D;
+constexpr GLenum GL_RED_VALUE = 0x1903;
 constexpr GLenum GL_SAMPLES_VALUE = 0x80A9;
 constexpr GLenum GL_VIEWPORT_VALUE = 0x0BA2;
 constexpr GLenum GL_VERTEX_SHADER_VALUE = 0x8B31;
@@ -386,9 +417,30 @@ GLint g_hand_use_scene_depth_uniform = -1;
 GLint g_hand_viewport_size_uniform = -1;
 GLint g_hand_depth_far_clip_uniform = -1;
 GLint g_hand_depth_bias_uniform = -1;
-GLint g_hand_depth_scale_uniform = -1;
 bool g_hand_gl_attempted = false;
 bool g_hand_gl_ready = false;
+GLuint g_afw_program = 0;
+GLuint g_afw_vao = 0;
+GLuint g_afw_vbo = 0;
+GLint g_afw_source_color_uniform = -1;
+GLint g_afw_source_depth_uniform = -1;
+GLint g_afw_inverse_source_projection_uniform = -1;
+GLint g_afw_source_projection_uniform = -1;
+GLint g_afw_inverse_target_projection_uniform = -1;
+GLint g_afw_source_to_target_view_uniform = -1;
+GLint g_afw_target_projection_uniform = -1;
+GLint g_afw_depth_far_clip_uniform = -1;
+GLint g_afw_enable_warp_uniform = -1;
+GLint g_afw_output_depth_uniform = -1;
+Matrix4 g_afw_source_view = identity_matrix();
+Matrix4 g_afw_source_projection = identity_matrix();
+Matrix4 g_afw_eye_view[2]{identity_matrix(), identity_matrix()};
+Matrix4 g_afw_eye_projection[2]{identity_matrix(), identity_matrix()};
+Matrix4 g_afw_source_to_eye_view[2]{identity_matrix(), identity_matrix()};
+bool g_afw_camera_valid = false;
+bool g_afw_gl_attempted = false;
+bool g_afw_gl_ready = false;
+uint32_t g_afw_warped_frames = 0;
 
 std::wstring module_directory() {
     wchar_t path[MAX_PATH]{};
@@ -914,6 +966,8 @@ bool load_hand_gl_functions() {
     g_gl_uniform_1i = load_gl_proc<GlUniform1iFn>("glUniform1i");
     g_gl_uniform_1f = load_gl_proc<GlUniform1fFn>("glUniform1f");
     g_gl_uniform_2f = load_gl_proc<GlUniform2fFn>("glUniform2f");
+    g_gl_uniform_matrix_4fv =
+        load_gl_proc<GlUniformMatrix4fvFn>("glUniformMatrix4fv");
     g_gl_gen_vertex_arrays = load_gl_proc<GlGenVertexArraysFn>("glGenVertexArrays");
     g_gl_bind_vertex_array = load_gl_proc<GlBindVertexArrayFn>("glBindVertexArray");
     g_gl_gen_buffers = load_gl_proc<GlGenBuffersFn>("glGenBuffers");
@@ -930,13 +984,14 @@ bool load_hand_gl_functions() {
         g_gl_bind_attrib_location && g_gl_link_program && g_gl_get_program_iv &&
         g_gl_delete_shader && g_gl_use_program && g_gl_get_uniform_location &&
         g_gl_uniform_1i && g_gl_uniform_1f && g_gl_uniform_2f &&
+        g_gl_uniform_matrix_4fv &&
         g_gl_gen_vertex_arrays && g_gl_bind_vertex_array &&
         g_gl_gen_buffers && g_gl_bind_buffer && g_gl_buffer_data &&
         g_gl_enable_vertex_attrib_array && g_gl_vertex_attrib_pointer &&
         g_gl_active_texture;
 }
 
-GLuint compile_hand_shader(GLenum type, const char* source, const char* name) {
+GLuint compile_gl_shader(GLenum type, const char* source, const char* name) {
     GLuint shader = g_gl_create_shader(type);
     g_gl_shader_source(shader, 1, &source, nullptr);
     g_gl_compile_shader(shader);
@@ -950,12 +1005,200 @@ GLuint compile_hand_shader(GLenum type, const char* source, const char* name) {
             g_gl_get_shader_info_log(shader, length, nullptr, log.data());
         }
         std::ostringstream out;
-        out << "hand renderer: " << name << " shader compile failed " << log.c_str();
+        out << name << " shader compile failed " << log.c_str();
         render_log(out.str());
         g_gl_delete_shader(shader);
         return 0;
     }
     return shader;
+}
+
+bool ensure_afw_gl_renderer() {
+    if (g_afw_gl_attempted) return g_afw_gl_ready;
+    g_afw_gl_attempted = true;
+    if (!load_hand_gl_functions()) {
+        render_log("AFW: required OpenGL functions are unavailable");
+        return false;
+    }
+
+    constexpr const char* kVertexSource = R"GLSL(
+#version 130
+in vec2 aPos;
+in vec2 aUv;
+out vec2 vUv;
+void main() {
+    vUv = aUv;
+    gl_Position = vec4(aPos, 0.0, 1.0);
+}
+)GLSL";
+    constexpr const char* kFragmentSource = R"GLSL(
+#version 130
+uniform sampler2D uSourceColor;
+uniform sampler2D uSourceDepth;
+uniform mat4 uInverseSourceProjection;
+uniform mat4 uSourceProjection;
+uniform mat4 uInverseTargetProjection;
+uniform mat4 uSourceToTargetView;
+uniform mat4 uTargetProjection;
+uniform float uDepthFarClip;
+// 0: direct copy, 1: projection correction, 2: depth stereo warp.
+uniform int uEnableWarp;
+uniform int uOutputDepth;
+in vec2 vUv;
+out vec4 fragColor;
+
+vec3 sourceViewPosition(vec2 uv, float linearDepth) {
+    vec4 ray = uInverseSourceProjection * vec4(uv * 2.0 - 1.0, -1.0, 1.0);
+    ray /= max(abs(ray.w), 0.00001);
+    return ray.xyz * (linearDepth / max(-ray.z, 0.0001));
+}
+
+vec2 projectionCorrectedSourceUv(vec2 targetUv) {
+    vec4 targetRay = uInverseTargetProjection *
+        vec4(targetUv * 2.0 - 1.0, -1.0, 1.0);
+    targetRay /= max(abs(targetRay.w), 0.00001);
+    vec4 sourceClip = uSourceProjection * vec4(targetRay.xyz, 1.0);
+    if (abs(sourceClip.w) <= 0.00001) return targetUv;
+    return sourceClip.xy / sourceClip.w * 0.5 + 0.5;
+}
+
+vec2 mirroredSourceUv(vec2 uv) {
+    // A generated eye can reveal a thin strip that is outside the source eye.
+    // Reflect nearby real pixels instead of stretching the final texel column.
+    if (uv.x < 0.0) uv.x = -uv.x;
+    if (uv.x > 1.0) uv.x = 2.0 - uv.x;
+    if (uv.y < 0.0) uv.y = -uv.y;
+    if (uv.y > 1.0) uv.y = 2.0 - uv.y;
+    return clamp(uv, vec2(0.001), vec2(0.999));
+}
+
+void main() {
+    if (uEnableWarp == 0) {
+        fragColor = uOutputDepth != 0
+            ? vec4(texture(uSourceDepth, vUv).r, 0.0, 0.0, 1.0)
+            : texture(uSourceColor, vUv);
+        return;
+    }
+    if (uEnableWarp == 1) {
+        vec2 sourceUv = projectionCorrectedSourceUv(vUv);
+        if (sourceUv.x <= 0.001 || sourceUv.x >= 0.999 ||
+            sourceUv.y <= 0.001 || sourceUv.y >= 0.999) {
+            sourceUv = vUv;
+        }
+        fragColor = uOutputDepth != 0
+            ? vec4(texture(uSourceDepth, sourceUv).r, 0.0, 0.0, 1.0)
+            : texture(uSourceColor, sourceUv);
+        return;
+    }
+    vec2 projectionSourceUv = projectionCorrectedSourceUv(vUv);
+    vec2 sourceUv = projectionSourceUv;
+    bool validDepth = false;
+    for (int iteration = 0; iteration < 3; ++iteration) {
+        vec2 boundedUv = clamp(sourceUv, vec2(0.001), vec2(0.999));
+        float linearDepth = 1.0;
+        if (uEnableWarp == 2) {
+            linearDepth = texture(uSourceDepth, boundedUv).r * uDepthFarClip;
+            if (linearDepth <= 0.001 || linearDepth >= uDepthFarClip * 0.999) break;
+        }
+        validDepth = true;
+        vec4 sourceView = vec4(sourceViewPosition(boundedUv, linearDepth), 1.0);
+        vec4 targetView = uEnableWarp == 2
+            ? uSourceToTargetView * sourceView
+            : sourceView;
+        vec4 targetClip = uTargetProjection * targetView;
+        if (abs(targetClip.w) <= 0.00001) break;
+        vec2 projectedUv = targetClip.xy / targetClip.w * 0.5 + 0.5;
+        sourceUv += projectionSourceUv - projectionCorrectedSourceUv(projectedUv);
+    }
+    if (!validDepth) sourceUv = projectionSourceUv;
+    vec2 displacement = sourceUv - projectionSourceUv;
+    if (abs(displacement.x) > 0.15 || abs(displacement.y) > 0.08) {
+        sourceUv = projectionSourceUv;
+    }
+    vec2 sampledUv = mirroredSourceUv(sourceUv);
+    if (uOutputDepth != 0) {
+        float sourceLinearDepth = texture(uSourceDepth, sampledUv).r * uDepthFarClip;
+        vec4 targetDepthPosition = uSourceToTargetView *
+            vec4(sourceViewPosition(sampledUv, sourceLinearDepth), 1.0);
+        float targetLinearDepth = max(-targetDepthPosition.z, 0.0);
+        fragColor = vec4(clamp(targetLinearDepth / uDepthFarClip, 0.0, 1.0),
+                         0.0, 0.0, 1.0);
+    } else {
+        fragColor = texture(uSourceColor, sampledUv);
+    }
+}
+)GLSL";
+
+    const GLuint vertex = compile_gl_shader(GL_VERTEX_SHADER_VALUE, kVertexSource,
+                                            "AFW vertex");
+    const GLuint fragment = compile_gl_shader(GL_FRAGMENT_SHADER_VALUE, kFragmentSource,
+                                              "AFW fragment");
+    if (!vertex || !fragment) return false;
+
+    g_afw_program = g_gl_create_program();
+    g_gl_attach_shader(g_afw_program, vertex);
+    g_gl_attach_shader(g_afw_program, fragment);
+    g_gl_bind_attrib_location(g_afw_program, 0, "aPos");
+    g_gl_bind_attrib_location(g_afw_program, 1, "aUv");
+    g_gl_link_program(g_afw_program);
+    g_gl_delete_shader(vertex);
+    g_gl_delete_shader(fragment);
+    GLint linked = 0;
+    g_gl_get_program_iv(g_afw_program, GL_LINK_STATUS_VALUE, &linked);
+    if (!linked) {
+        GLint length = 0;
+        g_gl_get_program_iv(g_afw_program, GL_INFO_LOG_LENGTH_VALUE, &length);
+        std::string log(static_cast<size_t>(std::max(1, length)), '\0');
+        if (g_gl_get_program_info_log && length > 1) {
+            g_gl_get_program_info_log(g_afw_program, length, nullptr, log.data());
+        }
+        render_log(std::string("AFW: program link failed ") + log.c_str());
+        g_afw_program = 0;
+        return false;
+    }
+
+    g_afw_source_color_uniform =
+        g_gl_get_uniform_location(g_afw_program, "uSourceColor");
+    g_afw_source_depth_uniform =
+        g_gl_get_uniform_location(g_afw_program, "uSourceDepth");
+    g_afw_inverse_source_projection_uniform =
+        g_gl_get_uniform_location(g_afw_program, "uInverseSourceProjection");
+    g_afw_source_projection_uniform =
+        g_gl_get_uniform_location(g_afw_program, "uSourceProjection");
+    g_afw_inverse_target_projection_uniform =
+        g_gl_get_uniform_location(g_afw_program, "uInverseTargetProjection");
+    g_afw_source_to_target_view_uniform =
+        g_gl_get_uniform_location(g_afw_program, "uSourceToTargetView");
+    g_afw_target_projection_uniform =
+        g_gl_get_uniform_location(g_afw_program, "uTargetProjection");
+    g_afw_depth_far_clip_uniform =
+        g_gl_get_uniform_location(g_afw_program, "uDepthFarClip");
+    g_afw_enable_warp_uniform =
+        g_gl_get_uniform_location(g_afw_program, "uEnableWarp");
+    g_afw_output_depth_uniform =
+        g_gl_get_uniform_location(g_afw_program, "uOutputDepth");
+
+    constexpr float vertices[] = {
+        -1.0f, -1.0f, 0.0f, 0.0f,
+         3.0f, -1.0f, 2.0f, 0.0f,
+        -1.0f,  3.0f, 0.0f, 2.0f,
+    };
+    g_gl_gen_vertex_arrays(1, &g_afw_vao);
+    g_gl_gen_buffers(1, &g_afw_vbo);
+    g_gl_bind_vertex_array(g_afw_vao);
+    g_gl_bind_buffer(GL_ARRAY_BUFFER_VALUE, g_afw_vbo);
+    g_gl_buffer_data(GL_ARRAY_BUFFER_VALUE, sizeof(vertices), vertices, GL_DYNAMIC_DRAW_VALUE);
+    g_gl_enable_vertex_attrib_array(0);
+    g_gl_vertex_attrib_pointer(0, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float), nullptr);
+    g_gl_enable_vertex_attrib_array(1);
+    g_gl_vertex_attrib_pointer(1, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float),
+                               reinterpret_cast<void*>(2 * sizeof(float)));
+    g_gl_bind_buffer(GL_ARRAY_BUFFER_VALUE, 0);
+    g_gl_bind_vertex_array(0);
+
+    g_afw_gl_ready = g_afw_program != 0 && g_afw_vao != 0 && g_afw_vbo != 0;
+    if (g_afw_gl_ready) render_log("AFW: OpenGL depth reprojection ready");
+    return g_afw_gl_ready;
 }
 
 bool ensure_hand_gl_renderer() {
@@ -971,47 +1214,22 @@ bool ensure_hand_gl_renderer() {
 in vec2 aPos;
 in vec2 aUv;
 in float aShade;
-in float aDepth;
+in float aInverseDepth;
 out vec2 vUv;
 out float vShade;
-out float vDepth;
+out float vInverseDepth;
 void main() {
     vUv = vec2(aUv.x, 1.0 - aUv.y);
     vShade = aShade;
-    vDepth = aDepth;
+    vInverseDepth = aInverseDepth;
     gl_Position = vec4(aPos, 0.0, 1.0);
 }
 )GLSL";
-    constexpr const char* kFragmentSource = R"GLSL(
-#version 130
-uniform sampler2D uTexture;
-uniform sampler2D uSceneDepth;
-uniform int uUseSceneDepth;
-uniform vec2 uViewportSize;
-uniform float uDepthFarClip;
-uniform float uDepthBias;
-uniform float uHandDepthScale;
-in vec2 vUv;
-in float vShade;
-in float vDepth;
-out vec4 fragColor;
-void main() {
-    if (uUseSceneDepth != 0 && uViewportSize.x > 0.5 && uViewportSize.y > 0.5) {
-        vec2 depthUv = gl_FragCoord.xy / uViewportSize;
-        float sceneDepth = texture(uSceneDepth, depthUv).r * uDepthFarClip;
-        float handDepth = vDepth * uHandDepthScale;
-        if (sceneDepth > 0.001 && handDepth > sceneDepth + uDepthBias) {
-            discard;
-        }
-    }
-    vec3 color = texture(uTexture, vUv).rgb * clamp(vShade, 0.35, 1.08);
-    fragColor = vec4(color, 1.0);
-}
-)GLSL";
-
-    const GLuint vertex = compile_hand_shader(GL_VERTEX_SHADER_VALUE, kVertexSource, "vertex");
+    const GLuint vertex = compile_gl_shader(GL_VERTEX_SHADER_VALUE, kVertexSource,
+                                            "hand vertex");
     const GLuint fragment =
-        compile_hand_shader(GL_FRAGMENT_SHADER_VALUE, kFragmentSource, "fragment");
+        compile_gl_shader(GL_FRAGMENT_SHADER_VALUE,
+                          hytalevr::kHandDepthFragmentShader, "hand fragment");
     if (!vertex || !fragment) return false;
 
     g_hand_program = g_gl_create_program();
@@ -1020,7 +1238,7 @@ void main() {
     g_gl_bind_attrib_location(g_hand_program, 0, "aPos");
     g_gl_bind_attrib_location(g_hand_program, 1, "aUv");
     g_gl_bind_attrib_location(g_hand_program, 2, "aShade");
-    g_gl_bind_attrib_location(g_hand_program, 3, "aDepth");
+    g_gl_bind_attrib_location(g_hand_program, 3, "aInverseDepth");
     g_gl_link_program(g_hand_program);
     g_gl_delete_shader(vertex);
     g_gl_delete_shader(fragment);
@@ -1045,7 +1263,6 @@ void main() {
     g_hand_viewport_size_uniform = g_gl_get_uniform_location(g_hand_program, "uViewportSize");
     g_hand_depth_far_clip_uniform = g_gl_get_uniform_location(g_hand_program, "uDepthFarClip");
     g_hand_depth_bias_uniform = g_gl_get_uniform_location(g_hand_program, "uDepthBias");
-    g_hand_depth_scale_uniform = g_gl_get_uniform_location(g_hand_program, "uHandDepthScale");
 
     GLint old_texture = 0;
     GLint old_unpack = 4;
@@ -1188,6 +1405,8 @@ bool load_hand_model() {
     return g_hand_model_loaded;
 }
 
+float validated_world_scale(const VrCameraControls& controls);
+
 Vec3 rotate_hand_local(Vec3 value, const VrCameraControls& controls) {
     constexpr float kPi = 3.14159265358979323846f;
     const float pitch = controls.hand_model_pitch_degrees * kPi / 180.0f;
@@ -1210,10 +1429,12 @@ Vec3 rotate_hand_local(Vec3 value, const VrCameraControls& controls) {
 
 Vec3 transform_hand_vertex(const HandVertex& vertex, const float controller[12],
                            bool right_hand, const VrCameraControls& controls) {
-    const float scale = 0.135f * std::clamp(controls.hand_model_scale, 0.10f, 5.0f);
+    const float world_scale = validated_world_scale(controls);
+    const float scale = 0.135f * std::clamp(controls.hand_model_scale, 0.10f, 5.0f) *
+                        world_scale;
     constexpr float offset_x = 0.0f;
-    constexpr float offset_y = -0.035f;
-    constexpr float offset_z = -0.055f;
+    const float offset_y = -0.035f * world_scale;
+    const float offset_z = -0.055f * world_scale;
 
     Vec3 local = vertex.position;
     local.x -= 0.32f;
@@ -1385,7 +1606,8 @@ void fill_projected_triangle(const ProjectedHandTriangle& triangle,
 }
 
 bool draw_projected_hand_triangles_gl(const std::vector<ProjectedHandTriangle>& triangles,
-                                      int width, int height) {
+                                      int width, int height, int eye,
+                                      const VrCameraControls& controls) {
     if (triangles.empty() || width <= 0 || height <= 0 || !ensure_hand_gl_renderer()) {
         return false;
     }
@@ -1403,7 +1625,7 @@ bool draw_projected_hand_triangles_gl(const std::vector<ProjectedHandTriangle>& 
             out.u = vertex.u;
             out.v = vertex.v;
             out.shade = vertex.shade;
-            out.depth = vertex.depth;
+            out.depth = 1.0f / (std::max)(vertex.depth, 0.001f);
             vertices.push_back(out);
         }
     }
@@ -1446,11 +1668,21 @@ bool draw_projected_hand_triangles_gl(const std::vector<ProjectedHandTriangle>& 
     g_gl_uniform_2f(g_hand_viewport_size_uniform,
                     static_cast<float>(width), static_cast<float>(height));
     const SceneDepthTextureSnapshot scene_depth = scene_depth_texture_snapshot();
-    const bool use_scene_depth = scene_depth.valid && scene_depth.texture != 0;
+    GLuint scene_depth_texture = scene_depth.texture;
+    int scene_depth_width = scene_depth.width;
+    int scene_depth_height = scene_depth.height;
+    bool use_scene_depth = scene_depth.valid && scene_depth_texture != 0;
+    if (eye >= 0 && eye <= 1 && g_eye_depth_valid[eye] &&
+        g_eye_depth_textures[eye] != 0) {
+        scene_depth_texture = g_eye_depth_textures[eye];
+        scene_depth_width = g_texture_width;
+        scene_depth_height = g_texture_height;
+        use_scene_depth = true;
+    }
     if (g_shared) {
-        g_shared->scene_depth_texture_id = scene_depth.texture;
-        g_shared->scene_depth_width = static_cast<uint32_t>((std::max)(0, scene_depth.width));
-        g_shared->scene_depth_height = static_cast<uint32_t>((std::max)(0, scene_depth.height));
+        g_shared->scene_depth_texture_id = scene_depth_texture;
+        g_shared->scene_depth_width = static_cast<uint32_t>((std::max)(0, scene_depth_width));
+        g_shared->scene_depth_height = static_cast<uint32_t>((std::max)(0, scene_depth_height));
         g_shared->scene_depth_frame = scene_depth.frame;
         InterlockedIncrement(reinterpret_cast<volatile LONG*>(&g_shared->hand_depth_draws));
         if (use_scene_depth) {
@@ -1459,13 +1691,13 @@ bool draw_projected_hand_triangles_gl(const std::vector<ProjectedHandTriangle>& 
     }
     g_gl_uniform_1i(g_hand_use_scene_depth_uniform, use_scene_depth ? 1 : 0);
     g_gl_uniform_1f(g_hand_depth_far_clip_uniform, scene_depth.far_clip);
-    g_gl_uniform_1f(g_hand_depth_bias_uniform, 0.06f);
-    g_gl_uniform_1f(g_hand_depth_scale_uniform, 2.5f);
+    g_gl_uniform_1f(g_hand_depth_bias_uniform,
+                    std::clamp(controls.hand_depth_tolerance, 0.0f, 1.0f));
     g_gl_active_texture(GL_TEXTURE0_VALUE);
     glBindTexture(GL_TEXTURE_2D, g_hand_texture_gl);
     if (use_scene_depth) {
         g_gl_active_texture(GL_TEXTURE1_VALUE);
-        glBindTexture(GL_TEXTURE_2D, scene_depth.texture);
+        glBindTexture(GL_TEXTURE_2D, scene_depth_texture);
     }
     g_gl_bind_vertex_array(g_hand_vao);
     g_gl_bind_buffer(GL_ARRAY_BUFFER_VALUE, g_hand_vbo);
@@ -1567,20 +1799,40 @@ bool is_executable_page(DWORD protect) {
            protect == PAGE_EXECUTE_READWRITE || protect == PAGE_EXECUTE_WRITECOPY;
 }
 
+bool is_writable_page(DWORD protect) {
+    if (protect & (PAGE_GUARD | PAGE_NOACCESS)) return false;
+    protect &= 0xff;
+    return protect == PAGE_READWRITE || protect == PAGE_WRITECOPY ||
+           protect == PAGE_EXECUTE_READWRITE || protect == PAGE_EXECUTE_WRITECOPY;
+}
+
+bool writable_memory_range(const void* address, size_t size) {
+    if (!address || size == 0) return false;
+    auto* cursor = static_cast<const unsigned char*>(address);
+    const auto* end = cursor + size;
+    while (cursor < end) {
+        MEMORY_BASIC_INFORMATION memory{};
+        if (VirtualQuery(cursor, &memory, sizeof(memory)) != sizeof(memory) ||
+            memory.State != MEM_COMMIT || !is_writable_page(memory.Protect)) {
+            return false;
+        }
+        const auto* region_end = static_cast<const unsigned char*>(memory.BaseAddress) +
+                                 memory.RegionSize;
+        if (region_end <= cursor) return false;
+        cursor = std::min(region_end, end);
+    }
+    return true;
+}
+
+using HookSiteValidator = bool (*)(const unsigned char*);
+
 unsigned char* scan_unique_pattern(const ModuleRange& range, const char* name,
-                                   const char* pattern_text, size_t preferred_rva) {
+                                   const char* pattern_text, size_t preferred_rva,
+                                   HookSiteValidator validator) {
     std::vector<PatternByte> pattern;
     if (!parse_pattern(pattern_text, pattern) || !range.base || range.size < pattern.size()) {
         render_log(std::string("pattern parse failed: ") + name);
         return nullptr;
-    }
-
-    if (preferred_rva > 0 && preferred_rva + pattern.size() <= range.size &&
-        pattern_matches(range.base + preferred_rva, range.size - preferred_rva, pattern)) {
-        std::ostringstream out;
-        out << name << " pattern matched preferred rva=0x" << std::hex << preferred_rva;
-        render_log(out.str());
-        return range.base + preferred_rva;
     }
 
     unsigned char* first = nullptr;
@@ -1598,7 +1850,10 @@ unsigned char* scan_unique_pattern(const ModuleRange& range, const char* name,
             unsigned char* scan_end = std::min(region_end, const_cast<unsigned char*>(end));
             if (scan_end > scan_begin && static_cast<size_t>(scan_end - scan_begin) >= pattern.size()) {
                 for (unsigned char* at = scan_begin; at + pattern.size() <= scan_end; ++at) {
-                    if (!pattern_matches(at, static_cast<size_t>(scan_end - at), pattern)) continue;
+                    if (!pattern_matches(at, static_cast<size_t>(scan_end - at), pattern) ||
+                        (validator && !validator(at))) {
+                        continue;
+                    }
                     if (!first) first = at;
                     ++count;
                     if (count > 1) {
@@ -1617,8 +1872,9 @@ unsigned char* scan_unique_pattern(const ModuleRange& range, const char* name,
 
     if (first) {
         std::ostringstream out;
-        out << name << " pattern found rva=0x" << std::hex
-            << static_cast<uintptr_t>(first - range.base);
+        const size_t found_rva = static_cast<size_t>(first - range.base);
+        out << name << " validated pattern found rva=0x" << std::hex << found_rva;
+        if (found_rva == preferred_rva) out << " (preferred)";
         render_log(out.str());
     } else {
         render_log(std::string(name) + " pattern not found");
@@ -1628,14 +1884,16 @@ unsigned char* scan_unique_pattern(const ModuleRange& range, const char* name,
 
 unsigned char* find_hook_target_by_patterns(const char* name, size_t preferred_rva,
                                             const char* const* patterns,
-                                            size_t pattern_count) {
+                                            size_t pattern_count,
+                                            HookSiteValidator validator) {
     const ModuleRange range = current_executable_range();
     if (!range.base || !range.size) {
         render_log(std::string(name) + " module range unavailable");
         return nullptr;
     }
     for (size_t i = 0; i < pattern_count; ++i) {
-        if (auto* target = scan_unique_pattern(range, name, patterns[i], preferred_rva)) {
+        if (auto* target = scan_unique_pattern(
+                range, name, patterns[i], preferred_rva, validator)) {
             return target;
         }
     }
@@ -1648,21 +1906,27 @@ void reset_eye_capture_resources(const char* reason) {
         g_eye_textures[0] = 0;
         g_eye_textures[1] = 0;
     }
-    if (g_resolve_texture) {
-        glDeleteTextures(1, &g_resolve_texture);
-        g_resolve_texture = 0;
+    if (g_afw_source_texture) {
+        glDeleteTextures(1, &g_afw_source_texture);
+        g_afw_source_texture = 0;
+    }
+    if (g_eye_depth_textures[0] || g_eye_depth_textures[1]) {
+        glDeleteTextures(2, g_eye_depth_textures);
+        g_eye_depth_textures[0] = g_eye_depth_textures[1] = 0;
     }
     g_eye_valid[0] = false;
     g_eye_valid[1] = false;
+    g_eye_depth_valid[0] = g_eye_depth_valid[1] = false;
     g_pre_ui_captured[0] = false;
     g_pre_ui_captured[1] = false;
     g_texture_width = 0;
     g_texture_height = 0;
-    g_resolve_width = 0;
-    g_resolve_height = 0;
-    g_eye_target_width = 0;
-    g_eye_target_height = 0;
+    g_source_texture_width = 0;
+    g_source_texture_height = 0;
     InterlockedExchange(&g_render_eye, 0);
+    AcquireSRWLockExclusive(&g_camera_lock);
+    g_afw_camera_valid = false;
+    ReleaseSRWLockExclusive(&g_camera_lock);
     if (g_shared) {
         g_shared->current_eye = 0;
         g_shared->capture_error = 0;
@@ -1678,7 +1942,8 @@ bool restore_camera_hook();
 bool restore_interaction_hook();
 bool restore_noesis_hooks();
 bool restore_swap_hook();
-bool capture_eye(int eye, const VrCameraControls& controls);
+bool restore_all_hooks(bool render_thread_cleanup);
+bool capture_eye(int eye, const VrCameraControls& controls, bool include_vr_overlays = true);
 
 class SuspendedProcessThreads {
 public:
@@ -1748,9 +2013,10 @@ bool read_controls(VrCameraControls& controls) {
         controls.non_vr_mode = g_shared->non_vr_mode;
         controls.ipd_meters = g_shared->ipd_meters;
         controls.stereo_separation = g_shared->stereo_separation;
-        controls.render_scale = g_shared->render_scale;
+        controls.world_scale = g_shared->world_scale;
         controls.translation_scale = g_shared->translation_scale;
         controls.translation_y_scale = g_shared->translation_y_scale;
+        controls.sneak_active = g_shared->sneak_active;
         controls.invert_translation_xz = g_shared->invert_translation_xz;
         controls.hand_pointer_enabled = g_shared->hand_pointer_enabled;
         controls.hide_center_reticle = g_shared->hide_center_reticle;
@@ -1767,15 +2033,16 @@ bool read_controls(VrCameraControls& controls) {
         controls.menu_ignore_draw_threshold = g_shared->menu_ignore_draw_threshold;
         controls.hand_pointer_distance = g_shared->hand_pointer_distance;
         controls.turn_speed = g_shared->turn_speed;
-        controls.floor_tilt_degrees = g_shared->floor_tilt_degrees;
+        controls.vr_resolution_scale = g_shared->vr_resolution_scale;
         controls.first_person_hand_hidden = g_shared->first_person_hand_hidden;
-        controls.wide_culling_enabled = g_shared->wide_culling_enabled;
-        controls.wide_culling_scale = g_shared->wide_culling_scale;
+        controls.reserved_render_option = g_shared->reserved_render_option;
+        controls.reserved_render_value = g_shared->reserved_render_value;
         controls.hmd_culling_view_enabled = g_shared->hmd_culling_view_enabled;
         controls.hand_model_scale = g_shared->hand_model_scale;
         controls.hand_model_pitch_degrees = g_shared->hand_model_pitch_degrees;
         controls.hand_model_yaw_degrees = g_shared->hand_model_yaw_degrees;
         controls.hand_model_roll_degrees = g_shared->hand_model_roll_degrees;
+        controls.hand_depth_tolerance = g_shared->hand_depth_tolerance;
         MemoryBarrier();
         const LONG after = InterlockedCompareExchange(
             reinterpret_cast<volatile LONG*>(&g_shared->control_sequence), 0, 0);
@@ -1832,6 +2099,7 @@ bool ensure_ui_scale_mapping() {
     g_ui_scale_shared->menuTextureFrame = 0;
     g_ui_scale_shared->menuCaptureError = 0;
     g_ui_scale_shared->currentEye = 0;
+    g_ui_scale_shared->renderFrameSequence = 0;
     g_ui_scale_shared->suppressMenuInGame = 0;
     g_ui_scale_shared->menuIgnoreDrawThreshold = 1;
     g_ui_scale_shared->firstPersonControllerReanchor = 0;
@@ -1975,12 +2243,55 @@ void projection_planes(const Matrix4& projection, float& near_z, float& far_z) {
     far_z = std::clamp(far_z, near_z + 10.0f, 100000.0f);
 }
 
-Matrix4 widen_projection_for_culling(Matrix4 projection, const VrCameraControls& controls) {
-    if (!controls.wide_culling_enabled) return projection;
-    const float scale = std::clamp(controls.wide_culling_scale, 0.05f, 1.0f);
-    projection.value[0] *= scale;
-    projection.value[5] *= scale;
-    return projection;
+Matrix4 combined_stereo_source_projection(const Matrix4& left,
+                                          const Matrix4& right) {
+    const auto horizontal_bounds = [](const Matrix4& projection, float& low, float& high) {
+        const float scale = projection.value[0];
+        const float offset = projection.value[8];
+        low = (-1.0f + offset) / scale;
+        high = (1.0f + offset) / scale;
+        if (low > high) std::swap(low, high);
+    };
+    const auto vertical_bounds = [](const Matrix4& projection, float& low, float& high) {
+        const float scale = projection.value[5];
+        const float offset = projection.value[9];
+        low = (-1.0f + offset) / scale;
+        high = (1.0f + offset) / scale;
+        if (low > high) std::swap(low, high);
+    };
+
+    float left_low = 0.0f;
+    float left_high = 0.0f;
+    float right_low = 0.0f;
+    float right_high = 0.0f;
+    horizontal_bounds(left, left_low, left_high);
+    horizontal_bounds(right, right_low, right_high);
+    float horizontal_low = (std::min)(left_low, right_low);
+    float horizontal_high = (std::max)(left_high, right_high);
+    const float horizontal_margin = (horizontal_high - horizontal_low) * 0.08f;
+    horizontal_low -= horizontal_margin;
+    horizontal_high += horizontal_margin;
+
+    float left_bottom = 0.0f;
+    float left_top = 0.0f;
+    float right_bottom = 0.0f;
+    float right_top = 0.0f;
+    vertical_bounds(left, left_bottom, left_top);
+    vertical_bounds(right, right_bottom, right_top);
+    float vertical_low = (std::min)(left_bottom, right_bottom);
+    float vertical_high = (std::max)(left_top, right_top);
+    const float vertical_margin = (vertical_high - vertical_low) * 0.02f;
+    vertical_low -= vertical_margin;
+    vertical_high += vertical_margin;
+
+    Matrix4 result = left;
+    result.value[0] = 2.0f / (horizontal_high - horizontal_low);
+    result.value[8] =
+        (horizontal_high + horizontal_low) / (horizontal_high - horizontal_low);
+    result.value[5] = 2.0f / (vertical_high - vertical_low);
+    result.value[9] =
+        (vertical_high + vertical_low) / (vertical_high - vertical_low);
+    return result;
 }
 
 bool active_turn_input() {
@@ -2077,30 +2388,132 @@ Matrix4 aggressive_game_view(const Matrix4& native_view,
 
     // Keep native position/culling responsive while refusing sudden orientation
     // changes from Hytale's own camera controller.
-    Matrix4 held = g_aggressive_native_view;
-    held.value[12] = horizontal_native.value[12];
-    held.value[13] = horizontal_native.value[13];
-    held.value[14] = horizontal_native.value[14];
-    g_aggressive_native_view = held;
+    const float held_yaw = yaw_from_view(g_aggressive_native_view);
+    g_aggressive_native_view = horizontal_view_with_yaw(horizontal_native, held_yaw);
     g_last_observed_native_yaw = native_yaw;
     g_last_observed_native_yaw_valid = true;
     snap_suppressed = true;
     ++g_aggressive_suppressed_snaps;
-    return held;
+    return g_aggressive_native_view;
+}
+
+float validated_world_scale(const VrCameraControls& controls) {
+    const float value = std::isfinite(controls.world_scale) && controls.world_scale > 0.0f
+        ? controls.world_scale
+        : 1.30f;
+    return std::clamp(value, 0.50f, 2.00f);
+}
+
+bool update_floor_height_alignment(const Matrix4& native_view,
+                                    const VrCameraControls& controls,
+                                    bool hmd_origin_valid,
+                                    uint32_t hmd_recenter_sequence,
+                                    float hmd_standing_height) {
+    constexpr float kHytaleStandingEyeHeightMeters = 66.2f / 32.0f;
+    const float world_scale = validated_world_scale(controls);
+    if (g_floor_height_alignment_sequence == controls.recenter_sequence &&
+        std::fabs(g_floor_height_world_scale - world_scale) <= 0.0001f) {
+        return true;
+    }
+    if (!hmd_origin_valid || hmd_recenter_sequence != controls.recenter_sequence ||
+        controls.sneak_active != 0) {
+        return false;
+    }
+
+    float camera_position[3]{};
+    float camera_forward[3]{};
+    hytalevr::view_pose(native_view, camera_position, camera_forward);
+    if (!std::isfinite(hmd_standing_height) || !std::isfinite(camera_position[1]) ||
+        hmd_standing_height < 0.50f || hmd_standing_height > 2.60f) {
+        return false;
+    }
+
+    // OpenVR Standing gives the real headset height above the physical floor.
+    // The base Player.blockymodel eye attachment is 66.2 model units high and
+    // Hytale uses 32 model units per world meter. Their difference raises or
+    // lowers the camera once without absorbing later room-scale movement.
+    g_floor_height_offset = std::clamp(
+        hmd_standing_height * world_scale - kHytaleStandingEyeHeightMeters,
+        -4.00f, 4.00f);
+    g_floor_height_world_scale = world_scale;
+    g_native_standing_camera_y = camera_position[1];
+    g_native_standing_camera_y_valid = true;
+    g_floor_height_alignment_sequence = controls.recenter_sequence;
+
+    std::ostringstream out;
+    out << "floor height aligned: physical=" << std::fixed << std::setprecision(3)
+        << hmd_standing_height << " hytaleEye=" << kHytaleStandingEyeHeightMeters
+        << " worldScale=" << world_scale
+        << " offset=" << g_floor_height_offset
+        << " nativeY=" << g_native_standing_camera_y
+        << " seq=" << controls.recenter_sequence;
+    render_log(out.str());
+    return true;
+}
+
+void track_native_standing_camera_height(const Matrix4& native_view,
+                                         const VrCameraControls& controls) {
+    if (controls.sneak_active != 0 ||
+        g_floor_height_alignment_sequence != controls.recenter_sequence) {
+        return;
+    }
+
+    float camera_position[3]{};
+    float camera_forward[3]{};
+    hytalevr::view_pose(native_view, camera_position, camera_forward);
+    if (!std::isfinite(camera_position[1])) return;
+
+    // Native camera Y follows the player's world elevation. Refresh the
+    // standing reference only while not sneaking, then hold it during crouch.
+    g_native_standing_camera_y = camera_position[1];
+    g_native_standing_camera_y_valid = true;
+}
+
+Matrix4 compensate_native_sneak_height(const Matrix4& native_view,
+                                       const VrCameraControls& controls) {
+    g_last_sneak_height_compensation = 0.0f;
+    if (controls.sneak_active == 0 || !g_native_standing_camera_y_valid ||
+        g_floor_height_alignment_sequence != controls.recenter_sequence) {
+        return native_view;
+    }
+
+    float camera_position[3]{};
+    float camera_forward[3]{};
+    hytalevr::view_pose(native_view, camera_position, camera_forward);
+    if (!std::isfinite(camera_position[1])) return native_view;
+
+    const float compensation = std::clamp(
+        g_native_standing_camera_y - camera_position[1], 0.0f, 1.50f);
+    if (compensation <= 0.0001f) return native_view;
+    g_last_sneak_height_compensation = compensation;
+    return hytalevr::apply_camera_height_offset(native_view, compensation);
 }
 
 void apply_vr_camera(void* object) {
+    HookCallbackScope callback_scope;
     if (g_shared) {
         InterlockedIncrement(reinterpret_cast<volatile LONG*>(&g_shared->camera_hook_entries));
     }
     VrCameraControls controls{};
     if (!object || !read_controls(controls) || !controls.enabled) return;
+    const float world_scale = validated_world_scale(controls);
     if (controls.non_vr_mode) {
         publish_render_filters_only(controls);
         return;
     }
 
     auto* camera = static_cast<unsigned char*>(object);
+    constexpr size_t kMatrixSize = sizeof(Matrix4);
+    if (!writable_memory_range(camera + 0x2E0, kMatrixSize) ||
+        !writable_memory_range(camera + 0x320, kMatrixSize) ||
+        !writable_memory_range(camera + 0x4E0, kMatrixSize)) {
+        const ULONGLONG now = GetTickCount64();
+        if (now - g_last_camera_layout_error_tick >= 1000) {
+            render_log("camera hook rejected an object with an incompatible matrix layout");
+            g_last_camera_layout_error_tick = now;
+        }
+        return;
+    }
     Matrix4 raw_view{};
     Matrix4 projection{};
     std::memcpy(&raw_view, camera + 0x2E0, sizeof(raw_view));
@@ -2173,14 +2586,28 @@ void apply_vr_camera(void* object) {
     }
 
     Matrix4 delta{};
+    bool hmd_origin_valid = false;
+    uint32_t hmd_recenter_sequence = 0;
+    float hmd_standing_height = 0.0f;
     AcquireSRWLockShared(&g_pose_lock);
     delta = g_hmd_view_delta;
+    hmd_origin_valid = g_hmd_origin_valid;
+    hmd_recenter_sequence = g_recenter_sequence;
+    hmd_standing_height = g_hmd_origin_pose[7];
     ReleaseSRWLockShared(&g_pose_lock);
     float aggressive_native_delta = 0.0f;
     bool aggressive_snap_suppressed = false;
     const Matrix4 leveled_view =
         aggressive_game_view(view, controls, aggressive_native_delta,
                              aggressive_snap_suppressed);
+    update_floor_height_alignment(leveled_view, controls, hmd_origin_valid,
+                                  hmd_recenter_sequence, hmd_standing_height);
+    track_native_standing_camera_height(leveled_view, controls);
+    const Matrix4 sneak_stabilized_view =
+        compensate_native_sneak_height(leveled_view, controls);
+    const Matrix4 floor_aligned_view =
+        hytalevr::apply_camera_height_offset(sneak_stabilized_view,
+                                             g_floor_height_offset);
     g_last_aggressive_native_delta = aggressive_native_delta;
     if (g_shared) {
         g_shared->native_camera_yaw = yaw_from_view(view);
@@ -2190,14 +2617,14 @@ void apply_vr_camera(void* object) {
 
     // Hytale contributes position and yaw only. Headset pitch and roll remain
     // absolute in SteamVR's Standing space, so the physical floor stays level.
-    const Matrix4 center_view = multiply(delta, leveled_view);
+    const Matrix4 center_view = multiply(delta, floor_aligned_view);
     const Matrix4 culling_view =
-        controls.hmd_culling_view_enabled ? hytalevr::horizontal_view(center_view) : leveled_view;
-    const Matrix4 neutral_view_projection = multiply(projection, leveled_view);
-    const Matrix4 culling_projection = widen_projection_for_culling(projection, controls);
+        controls.hmd_culling_view_enabled ? hytalevr::horizontal_view(center_view) : floor_aligned_view;
+    const Matrix4 neutral_view_projection = multiply(projection, floor_aligned_view);
+    const Matrix4 culling_projection = projection;
     const Matrix4 culling_view_projection = multiply(culling_projection, culling_view);
     AcquireSRWLockExclusive(&g_camera_lock);
-    g_neutral_view = leveled_view;
+    g_neutral_view = floor_aligned_view;
     g_neutral_view_valid = true;
     g_culling_view = culling_view;
     g_culling_view_valid = controls.hmd_culling_view_enabled != 0;
@@ -2219,7 +2646,6 @@ void apply_vr_camera(void* object) {
 
     Matrix4 eye_view_matrix = center_view;
     if (controls.stereo_enabled && g_vr_system) {
-        const vr::EVREye eye = current_camera_eye(controls);
         const auto left_eye = g_vr_system->GetEyeToHeadTransform(vr::Eye_Left);
         const auto right_eye = g_vr_system->GetEyeToHeadTransform(vr::Eye_Right);
         const float dx = right_eye.m[0][3] - left_eye.m[0][3];
@@ -2229,15 +2655,34 @@ void apply_vr_camera(void* object) {
         const float requested_ipd = std::clamp(controls.ipd_meters, 0.04f, 0.08f);
         const float ipd_scale = runtime_ipd > 0.001f ? requested_ipd / runtime_ipd : 1.0f;
         const float separation = std::clamp(controls.stereo_separation, 0.0f, 2.0f) *
-                                 std::clamp(ipd_scale, 0.5f, 1.5f);
-        const auto eye_to_head = eye == vr::Eye_Left ? left_eye : right_eye;
-        const Matrix4 eye_view = inverse_eye_to_head(eye_to_head, separation);
-        eye_view_matrix = multiply(eye_view, center_view);
-
+                                 std::clamp(ipd_scale, 0.5f, 1.5f) * world_scale;
         float near_z = 0.05f;
         float far_z = 10000.0f;
         projection_planes(projection, near_z, far_z);
-        projection = from_openvr(g_vr_system->GetProjectionMatrix(eye, near_z, far_z));
+        const Matrix4 left_eye_view = inverse_eye_to_head(left_eye, separation);
+        const Matrix4 right_eye_view = inverse_eye_to_head(right_eye, separation);
+        const Matrix4 left_view = multiply(left_eye_view, center_view);
+        const Matrix4 right_view = multiply(right_eye_view, center_view);
+        const Matrix4 left_projection = from_openvr(
+            g_vr_system->GetProjectionMatrix(vr::Eye_Left, near_z, far_z));
+        const Matrix4 right_projection = from_openvr(
+            g_vr_system->GetProjectionMatrix(vr::Eye_Right, near_z, far_z));
+
+        // Render one real, centered camera with enough horizontal coverage for
+        // both eyes. The two headset views are reconstructed from this source.
+        eye_view_matrix = center_view;
+        projection = combined_stereo_source_projection(left_projection, right_projection);
+        AcquireSRWLockExclusive(&g_camera_lock);
+        g_afw_source_view = eye_view_matrix;
+        g_afw_source_projection = projection;
+        g_afw_eye_view[0] = left_view;
+        g_afw_eye_projection[0] = left_projection;
+        g_afw_eye_view[1] = right_view;
+        g_afw_eye_projection[1] = right_projection;
+        g_afw_source_to_eye_view[0] = left_eye_view;
+        g_afw_source_to_eye_view[1] = right_eye_view;
+        g_afw_camera_valid = true;
+        ReleaseSRWLockExclusive(&g_camera_lock);
     }
     const Matrix4 view_projection = multiply(projection, eye_view_matrix);
     // Keep the final VR transform in +0x320. When HMD culling is enabled,
@@ -2245,9 +2690,6 @@ void apply_vr_camera(void* object) {
     // where the player looks, not only where Hytale's mouse camera points.
     if (controls.hmd_culling_view_enabled) {
         std::memcpy(camera + 0x2E0, &culling_view, sizeof(culling_view));
-    }
-    if (controls.wide_culling_enabled) {
-        std::memcpy(camera + 0x4E0, &culling_projection, sizeof(culling_projection));
     }
     std::memcpy(camera + 0x320, &view_projection, sizeof(view_projection));
     const float native_view_delta =
@@ -2268,10 +2710,12 @@ void apply_vr_camera(void* object) {
             << " finalDelta=" << final_vp_delta
             << " recenter=" << controls.recenter_sequence
             << " stereo=" << controls.stereo_enabled
-            << " wideCull=" << controls.wide_culling_enabled
-            << " cullScale=" << controls.wide_culling_scale
+            << " resolutionScale=" << controls.vr_resolution_scale
             << " hmdCull=" << controls.hmd_culling_view_enabled
             << " trackingSpace=standing"
+            << " worldScale=" << world_scale
+            << " floorHeightOffset=" << g_floor_height_offset
+            << " sneakHeightComp=" << g_last_sneak_height_compensation
             << " hmdOrigin=" << (g_hmd_origin_valid ? 1 : 0)
             << " hmdCurrent=" << (g_hmd_current_valid ? 1 : 0)
             << " selfCullView=" << (reused_cached_native_view ? 1 : 0)
@@ -2310,8 +2754,8 @@ void apply_vr_camera(void* object) {
     if (g_hmd_origin_valid && selected_pose_valid) {
         gameplay_view_delta = hytalevr::relative_view_pose(
             g_hmd_origin_pose, gameplay_pose,
-            std::clamp(controls.translation_scale, 0.0f, 10.0f),
-            std::clamp(controls.translation_y_scale, 0.0f, 10.0f),
+            std::clamp(controls.translation_scale, 0.0f, 10.0f) * world_scale,
+            std::clamp(controls.translation_y_scale, 0.0f, 10.0f) * world_scale,
             controls.invert_translation_xz != 0);
         gameplay_pose_valid = true;
     }
@@ -2322,7 +2766,7 @@ void apply_vr_camera(void* object) {
     const bool ray_valid = (controls.hand_pointer_enabled || physical_ray_active) &&
                            gameplay_pose_valid;
     if (ray_valid) {
-        const Matrix4 controller_view = multiply(gameplay_view_delta, leveled_view);
+        const Matrix4 controller_view = multiply(gameplay_view_delta, floor_aligned_view);
         hytalevr::view_pose(controller_view, ray_offset, ray_direction);
     }
     AcquireSRWLockExclusive(&g_game_ray_lock);
@@ -2351,6 +2795,7 @@ void apply_vr_camera(void* object) {
 }
 
 void apply_controller_gameplay_ray(float* origin, float* direction) {
+    HookCallbackScope callback_scope;
     if (g_shared) {
         InterlockedIncrement(
             reinterpret_cast<volatile LONG*>(&g_shared->interaction_ray_calls));
@@ -2520,10 +2965,11 @@ void update_hmd_pose(const vr::TrackedDevicePose_t& pose,
         render_log(out.str());
     }
     update_physical_hmd_locked(current, now, recentered);
+    const float world_scale = validated_world_scale(controls);
     g_hmd_view_delta = hytalevr::relative_view_pose(
         g_hmd_origin_pose, current,
-        std::clamp(controls.translation_scale, 0.0f, 10.0f),
-        std::clamp(controls.translation_y_scale, 0.0f, 10.0f),
+        std::clamp(controls.translation_scale, 0.0f, 10.0f) * world_scale,
+        std::clamp(controls.translation_y_scale, 0.0f, 10.0f) * world_scale,
         controls.invert_translation_xz != 0);
     if (render_logging_enabled() &&
         (recentered || now - g_last_hmd_delta_diag_tick >= 1500)) {
@@ -2724,6 +3170,8 @@ void update_vr_actions() {
     uint64_t left_button_mask = 0;
     uint64_t right_button_mask = 0;
     bool legacy_left_x = false;
+    bool legacy_left_grip = false;
+    bool legacy_right_grip = false;
     if (g_vr_system) {
         const vr::TrackedDeviceIndex_t left_controller =
             g_vr_system->GetTrackedDeviceIndexForControllerRole(vr::TrackedControllerRole_LeftHand);
@@ -2731,9 +3179,12 @@ void update_vr_actions() {
             vr::VRControllerState_t state{};
             if (g_vr_system->GetControllerState(left_controller, &state, sizeof(state))) {
                 left_button_mask = state.ulButtonPressed;
-                legacy_left_x =
-                    (left_button_mask & vr::ButtonMaskFromId(vr::k_EButton_A)) != 0 ||
-                    (left_button_mask & vr::ButtonMaskFromId(vr::k_EButton_ApplicationMenu)) != 0;
+                legacy_left_x = !x_active &&
+                    (((left_button_mask & vr::ButtonMaskFromId(vr::k_EButton_A)) != 0) ||
+                     ((left_button_mask &
+                       vr::ButtonMaskFromId(vr::k_EButton_ApplicationMenu)) != 0));
+                legacy_left_grip =
+                    (left_button_mask & vr::ButtonMaskFromId(vr::k_EButton_Grip)) != 0;
             }
         }
         const vr::TrackedDeviceIndex_t right_controller =
@@ -2742,12 +3193,15 @@ void update_vr_actions() {
             vr::VRControllerState_t state{};
             if (g_vr_system->GetControllerState(right_controller, &state, sizeof(state))) {
                 right_button_mask = state.ulButtonPressed;
+                legacy_right_grip =
+                    (right_button_mask & vr::ButtonMaskFromId(vr::k_EButton_Grip)) != 0;
             }
         }
     }
 
     const bool active_input = move_active || turn_active || trigger_active ||
-        left_trigger_active || left_grip_active || right_grip_active ||
+        left_trigger_active || left_grip_active || legacy_left_grip ||
+        right_grip_active || legacy_right_grip ||
         x_active || legacy_left_x || y_active || b_active || right_stick_click_active ||
         left_pose_active || pose_active;
     g_shared->controller_active = active_input ? 1u : 0u;
@@ -2794,8 +3248,10 @@ void update_vr_actions() {
         ((x_active && button_x.bState) || legacy_left_x) ? 1u : 0u;
     g_shared->controller_button_y = y_active && button_y.bState ? 1u : 0u;
     g_shared->controller_button_b = b_active && button_b.bState ? 1u : 0u;
-    g_shared->controller_left_grip = g_left_grip_pressed ? 1u : 0u;
-    g_shared->controller_right_grip = g_right_grip_pressed ? 1u : 0u;
+    g_shared->controller_left_grip =
+        (g_left_grip_pressed || legacy_left_grip) ? 1u : 0u;
+    g_shared->controller_right_grip =
+        (g_right_grip_pressed || legacy_right_grip) ? 1u : 0u;
     g_shared->controller_right_stick_click =
         right_stick_click_active && right_stick_click.bState ? 1u : 0u;
     g_shared->controller_left_button_mask = left_button_mask;
@@ -2932,15 +3388,13 @@ bool prepare_render_resolution(void* window, const VrCameraControls& controls) {
         g_shared->resolution_error = 2;
         return false;
     }
-    // Keep capture textures 1:1 with Hytale's real backbuffer. The old
-    // SteamVR-sized rescale path could leave screen-space/UI content as a
-    // transparent 2D layer that popped when the head pose changed.
-    g_shared->recommended_width = static_cast<uint32_t>(pixel_width);
-    g_shared->recommended_height = static_cast<uint32_t>(pixel_height);
+
+    // AFW scales both output dimensions together. Projection matrices remain
+    // untouched, so resolution changes cannot stretch either eye.
+    g_shared->recommended_width = recommended_width;
+    g_shared->recommended_height = recommended_height;
     g_shared->backbuffer_width = pixel_width;
     g_shared->backbuffer_height = pixel_height;
-    g_eye_target_width = pixel_width;
-    g_eye_target_height = pixel_height;
     g_shared->resolution_error = 0;
     static int last_logged_width = 0;
     static int last_logged_height = 0;
@@ -2948,8 +3402,7 @@ bool prepare_render_resolution(void* window, const VrCameraControls& controls) {
         std::ostringstream out;
         out << "resolution recommendedSteamVR=" << recommended_width << "x"
             << recommended_height << " backbuffer=" << pixel_width << "x"
-            << pixel_height << " target=" << g_eye_target_width << "x"
-            << g_eye_target_height << " renderScale=" << controls.render_scale;
+            << pixel_height << " requestedScale=" << controls.vr_resolution_scale;
         render_log(out.str());
         last_logged_width = pixel_width;
         last_logged_height = pixel_height;
@@ -2974,12 +3427,9 @@ bool initialize_gl_capture() {
         !g_gl_check_framebuffer_status) {
         return false;
     }
-    if (g_capture_fbo && g_resolve_fbo) return true;
-    GLuint framebuffers[2]{};
-    g_gl_gen_framebuffers(2, framebuffers);
-    g_capture_fbo = framebuffers[0];
-    g_resolve_fbo = framebuffers[1];
-    return g_capture_fbo != 0 && g_resolve_fbo != 0;
+    if (g_capture_fbo) return true;
+    g_gl_gen_framebuffers(1, &g_capture_fbo);
+    return g_capture_fbo != 0;
 }
 
 bool ensure_ui_overlay(float width_meters = 1.50f, float distance_meters = 1.65f) {
@@ -3176,10 +3626,12 @@ bool ui_overlay_requested() {
 }
 
 void __fastcall hook_noesis_begin_onscreen(void* device) {
+    HookCallbackScope callback_scope;
     if (g_noesis_begin_trampoline) g_noesis_begin_trampoline(device);
 }
 
 void __fastcall hook_noesis_end_onscreen(void* device) {
+    HookCallbackScope callback_scope;
     const bool redirected = g_ui_redirect_active;
     if (g_noesis_end_trampoline) g_noesis_end_trampoline(device);
     if (!redirected) return;
@@ -3214,6 +3666,7 @@ void __fastcall hook_noesis_end_onscreen(void* device) {
 }
 
 void __fastcall hook_noesis_renderer_render(void* renderer, void* a, void* b, void* c) {
+    HookCallbackScope callback_scope;
     if (g_noesis_renderer_trampoline) {
         g_noesis_renderer_trampoline(renderer, a, b, c);
     }
@@ -3236,11 +3689,46 @@ void publish_pointer(bool valid, int x, int y, int surface_width,
     InterlockedIncrement(reinterpret_cast<volatile LONG*>(&g_shared->pointer_draws));
 }
 
+bool project_head_point_using_render_eye(int eye, const float head[3], float clip[4]) {
+    if (!g_vr_system || eye < 0 || eye > 1) return false;
+
+    Matrix4 eye_view{};
+    Matrix4 projection{};
+    AcquireSRWLockShared(&g_camera_lock);
+    const bool camera_valid = g_afw_camera_valid;
+    if (camera_valid) {
+        eye_view = g_afw_source_to_eye_view[eye];
+        projection = g_afw_eye_projection[eye];
+    }
+    ReleaseSRWLockShared(&g_camera_lock);
+    if (!camera_valid) {
+        const vr::EVREye vr_eye = eye == 0 ? vr::Eye_Left : vr::Eye_Right;
+        eye_view = inverse_eye_to_head(g_vr_system->GetEyeToHeadTransform(vr_eye), 1.0f);
+        projection = from_openvr(g_vr_system->GetProjectionMatrix(vr_eye, 0.05f, 100.0f));
+    }
+
+    float eye_point[4]{eye_view.value[12], eye_view.value[13],
+                       eye_view.value[14], 1.0f};
+    for (int row = 0; row < 3; ++row) {
+        for (int column = 0; column < 3; ++column) {
+            eye_point[row] += eye_view.value[column * 4 + row] * head[column];
+        }
+    }
+    std::fill(clip, clip + 4, 0.0f);
+    for (int row = 0; row < 4; ++row) {
+        for (int column = 0; column < 4; ++column) {
+            clip[row] += projection.value[column * 4 + row] * eye_point[column];
+        }
+    }
+    return std::isfinite(clip[3]) && clip[3] > 0.001f;
+}
+
 bool controller_pointer_pixel(int eye, int width, int height, float distance,
                               int& pixel_x, int& pixel_y,
                               int& surface_width, int& surface_height,
                               bool& menu_mode,
-                              bool allow_menu_overlay = true) {
+                              bool allow_menu_overlay = true,
+                              float world_scale = 1.0f) {
     if (!g_vr_system || width <= 0 || height <= 0) return false;
     surface_width = width;
     surface_height = height;
@@ -3307,10 +3795,14 @@ bool controller_pointer_pixel(int eye, int width, int height, float distance,
     if (!valid) return false;
 
     const float pointer_distance = std::clamp(distance, 0.5f, 10.0f);
+    world_scale = std::clamp(std::isfinite(world_scale) ? world_scale : 1.0f,
+                             0.50f, 2.00f);
     float absolute[3]{};
     for (int row = 0; row < 3; ++row) {
-        absolute[row] = controller[row * 4 + 3] -
-                        controller[row * 4 + 2] * pointer_distance;
+        const float scaled_origin = hmd[row * 4 + 3] +
+            (controller[row * 4 + 3] - hmd[row * 4 + 3]) * world_scale;
+        absolute[row] = scaled_origin -
+                        controller[row * 4 + 2] * pointer_distance * world_scale;
     }
 
     float head[3]{};
@@ -3321,25 +3813,8 @@ bool controller_pointer_pixel(int eye, int width, int height, float distance,
         }
     }
 
-    const auto eye_to_head = g_vr_system->GetEyeToHeadTransform(
-        eye == 0 ? vr::Eye_Left : vr::Eye_Right);
-    float eye_point[4]{0.0f, 0.0f, 0.0f, 1.0f};
-    for (int column = 0; column < 3; ++column) {
-        for (int row = 0; row < 3; ++row) {
-            eye_point[column] += eye_to_head.m[row][column] *
-                (head[row] - eye_to_head.m[row][3]);
-        }
-    }
-
-    const auto projection = g_vr_system->GetProjectionMatrix(
-        eye == 0 ? vr::Eye_Left : vr::Eye_Right, 0.05f, 100.0f);
     float clip[4]{};
-    for (int row = 0; row < 4; ++row) {
-        for (int column = 0; column < 4; ++column) {
-            clip[row] += projection.m[row][column] * eye_point[column];
-        }
-    }
-    if (!std::isfinite(clip[3]) || clip[3] <= 0.001f) return false;
+    if (!project_head_point_using_render_eye(eye, head, clip)) return false;
     const float ndc_x = clip[0] / clip[3];
     const float ndc_y = clip[1] / clip[3];
     if (!std::isfinite(ndc_x) || !std::isfinite(ndc_y) ||
@@ -3365,25 +3840,8 @@ bool project_tracking_point_to_eye(int eye, int width, int height,
         }
     }
 
-    const auto eye_to_head = g_vr_system->GetEyeToHeadTransform(
-        eye == 0 ? vr::Eye_Left : vr::Eye_Right);
-    float eye_point[4]{0.0f, 0.0f, 0.0f, 1.0f};
-    for (int column = 0; column < 3; ++column) {
-        for (int row = 0; row < 3; ++row) {
-            eye_point[column] += eye_to_head.m[row][column] *
-                (head[row] - eye_to_head.m[row][3]);
-        }
-    }
-
-    const auto projection = g_vr_system->GetProjectionMatrix(
-        eye == 0 ? vr::Eye_Left : vr::Eye_Right, 0.05f, 100.0f);
     float clip[4]{};
-    for (int row = 0; row < 4; ++row) {
-        for (int column = 0; column < 4; ++column) {
-            clip[row] += projection.m[row][column] * eye_point[column];
-        }
-    }
-    if (!std::isfinite(clip[3]) || clip[3] <= 0.001f) return false;
+    if (!project_head_point_using_render_eye(eye, head, clip)) return false;
     const float ndc_x = clip[0] / clip[3];
     const float ndc_y = clip[1] / clip[3];
     if (!std::isfinite(ndc_x) || !std::isfinite(ndc_y) ||
@@ -3409,25 +3867,8 @@ bool project_tracking_point_to_eye_ndc(int eye, const float hmd[12],
         }
     }
 
-    const auto eye_to_head = g_vr_system->GetEyeToHeadTransform(
-        eye == 0 ? vr::Eye_Left : vr::Eye_Right);
-    float eye_point[4]{0.0f, 0.0f, 0.0f, 1.0f};
-    for (int column = 0; column < 3; ++column) {
-        for (int row = 0; row < 3; ++row) {
-            eye_point[column] += eye_to_head.m[row][column] *
-                (head[row] - eye_to_head.m[row][3]);
-        }
-    }
-
-    const auto projection = g_vr_system->GetProjectionMatrix(
-        eye == 0 ? vr::Eye_Left : vr::Eye_Right, 0.05f, 100.0f);
     float clip[4]{};
-    for (int row = 0; row < 4; ++row) {
-        for (int column = 0; column < 4; ++column) {
-            clip[row] += projection.m[row][column] * eye_point[column];
-        }
-    }
-    if (!std::isfinite(clip[3]) || clip[3] <= 0.001f) return false;
+    if (!project_head_point_using_render_eye(eye, head, clip)) return false;
     ndc_x = clip[0] / clip[3];
     ndc_y = clip[1] / clip[3];
     depth = clip[3];
@@ -3661,6 +4102,16 @@ void draw_vr_hand_model(int eye, int width, int height,
     }
     ReleaseSRWLockShared(&g_pose_lock);
     if (!hmd_valid || (!controller_valid[0] && !controller_valid[1])) return;
+    const float world_scale = validated_world_scale(controls);
+    for (int hand = 0; hand < 2; ++hand) {
+        if (!controller_valid[hand]) continue;
+        for (int row = 0; row < 3; ++row) {
+            const int translation_index = row * 4 + 3;
+            controller_poses[hand][translation_index] = hmd[translation_index] +
+                (controller_poses[hand][translation_index] - hmd[translation_index]) *
+                    world_scale;
+        }
+    }
     const Vec3 eye_position{hmd[3], hmd[7], hmd[11]};
 
     static thread_local std::vector<ProjectedHandTriangle> triangles;
@@ -3743,7 +4194,7 @@ void draw_vr_hand_model(int eye, int width, int height,
                   return a.depth > b.depth;
               });
     if (hardware_hand_renderer &&
-        draw_projected_hand_triangles_gl(triangles, width, height)) return;
+        draw_projected_hand_triangles_gl(triangles, width, height, eye, controls)) return;
 
     if (hardware_hand_renderer) {
         for (ProjectedHandTriangle& triangle : triangles) {
@@ -3774,6 +4225,7 @@ void draw_vr_hand_model(int eye, int width, int height,
 }
 
 void draw_controller_pointer(int eye, int width, int height, float distance,
+                             float world_scale,
                              bool publish_state = true) {
     int x = 0;
     int y = 0;
@@ -3782,7 +4234,7 @@ void draw_controller_pointer(int eye, int width, int height, float distance,
     bool menu_mode = false;
     if (!controller_pointer_pixel(eye, width, height, distance, x, y,
                                   surface_width, surface_height, menu_mode,
-                                  false)) {
+                                  false, world_scale)) {
         if (publish_state && eye == 0) publish_pointer(false, 0, 0, 0, 0, false);
         return;
     }
@@ -3813,7 +4265,51 @@ void draw_controller_pointer(int eye, int width, int height, float distance,
     }
 }
 
-bool capture_eye(int eye, const VrCameraControls& controls) {
+void draw_vr_eye_overlays(int eye, int width, int height,
+                          const VrCameraControls& controls,
+                          int source_x, int source_y,
+                          int source_width, int source_height,
+                          bool source_multisampled) {
+    draw_vr_hand_model(eye, width, height, controls);
+    if (controls.hand_pointer_enabled) {
+        const bool menu_overlay_active = g_shared && g_shared->ui_overlay_active != 0;
+        if (!menu_overlay_active && controls.hide_center_reticle) {
+            suppress_center_reticle(source_x, source_y, source_width, source_height,
+                                     width, height, source_multisampled);
+        }
+        const float pointer_distance = menu_overlay_active
+            ? controls.ui_overlay_distance
+            : controls.hand_pointer_distance;
+        const float world_scale = validated_world_scale(controls);
+        if (menu_overlay_active) {
+            int pointer_x = 0;
+            int pointer_y = 0;
+            int pointer_surface_width = 0;
+            int pointer_surface_height = 0;
+            bool pointer_menu_mode = false;
+            const bool pointer_valid =
+                controller_pointer_pixel(eye, width, height, pointer_distance,
+                                         pointer_x, pointer_y,
+                                         pointer_surface_width,
+                                         pointer_surface_height,
+                                         pointer_menu_mode, true, world_scale);
+            if (pointer_valid && pointer_menu_mode && eye == 0) {
+                publish_pointer(true, pointer_x, pointer_y,
+                                pointer_surface_width, pointer_surface_height, true);
+            }
+            draw_controller_pointer(eye, width, height,
+                                    controls.hand_pointer_distance,
+                                    world_scale, false);
+        } else {
+            draw_controller_pointer(eye, width, height, pointer_distance,
+                                    world_scale);
+        }
+    } else if (g_shared) {
+        publish_pointer(false, 0, 0, 0, 0, false);
+    }
+}
+
+bool capture_eye(int eye, const VrCameraControls& controls, bool include_vr_overlays) {
     const bool check_gl_errors = render_logging_enabled();
     GLint viewport[4]{};
     glGetIntegerv(GL_VIEWPORT, viewport);
@@ -3826,30 +4322,48 @@ bool capture_eye(int eye, const VrCameraControls& controls) {
         g_shared->capture_width = source_width;
         g_shared->capture_height = source_height;
     }
-    // Keep the game window untouched. Each eye owns an independent SteamVR-sized
-    // texture, so changing quality cannot alter the game's aspect ratio.
-    const int width = g_eye_target_width > 0 ? g_eye_target_width : source_width;
-    const int height = g_eye_target_height > 0 ? g_eye_target_height : source_height;
+    GLint max_texture_size = 4096;
+    glGetIntegerv(GL_MAX_TEXTURE_SIZE, &max_texture_size);
+    const hytalevr::RenderResolution output_resolution =
+        hytalevr::scaled_render_resolution(source_width, source_height,
+                                           controls.vr_resolution_scale,
+                                           max_texture_size);
+    if (output_resolution.width <= 0 || output_resolution.height <= 0) return false;
 
-    if (width != g_texture_width || height != g_texture_height) {
-        if (g_eye_textures[0] || g_eye_textures[1]) glDeleteTextures(2, g_eye_textures);
-        g_eye_textures[0] = g_eye_textures[1] = 0;
+    if (source_width != g_source_texture_width ||
+        source_height != g_source_texture_height ||
+        output_resolution.width != g_texture_width ||
+        output_resolution.height != g_texture_height) {
+        if (g_eye_textures[0] || g_eye_textures[1]) {
+            glDeleteTextures(2, g_eye_textures);
+            g_eye_textures[0] = g_eye_textures[1] = 0;
+        }
+        if (g_afw_source_texture) glDeleteTextures(1, &g_afw_source_texture);
+        g_afw_source_texture = 0;
+        if (g_eye_depth_textures[0] || g_eye_depth_textures[1]) {
+            glDeleteTextures(2, g_eye_depth_textures);
+            g_eye_depth_textures[0] = g_eye_depth_textures[1] = 0;
+        }
         g_eye_valid[0] = g_eye_valid[1] = false;
+        g_eye_depth_valid[0] = g_eye_depth_valid[1] = false;
         g_pre_ui_captured[0] = g_pre_ui_captured[1] = false;
-        g_texture_width = width;
-        g_texture_height = height;
+        g_source_texture_width = source_width;
+        g_source_texture_height = source_height;
+        g_texture_width = output_resolution.width;
+        g_texture_height = output_resolution.height;
     }
 
     GLint previous_texture = 0;
     glGetIntegerv(GL_TEXTURE_BINDING_2D, &previous_texture);
-    if (!g_eye_textures[eye]) {
-        glGenTextures(1, &g_eye_textures[eye]);
-        glBindTexture(GL_TEXTURE_2D, g_eye_textures[eye]);
+    if (!g_afw_source_texture) {
+        glGenTextures(1, &g_afw_source_texture);
+        glBindTexture(GL_TEXTURE_2D, g_afw_source_texture);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE_VALUE);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE_VALUE);
-        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, width, height, 0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, source_width, source_height, 0,
+                     GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
     }
     const ULONGLONG capture_log_now = GetTickCount64();
     if (render_logging_enabled() && capture_log_now - g_last_capture_diag_tick >= 1500) {
@@ -3861,20 +4375,21 @@ bool capture_eye(int eye, const VrCameraControls& controls) {
         out << "capture begin eye=" << eye
             << " viewport=(" << viewport[0] << "," << viewport[1] << ","
             << source_width << "x" << source_height << ")"
-            << " target=" << width << "x" << height
+            << " sourceTexture=" << source_width << "x" << source_height
+            << " vrOutput=" << g_texture_width << "x" << g_texture_height
+            << " resolutionScale=" << output_resolution.scale
             << " samples=" << samples
             << " readFbo=" << read_fbo_for_log
             << " drawFbo=" << draw_fbo_for_log
             << " captureFbo=" << g_capture_fbo
-            << " resolveFbo=" << g_resolve_fbo
-            << " tex=" << g_eye_textures[eye]
+            << " sourceTex=" << g_afw_source_texture
             << " currentEye=" << (g_shared ? g_shared->current_eye : 0)
             << " stereoFrames=" << (g_shared ? g_shared->stereo_frames : 0);
         render_log(out.str());
         g_last_capture_diag_tick = capture_log_now;
     }
 
-    glBindTexture(GL_TEXTURE_2D, g_eye_textures[eye]);
+    glBindTexture(GL_TEXTURE_2D, g_afw_source_texture);
     if (initialize_gl_capture()) {
         GLint previous_read_fbo = 0;
         GLint previous_draw_fbo = 0;
@@ -3882,7 +4397,7 @@ bool capture_eye(int eye, const VrCameraControls& controls) {
         glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING_VALUE, &previous_draw_fbo);
         g_gl_bind_framebuffer(GL_DRAW_FRAMEBUFFER_VALUE, g_capture_fbo);
         g_gl_framebuffer_texture_2d(GL_DRAW_FRAMEBUFFER_VALUE, GL_COLOR_ATTACHMENT0_VALUE,
-                                    GL_TEXTURE_2D, g_eye_textures[eye], 0);
+                                    GL_TEXTURE_2D, g_afw_source_texture, 0);
         if (g_gl_check_framebuffer_status(GL_DRAW_FRAMEBUFFER_VALUE) !=
             GL_FRAMEBUFFER_COMPLETE_VALUE) {
             g_gl_bind_framebuffer(GL_READ_FRAMEBUFFER_VALUE, static_cast<GLuint>(previous_read_fbo));
@@ -3897,92 +4412,15 @@ bool capture_eye(int eye, const VrCameraControls& controls) {
         if (check_gl_errors) {
             while (glGetError() != GL_NO_ERROR) {}
         }
-        int overlay_source_x = viewport[0];
-        int overlay_source_y = viewport[1];
-        bool overlay_source_multisampled = samples > 1;
-        if (samples > 1 && (source_width != width || source_height != height)) {
-            if (!g_resolve_texture || g_resolve_width != source_width ||
-                g_resolve_height != source_height) {
-                if (g_resolve_texture) glDeleteTextures(1, &g_resolve_texture);
-                glGenTextures(1, &g_resolve_texture);
-                glBindTexture(GL_TEXTURE_2D, g_resolve_texture);
-                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE_VALUE);
-                glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE_VALUE);
-                glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, source_width, source_height, 0,
-                             GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
-                g_resolve_width = source_width;
-                g_resolve_height = source_height;
-            }
-            g_gl_bind_framebuffer(GL_DRAW_FRAMEBUFFER_VALUE, g_resolve_fbo);
-            g_gl_framebuffer_texture_2d(GL_DRAW_FRAMEBUFFER_VALUE, GL_COLOR_ATTACHMENT0_VALUE,
-                                        GL_TEXTURE_2D, g_resolve_texture, 0);
-            if (g_gl_check_framebuffer_status(GL_DRAW_FRAMEBUFFER_VALUE) ==
-                GL_FRAMEBUFFER_COMPLETE_VALUE) {
-                g_gl_blit_framebuffer(viewport[0], viewport[1], viewport[0] + source_width,
-                                      viewport[1] + source_height, 0, 0,
-                                      source_width, source_height,
-                                      GL_COLOR_BUFFER_BIT, GL_NEAREST);
-                g_gl_bind_framebuffer(GL_READ_FRAMEBUFFER_VALUE, g_resolve_fbo);
-                g_gl_bind_framebuffer(GL_DRAW_FRAMEBUFFER_VALUE, g_capture_fbo);
-                g_gl_blit_framebuffer(0, 0, source_width, source_height,
-                                      0, 0, width, height, GL_COLOR_BUFFER_BIT, GL_LINEAR);
-                overlay_source_x = 0;
-                overlay_source_y = 0;
-                overlay_source_multisampled = false;
-            } else {
-                g_gl_bind_framebuffer(GL_READ_FRAMEBUFFER_VALUE,
-                                      static_cast<GLuint>(previous_read_fbo));
-                g_gl_bind_framebuffer(GL_DRAW_FRAMEBUFFER_VALUE,
-                                      static_cast<GLuint>(previous_draw_fbo));
-                glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(previous_texture));
-                if (g_shared) g_shared->capture_error = 3;
-                render_log("capture error: resolve framebuffer incomplete");
-                g_eye_valid[eye] = false;
-                return false;
-            }
-        } else {
-            g_gl_blit_framebuffer(viewport[0], viewport[1], viewport[0] + source_width,
-                                  viewport[1] + source_height, 0, 0, width, height,
-                                  GL_COLOR_BUFFER_BIT, samples > 1 ? GL_NEAREST : GL_LINEAR);
-        }
-        draw_vr_hand_model(eye, width, height, controls);
-        if (controls.hand_pointer_enabled) {
-            const bool menu_overlay_active = g_shared && g_shared->ui_overlay_active != 0;
-            if (!menu_overlay_active && controls.hide_center_reticle) {
-                suppress_center_reticle(overlay_source_x, overlay_source_y,
-                                         source_width, source_height, width, height,
-                                         overlay_source_multisampled);
-            }
-            const float pointer_distance = menu_overlay_active
-                ? controls.ui_overlay_distance
-                : controls.hand_pointer_distance;
-            if (menu_overlay_active) {
-                int pointer_x = 0;
-                int pointer_y = 0;
-                int pointer_surface_width = 0;
-                int pointer_surface_height = 0;
-                bool pointer_menu_mode = false;
-                const bool pointer_valid =
-                    controller_pointer_pixel(eye, width, height, pointer_distance,
-                                             pointer_x, pointer_y,
-                                             pointer_surface_width,
-                                             pointer_surface_height,
-                                             pointer_menu_mode);
-                if (pointer_valid && pointer_menu_mode) {
-                    if (eye == 0) {
-                        publish_pointer(true, pointer_x, pointer_y,
-                                        pointer_surface_width, pointer_surface_height,
-                                        true);
-                    }
-                }
-                draw_controller_pointer(eye, width, height, controls.hand_pointer_distance, false);
-            } else {
-                draw_controller_pointer(eye, width, height, pointer_distance);
-            }
-        } else if (g_shared) {
-            publish_pointer(false, 0, 0, 0, 0, false);
+        g_gl_blit_framebuffer(viewport[0], viewport[1], viewport[0] + source_width,
+                              viewport[1] + source_height, 0, 0,
+                              source_width, source_height,
+                              GL_COLOR_BUFFER_BIT, samples > 1 ? GL_NEAREST : GL_LINEAR);
+        if (include_vr_overlays) {
+            draw_vr_eye_overlays(eye, source_width, source_height, controls,
+                                 viewport[0], viewport[1],
+                                 source_width, source_height,
+                                 samples > 1);
         }
         const GLenum blit_error = check_gl_errors ? glGetError() : GL_NO_ERROR;
         g_gl_bind_framebuffer(GL_READ_FRAMEBUFFER_VALUE, static_cast<GLuint>(previous_read_fbo));
@@ -3994,20 +4432,14 @@ bool capture_eye(int eye, const VrCameraControls& controls) {
                 std::ostringstream out;
                 out << "capture error: glBlit/copy GL error=0x" << std::hex << blit_error
                     << std::dec << " eye=" << eye << " source=" << source_width << "x"
-                    << source_height << " target=" << width << "x" << height;
+                    << source_height << " target=" << source_width << "x"
+                    << source_height;
                 render_log(out.str());
             }
             g_eye_valid[eye] = false;
             return false;
         }
     } else {
-        if (width != source_width || height != source_height) {
-            glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(previous_texture));
-            if (g_shared) g_shared->capture_error = 4;
-            render_log("capture error: GL capture unavailable and source/target sizes differ");
-            g_eye_valid[eye] = false;
-            return false;
-        }
         glCopyTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, viewport[0], viewport[1],
                             source_width, source_height);
     }
@@ -4017,6 +4449,218 @@ bool capture_eye(int eye, const VrCameraControls& controls) {
         g_shared->capture_error = 0;
     }
     return g_eye_valid[eye];
+}
+
+bool preserve_afw_source_texture(int captured_eye) {
+    return captured_eye >= 0 && captured_eye <= 1 && g_eye_valid[captured_eye] &&
+           g_afw_source_texture != 0 && g_source_texture_width > 0 &&
+           g_source_texture_height > 0;
+}
+
+bool warp_source_to_eye(GLuint source_texture, int target_eye) {
+    if (!source_texture || target_eye < 0 || target_eye > 1 ||
+        g_texture_width <= 0 || g_texture_height <= 0) {
+        return false;
+    }
+    const SceneDepthTextureSnapshot depth = scene_depth_texture_snapshot();
+    if (!depth.valid || !depth.texture || !initialize_gl_capture() ||
+        !ensure_afw_gl_renderer()) {
+        return false;
+    }
+    const int source_width = g_source_texture_width;
+    const int source_height = g_source_texture_height;
+    const int depthToleranceX = (std::max)(8, source_width / 32);
+    const int depthToleranceY = (std::max)(8, source_height / 32);
+    if (std::abs(depth.width * 2 - source_width) > depthToleranceX ||
+        std::abs(depth.height * 2 - source_height) > depthToleranceY) {
+        return false;
+    }
+
+    Matrix4 source_projection{};
+    Matrix4 target_projection{};
+    Matrix4 source_to_target_view{};
+    AcquireSRWLockShared(&g_camera_lock);
+    const bool camera_valid = g_afw_camera_valid;
+    source_projection = g_afw_source_projection;
+    target_projection = g_afw_eye_projection[target_eye];
+    source_to_target_view = g_afw_source_to_eye_view[target_eye];
+    ReleaseSRWLockShared(&g_camera_lock);
+    if (!camera_valid) return false;
+
+    Matrix4 inverse_source_projection{};
+    Matrix4 inverse_target_projection{};
+    if (!hytalevr::inverse(source_projection, inverse_source_projection) ||
+        !hytalevr::inverse(target_projection, inverse_target_projection)) {
+        return false;
+    }
+
+    GLint previous_program = 0;
+    GLint previous_vao = 0;
+    GLint previous_array_buffer = 0;
+    GLint previous_active_texture = 0;
+    GLint previous_texture_0 = 0;
+    GLint previous_texture_1 = 0;
+    GLint previous_read_fbo = 0;
+    GLint previous_draw_fbo = 0;
+    GLint previous_viewport[4]{};
+    GLboolean previous_color_mask[4]{};
+    glGetIntegerv(GL_CURRENT_PROGRAM_VALUE, &previous_program);
+    glGetIntegerv(GL_VERTEX_ARRAY_BINDING_VALUE, &previous_vao);
+    glGetIntegerv(GL_ARRAY_BUFFER_BINDING_VALUE, &previous_array_buffer);
+    glGetIntegerv(GL_ACTIVE_TEXTURE_VALUE, &previous_active_texture);
+    glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING_VALUE, &previous_read_fbo);
+    glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING_VALUE, &previous_draw_fbo);
+    glGetIntegerv(GL_VIEWPORT, previous_viewport);
+    glGetBooleanv(GL_COLOR_WRITEMASK, previous_color_mask);
+    const GLboolean blend_enabled = glIsEnabled(GL_BLEND);
+    const GLboolean depth_enabled = glIsEnabled(GL_DEPTH_TEST);
+    const GLboolean scissor_enabled = glIsEnabled(GL_SCISSOR_TEST);
+    const GLboolean cull_enabled = glIsEnabled(GL_CULL_FACE);
+    g_gl_active_texture(GL_TEXTURE0_VALUE);
+    glGetIntegerv(GL_TEXTURE_BINDING_2D, &previous_texture_0);
+    g_gl_active_texture(GL_TEXTURE1_VALUE);
+    glGetIntegerv(GL_TEXTURE_BINDING_2D, &previous_texture_1);
+
+    g_gl_active_texture(GL_TEXTURE0_VALUE);
+    if (!g_eye_textures[target_eye]) {
+        glGenTextures(1, &g_eye_textures[target_eye]);
+        glBindTexture(GL_TEXTURE_2D, g_eye_textures[target_eye]);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE_VALUE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE_VALUE);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, g_texture_width, g_texture_height, 0,
+                     GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+    }
+    if (!g_eye_depth_textures[target_eye]) {
+        glGenTextures(1, &g_eye_depth_textures[target_eye]);
+        glBindTexture(GL_TEXTURE_2D, g_eye_depth_textures[target_eye]);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE_VALUE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE_VALUE);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_R16F_VALUE,
+                     g_texture_width, g_texture_height, 0,
+                     GL_RED_VALUE, GL_FLOAT, nullptr);
+    }
+    g_eye_valid[target_eye] = false;
+    g_eye_depth_valid[target_eye] = false;
+
+    g_gl_bind_framebuffer(GL_DRAW_FRAMEBUFFER_VALUE, g_capture_fbo);
+    g_gl_framebuffer_texture_2d(GL_DRAW_FRAMEBUFFER_VALUE, GL_COLOR_ATTACHMENT0_VALUE,
+                                GL_TEXTURE_2D, g_eye_textures[target_eye], 0);
+    bool success = g_gl_check_framebuffer_status(GL_DRAW_FRAMEBUFFER_VALUE) ==
+        GL_FRAMEBUFFER_COMPLETE_VALUE;
+    if (success) {
+        while (glGetError() != GL_NO_ERROR) {}
+        glViewport(0, 0, g_texture_width, g_texture_height);
+        glDisable(GL_BLEND);
+        glDisable(GL_DEPTH_TEST);
+        glDisable(GL_SCISSOR_TEST);
+        glDisable(GL_CULL_FACE);
+        glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+        g_gl_use_program(g_afw_program);
+        g_gl_bind_vertex_array(g_afw_vao);
+        g_gl_uniform_1i(g_afw_source_color_uniform, 0);
+        g_gl_uniform_1i(g_afw_source_depth_uniform, 1);
+        g_gl_uniform_matrix_4fv(g_afw_inverse_source_projection_uniform, 1, GL_FALSE,
+                                inverse_source_projection.value);
+        g_gl_uniform_matrix_4fv(g_afw_source_projection_uniform, 1, GL_FALSE,
+                                source_projection.value);
+        g_gl_uniform_matrix_4fv(g_afw_inverse_target_projection_uniform, 1, GL_FALSE,
+                                inverse_target_projection.value);
+        g_gl_uniform_matrix_4fv(g_afw_source_to_target_view_uniform, 1, GL_FALSE,
+                                source_to_target_view.value);
+        g_gl_uniform_matrix_4fv(g_afw_target_projection_uniform, 1, GL_FALSE,
+                                target_projection.value);
+        g_gl_uniform_1f(g_afw_depth_far_clip_uniform, depth.far_clip);
+        g_gl_uniform_1i(g_afw_enable_warp_uniform, 2);
+        g_gl_uniform_1i(g_afw_output_depth_uniform, 0);
+        g_gl_active_texture(GL_TEXTURE0_VALUE);
+        glBindTexture(GL_TEXTURE_2D, source_texture);
+        g_gl_active_texture(GL_TEXTURE1_VALUE);
+        glBindTexture(GL_TEXTURE_2D, depth.texture);
+        glDrawArrays(GL_TRIANGLES, 0, 3);
+        success = glGetError() == GL_NO_ERROR;
+        if (success) {
+            g_gl_framebuffer_texture_2d(GL_DRAW_FRAMEBUFFER_VALUE,
+                                        GL_COLOR_ATTACHMENT0_VALUE,
+                                        GL_TEXTURE_2D,
+                                        g_eye_depth_textures[target_eye], 0);
+            const bool depth_complete =
+                g_gl_check_framebuffer_status(GL_DRAW_FRAMEBUFFER_VALUE) ==
+                GL_FRAMEBUFFER_COMPLETE_VALUE;
+            if (depth_complete) {
+                g_gl_uniform_1i(g_afw_output_depth_uniform, 1);
+                glDrawArrays(GL_TRIANGLES, 0, 3);
+                g_eye_depth_valid[target_eye] = glGetError() == GL_NO_ERROR;
+                g_gl_uniform_1i(g_afw_output_depth_uniform, 0);
+            }
+        }
+    }
+
+    g_gl_active_texture(GL_TEXTURE1_VALUE);
+    glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(previous_texture_1));
+    g_gl_active_texture(GL_TEXTURE0_VALUE);
+    glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(previous_texture_0));
+    g_gl_active_texture(static_cast<GLenum>(previous_active_texture));
+    g_gl_bind_vertex_array(static_cast<GLuint>(previous_vao));
+    g_gl_bind_buffer(GL_ARRAY_BUFFER_VALUE, static_cast<GLuint>(previous_array_buffer));
+    g_gl_use_program(static_cast<GLuint>(previous_program));
+    g_gl_bind_framebuffer(GL_READ_FRAMEBUFFER_VALUE, static_cast<GLuint>(previous_read_fbo));
+    g_gl_bind_framebuffer(GL_DRAW_FRAMEBUFFER_VALUE, static_cast<GLuint>(previous_draw_fbo));
+    glViewport(previous_viewport[0], previous_viewport[1],
+               previous_viewport[2], previous_viewport[3]);
+    glColorMask(previous_color_mask[0], previous_color_mask[1],
+                previous_color_mask[2], previous_color_mask[3]);
+    if (blend_enabled) glEnable(GL_BLEND); else glDisable(GL_BLEND);
+    if (depth_enabled) glEnable(GL_DEPTH_TEST); else glDisable(GL_DEPTH_TEST);
+    if (scissor_enabled) glEnable(GL_SCISSOR_TEST); else glDisable(GL_SCISSOR_TEST);
+    if (cull_enabled) glEnable(GL_CULL_FACE); else glDisable(GL_CULL_FACE);
+
+    if (success) {
+        g_eye_valid[target_eye] = true;
+        ++g_afw_warped_frames;
+        if (render_logging_enabled() && (g_afw_warped_frames % 90u) == 1u) {
+            std::ostringstream out;
+            out << "AFW: warped centered source target=" << target_eye
+                << " source=" << source_width << "x" << source_height
+                << " output=" << g_texture_width << "x" << g_texture_height
+                << " depth=" << depth.width << "x" << depth.height
+                << " depthFrame=" << depth.frame;
+            render_log(out.str());
+        }
+    }
+    return success;
+}
+
+bool draw_overlays_to_eye_texture(int eye, const VrCameraControls& controls) {
+    if (eye < 0 || eye > 1 || !g_eye_valid[eye] || !g_eye_textures[eye] ||
+        !initialize_gl_capture()) {
+        return false;
+    }
+    GLint previous_read_fbo = 0;
+    GLint previous_draw_fbo = 0;
+    GLint previous_viewport[4]{};
+    glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING_VALUE, &previous_read_fbo);
+    glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING_VALUE, &previous_draw_fbo);
+    glGetIntegerv(GL_VIEWPORT, previous_viewport);
+    g_gl_bind_framebuffer(GL_READ_FRAMEBUFFER_VALUE, g_capture_fbo);
+    g_gl_bind_framebuffer(GL_DRAW_FRAMEBUFFER_VALUE, g_capture_fbo);
+    g_gl_framebuffer_texture_2d(GL_DRAW_FRAMEBUFFER_VALUE, GL_COLOR_ATTACHMENT0_VALUE,
+                                GL_TEXTURE_2D, g_eye_textures[eye], 0);
+    const bool complete = g_gl_check_framebuffer_status(GL_DRAW_FRAMEBUFFER_VALUE) ==
+        GL_FRAMEBUFFER_COMPLETE_VALUE;
+    if (complete) {
+        glViewport(0, 0, g_texture_width, g_texture_height);
+        draw_vr_eye_overlays(eye, g_texture_width, g_texture_height, controls,
+                             0, 0, g_texture_width, g_texture_height, false);
+    }
+    g_gl_bind_framebuffer(GL_READ_FRAMEBUFFER_VALUE, static_cast<GLuint>(previous_read_fbo));
+    g_gl_bind_framebuffer(GL_DRAW_FRAMEBUFFER_VALUE, static_cast<GLuint>(previous_draw_fbo));
+    glViewport(previous_viewport[0], previous_viewport[1],
+               previous_viewport[2], previous_viewport[3]);
+    return complete;
 }
 
 vr::EVRCompositorError submit_eye_texture_to_eye(int target_eye_index, int texture_eye_index) {
@@ -4197,20 +4841,23 @@ void shutdown_stereo() {
         glDeleteTextures(2, g_eye_textures);
         g_eye_textures[0] = g_eye_textures[1] = 0;
     }
-    if (g_resolve_texture) {
-        glDeleteTextures(1, &g_resolve_texture);
-        g_resolve_texture = 0;
+    if (g_afw_source_texture) {
+        glDeleteTextures(1, &g_afw_source_texture);
+        g_afw_source_texture = 0;
     }
-    if ((g_capture_fbo || g_resolve_fbo) && g_gl_delete_framebuffers) {
-        const GLuint framebuffers[2]{g_capture_fbo, g_resolve_fbo};
-        g_gl_delete_framebuffers(2, framebuffers);
-        g_capture_fbo = g_resolve_fbo = 0;
+    if (g_eye_depth_textures[0] || g_eye_depth_textures[1]) {
+        glDeleteTextures(2, g_eye_depth_textures);
+        g_eye_depth_textures[0] = g_eye_depth_textures[1] = 0;
+    }
+    if (g_capture_fbo && g_gl_delete_framebuffers) {
+        g_gl_delete_framebuffers(1, &g_capture_fbo);
+        g_capture_fbo = 0;
     }
     g_eye_valid[0] = g_eye_valid[1] = false;
+    g_eye_depth_valid[0] = g_eye_depth_valid[1] = false;
     g_pre_ui_captured[0] = g_pre_ui_captured[1] = false;
     g_texture_width = g_texture_height = 0;
-    g_resolve_width = g_resolve_height = 0;
-    g_eye_target_width = g_eye_target_height = 0;
+    g_source_texture_width = g_source_texture_height = 0;
     g_consecutive_submit_failures = 0;
     g_last_successful_submit_tick = 0;
     g_last_swap_recenter_sequence = 0;
@@ -4223,6 +4870,12 @@ void shutdown_stereo() {
     g_hmd_view_delta = identity_matrix();
     g_hmd_origin_valid = false;
     g_hmd_current_valid = false;
+    g_floor_height_alignment_sequence = ~0u;
+    g_floor_height_offset = 0.0f;
+    g_floor_height_world_scale = 1.30f;
+    g_native_standing_camera_y = 0.0f;
+    g_native_standing_camera_y_valid = false;
+    g_last_sneak_height_compensation = 0.0f;
     g_left_controller_valid = false;
     g_right_controller_valid = false;
     reset_physical_tracking_locked();
@@ -4237,6 +4890,7 @@ void shutdown_stereo() {
     g_last_written_culling_view_valid = false;
     g_last_native_camera_object = nullptr;
     g_last_written_culling_object = nullptr;
+    g_afw_camera_valid = false;
     ReleaseSRWLockExclusive(&g_camera_lock);
     g_aggressive_native_view_valid = false;
     g_last_observed_native_yaw_valid = false;
@@ -4298,7 +4952,11 @@ void shutdown_stereo() {
 }
 
 void __cdecl hook_sdl_gl_swap_window(void* window) {
+    HookCallbackScope callback_scope;
     if (g_shared) InterlockedIncrement(reinterpret_cast<volatile LONG*>(&g_shared->swap_calls));
+    if (ensure_ui_scale_mapping() && g_ui_scale_shared) {
+        InterlockedIncrement(&g_ui_scale_shared->renderFrameSequence);
+    }
     VrCameraControls controls{};
     const bool have_controls = read_controls(controls);
     const ULONGLONG swap_log_now = GetTickCount64();
@@ -4345,18 +5003,7 @@ void __cdecl hook_sdl_gl_swap_window(void* window) {
         reset_eye_capture_resources("recenter sequence");
     }
     if (have_controls && controls.unload_requested) {
-        publish_ui_scale_neutral();
-        restore_neutral_camera(true);
-        if (g_runtime_active) shutdown_stereo();
-        restore_noesis_hooks();
-        const bool interaction_restored = restore_interaction_hook();
-        const bool camera_restored = interaction_restored && restore_camera_hook();
-        // Keep the swap callback installed if the camera patch could not be
-        // restored yet; the next frame then provides a safe retry point.
-        const bool swap_restored = camera_restored && restore_swap_hook();
-        g_shared->swap_hook_active = swap_restored ? 0u : 1u;
-        g_shared->hook_active = camera_restored && swap_restored ? 0u : 1u;
-        g_shared->hook_error = camera_restored && swap_restored ? 0 : 3;
+        restore_all_hooks(true);
         if (g_swap_trampoline) g_swap_trampoline(window);
         return;
     }
@@ -4391,35 +5038,41 @@ void __cdecl hook_sdl_gl_swap_window(void* window) {
             g_consecutive_submit_failures = 0;
             g_last_successful_submit_tick = now;
         }
-        const int eye = static_cast<int>(InterlockedCompareExchange(&g_render_eye, 0, 0) & 1);
-        if (eye == 0 && !prepare_render_resolution(window, controls)) {
+        InterlockedExchange(&g_render_eye, 0);
+        g_shared->current_eye = 0;
+        constexpr int source_eye = 0;
+        if (!prepare_render_resolution(window, controls)) {
             restore_neutral_camera();
             if (g_swap_trampoline) g_swap_trampoline(window);
             return;
         }
-        const bool captured = g_pre_ui_captured[eye] || capture_eye(eye, controls);
-        g_pre_ui_captured[eye] = false;
+        const bool captured = g_pre_ui_captured[source_eye] ||
+                              capture_eye(source_eye, controls, false);
+        g_pre_ui_captured[source_eye] = false;
         restore_neutral_camera();
-        if (captured) {
-            if (eye == 0) {
+        if (captured && preserve_afw_source_texture(source_eye)) {
+            const bool left_warped = warp_source_to_eye(g_afw_source_texture, 0);
+            const bool right_warped = warp_source_to_eye(g_afw_source_texture, 1);
+            if (left_warped && right_warped) {
+                draw_overlays_to_eye_texture(0, controls);
+                draw_overlays_to_eye_texture(1, controls);
                 submit_menu_overlay_texture(g_eye_textures[0], controls);
-                InterlockedExchange(&g_render_eye, 1);
-                g_shared->current_eye = 1;
-            } else if (submit_eye_pair()) {
+            }
+            if (left_warped && right_warped && submit_eye_pair()) {
                 synchronize_openvr(controls);
-                InterlockedIncrement(reinterpret_cast<volatile LONG*>(&g_shared->completed_pairs));
-                InterlockedExchange(&g_render_eye, 0);
-                g_shared->current_eye = 0;
+                InterlockedIncrement(
+                    reinterpret_cast<volatile LONG*>(&g_shared->completed_pairs));
             } else {
-                InterlockedExchange(&g_render_eye, 0);
-                g_shared->current_eye = 0;
+                g_eye_valid[0] = g_eye_valid[1] = false;
+                g_eye_depth_valid[0] = g_eye_depth_valid[1] = false;
+                synchronize_openvr(controls);
             }
         } else {
             g_eye_valid[0] = false;
             g_eye_valid[1] = false;
+            g_eye_depth_valid[0] = g_eye_depth_valid[1] = false;
             g_pre_ui_captured[0] = g_pre_ui_captured[1] = false;
-            InterlockedExchange(&g_render_eye, 0);
-            g_shared->current_eye = 0;
+            synchronize_openvr(controls);
         }
     } else if (g_shared) {
         g_shared->stereo_active = 0;
@@ -4468,6 +5121,17 @@ bool install_swap_hook() {
     DWORD old_protect = 0;
     SuspendedProcessThreads suspended_threads;
     if (!VirtualProtect(g_swap_target, 14, PAGE_EXECUTE_READWRITE, &old_protect)) {
+        if (allocated_trampoline) {
+            VirtualFree(trampoline, 0, MEM_RELEASE);
+            g_swap_trampoline = nullptr;
+        }
+        g_swap_target = nullptr;
+        return false;
+    }
+    if (std::memcmp(g_swap_target, g_swap_original.data(), g_swap_original.size()) != 0) {
+        DWORD unused = 0;
+        VirtualProtect(g_swap_target, g_swap_original.size(), old_protect, &unused);
+        render_log("SDL swap hook site changed before patching; installation aborted");
         if (allocated_trampoline) {
             VirtualFree(trampoline, 0, MEM_RELEASE);
             g_swap_trampoline = nullptr;
@@ -4590,10 +5254,12 @@ bool install_interaction_hook() {
         "48 8D 95 00 FF FF FF 48 89 54 24 20 "
         "48 8D 95 20 FE FF FF 4C 8D 85 10 FE FF FF 4C 8B CF",
         "0F 29 BD 20 FE FF FF 44 0F 29 85 10 FE FF FF",
-        "0F 29 BD ?? FE FF FF 44 0F 29 85 ?? FE FF FF",
+        "0F 29 BD ?? ?? ?? ?? 44 0F 29 85 ?? ?? ?? ??",
     };
     g_interaction_hook_target = find_hook_target_by_patterns(
-        "interaction-ray hook", 0x4BF5F1, patterns, sizeof(patterns) / sizeof(patterns[0]));
+        "interaction-ray hook", 0x4BF5F1, patterns,
+        sizeof(patterns) / sizeof(patterns[0]),
+        &hytalevr::interaction_hook_site_valid);
     if (!g_interaction_hook_target) return false;
 
     std::memcpy(g_interaction_original.data(), g_interaction_hook_target,
@@ -4678,6 +5344,19 @@ bool install_interaction_hook() {
         g_interaction_hook_target = nullptr;
         return false;
     }
+    if (std::memcmp(g_interaction_hook_target, g_interaction_original.data(),
+                    g_interaction_original.size()) != 0) {
+        DWORD unused = 0;
+        VirtualProtect(g_interaction_hook_target, g_interaction_original.size(),
+                       old_protect, &unused);
+        render_log("interaction hook site changed before patching; installation aborted");
+        if (allocated_code) {
+            VirtualFree(code, 0, MEM_RELEASE);
+            g_interaction_hook_memory = nullptr;
+        }
+        g_interaction_hook_target = nullptr;
+        return false;
+    }
     g_interaction_hook_target[0] = 0x48;
     g_interaction_hook_target[1] = 0xB8;
     *reinterpret_cast<void**>(g_interaction_hook_target + 2) = code;
@@ -4701,10 +5380,12 @@ bool install_hook() {
         "44 0F 28 A4 24 20 03 00 00 44 0F 28 AC 24 10 03 00 00 "
         "48 81 C4 90 03 00 00 5B 5D 5E 5F 41 5D 41 5E 41 5F C3",
         "0F 28 B4 24 80 03 00 00 0F 28 BC 24 70 03 00 00",
-        "0F 28 B4 24 ?? ?? 00 00 0F 28 BC 24 ?? ?? 00 00",
+        "0F 28 B4 24 ?? ?? ?? ?? 0F 28 BC 24 ?? ?? ?? ??",
     };
     g_hook_target = find_hook_target_by_patterns(
-        "camera hook", 0x5EC7F3, patterns, sizeof(patterns) / sizeof(patterns[0]));
+        "camera hook", 0x5EC7F3, patterns,
+        sizeof(patterns) / sizeof(patterns[0]),
+        &hytalevr::camera_hook_site_valid);
     if (!g_hook_target) return false;
 
     std::memcpy(g_original.data(), g_hook_target, g_original.size());
@@ -4771,6 +5452,17 @@ bool install_hook() {
         g_hook_target = nullptr;
         return false;
     }
+    if (std::memcmp(g_hook_target, g_original.data(), g_original.size()) != 0) {
+        DWORD unused = 0;
+        VirtualProtect(g_hook_target, g_original.size(), old_protect, &unused);
+        render_log("camera hook site changed before patching; installation aborted");
+        if (allocated_code) {
+            VirtualFree(code, 0, MEM_RELEASE);
+            g_hook_memory = nullptr;
+        }
+        g_hook_target = nullptr;
+        return false;
+    }
     g_hook_target[0] = 0x48;
     g_hook_target[1] = 0xB8;
     *reinterpret_cast<void**>(g_hook_target + 2) = code;
@@ -4785,10 +5477,22 @@ bool install_hook() {
 
 bool restore_camera_hook() {
     if (!g_hook_target) return true;
+    if (!hytalevr::absolute_jump_patch_matches(
+            g_hook_target, g_original.size(), g_hook_memory)) {
+        render_log("camera hook restore refused: patch ownership was lost");
+        return false;
+    }
     DWORD old_protect = 0;
     SuspendedProcessThreads suspended_threads;
     if (!VirtualProtect(g_hook_target, g_original.size(), PAGE_EXECUTE_READWRITE,
                         &old_protect)) return false;
+    if (!hytalevr::absolute_jump_patch_matches(
+            g_hook_target, g_original.size(), g_hook_memory)) {
+        DWORD unused = 0;
+        VirtualProtect(g_hook_target, g_original.size(), old_protect, &unused);
+        render_log("camera hook restore refused: patch changed while suspending threads");
+        return false;
+    }
     std::memcpy(g_hook_target, g_original.data(), g_original.size());
     DWORD unused = 0;
     VirtualProtect(g_hook_target, g_original.size(), old_protect, &unused);
@@ -4818,10 +5522,26 @@ bool restore_interaction_hook() {
         }
         return true;
     }
+    if (!hytalevr::absolute_jump_patch_matches(
+            g_interaction_hook_target, g_interaction_original.size(),
+            g_interaction_hook_memory)) {
+        render_log("interaction hook restore refused: patch ownership was lost");
+        return false;
+    }
     DWORD old_protect = 0;
     SuspendedProcessThreads suspended_threads;
     if (!VirtualProtect(g_interaction_hook_target, g_interaction_original.size(),
                         PAGE_EXECUTE_READWRITE, &old_protect)) return false;
+    if (!hytalevr::absolute_jump_patch_matches(
+            g_interaction_hook_target, g_interaction_original.size(),
+            g_interaction_hook_memory)) {
+        DWORD unused = 0;
+        VirtualProtect(g_interaction_hook_target, g_interaction_original.size(),
+                       old_protect, &unused);
+        render_log(
+            "interaction hook restore refused: patch changed while suspending threads");
+        return false;
+    }
     std::memcpy(g_interaction_hook_target, g_interaction_original.data(),
                 g_interaction_original.size());
     DWORD unused = 0;
@@ -4901,10 +5621,24 @@ bool restore_noesis_hooks() {
 
 bool restore_swap_hook() {
     if (!g_swap_target) return true;
+    if (!hytalevr::absolute_jump_patch_matches(
+            g_swap_target, g_swap_original.size(),
+            reinterpret_cast<const void*>(&hook_sdl_gl_swap_window))) {
+        render_log("SDL swap hook restore refused: patch ownership was lost");
+        return false;
+    }
     DWORD old_protect = 0;
     SuspendedProcessThreads suspended_threads;
     if (!VirtualProtect(g_swap_target, g_swap_original.size(), PAGE_EXECUTE_READWRITE,
                         &old_protect)) return false;
+    if (!hytalevr::absolute_jump_patch_matches(
+            g_swap_target, g_swap_original.size(),
+            reinterpret_cast<const void*>(&hook_sdl_gl_swap_window))) {
+        DWORD unused = 0;
+        VirtualProtect(g_swap_target, g_swap_original.size(), old_protect, &unused);
+        render_log("SDL swap hook restore refused: patch changed while suspending threads");
+        return false;
+    }
     std::memcpy(g_swap_target, g_swap_original.data(), g_swap_original.size());
     DWORD unused = 0;
     VirtualProtect(g_swap_target, g_swap_original.size(), old_protect, &unused);
@@ -4915,12 +5649,86 @@ bool restore_swap_hook() {
     return true;
 }
 
+bool restore_all_hooks(bool render_thread_cleanup) {
+    AcquireSRWLockExclusive(&g_hook_lifecycle_lock);
+    publish_ui_scale_neutral();
+    restore_neutral_camera(true);
+    if (render_thread_cleanup && g_runtime_active) shutdown_stereo();
+
+    const bool noesis_restored = restore_noesis_hooks();
+    const bool interaction_restored = noesis_restored && restore_interaction_hook();
+    const bool camera_restored = interaction_restored && restore_camera_hook();
+    // Keep the swap callback installed when another hook could not be restored;
+    // it gives the render thread a safe place to retry without unloading code.
+    const bool swap_restored = camera_restored && restore_swap_hook();
+    const bool restored = noesis_restored && interaction_restored &&
+                          camera_restored && swap_restored;
+    if (g_shared) {
+        g_shared->swap_hook_active = swap_restored ? 0u : 1u;
+        g_shared->hook_active = restored ? 0u : 1u;
+        g_shared->hook_error = restored ? 0 : 3;
+    }
+    ReleaseSRWLockExclusive(&g_hook_lifecycle_lock);
+    return restored;
+}
+
+bool wait_for_hook_callbacks_to_quiesce(DWORD timeout_ms) {
+    const ULONGLONG deadline = GetTickCount64() + timeout_ms;
+    ULONGLONG idle_since = 0;
+    while (GetTickCount64() < deadline) {
+        if (InterlockedCompareExchange(&g_hook_callbacks_in_flight, 0, 0) == 0) {
+            if (idle_since == 0) idle_since = GetTickCount64();
+            if (GetTickCount64() - idle_since >= 250) return true;
+        } else {
+            idle_since = 0;
+        }
+        Sleep(5);
+    }
+    return false;
+}
+
+void close_worker_resources() {
+    publish_ui_scale_neutral();
+    if (g_ui_scale_shared) {
+        UnmapViewOfFile(g_ui_scale_shared);
+        g_ui_scale_shared = nullptr;
+    }
+    if (g_ui_scale_mapping) {
+        CloseHandle(g_ui_scale_mapping);
+        g_ui_scale_mapping = nullptr;
+    }
+
+    VrCameraShared* shared = g_shared;
+    g_shared = nullptr;
+    if (shared) UnmapViewOfFile(shared);
+    if (g_mapping) {
+        CloseHandle(g_mapping);
+        g_mapping = nullptr;
+    }
+}
+
+[[noreturn]] void unload_worker_module() {
+    if (g_vr_system) {
+        vr::VR_Shutdown();
+        g_vr_system = nullptr;
+    }
+    if (g_hand_gdiplus_token != 0) {
+        Gdiplus::GdiplusShutdown(g_hand_gdiplus_token);
+        g_hand_gdiplus_token = 0;
+    }
+    close_worker_resources();
+    HMODULE module = g_module;
+    g_module = nullptr;
+    if (module) FreeLibraryAndExitThread(module, 0);
+    ExitThread(0);
+}
+
 DWORD WINAPI worker(void*) {
     render_log("worker start: opening shared mapping");
     g_mapping = OpenFileMappingW(FILE_MAP_ALL_ACCESS, FALSE, kVrCameraMappingName);
     if (!g_mapping) {
         render_log("worker abort: OpenFileMapping failed");
-        return 0;
+        unload_worker_module();
     }
     g_shared = static_cast<VrCameraShared*>(
         MapViewOfFile(g_mapping, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(VrCameraShared)));
@@ -4928,7 +5736,7 @@ DWORD WINAPI worker(void*) {
         g_shared->version != kVrCameraVersion) {
         render_log("worker abort: shared mapping magic/version mismatch");
         if (g_shared) g_shared->hook_error = 6;
-        return 0;
+        unload_worker_module();
     }
     render_log("worker mapped shared memory");
     auto install_all_hooks = []() {
@@ -4948,9 +5756,9 @@ DWORD WINAPI worker(void*) {
             render_log("install_all_hooks failed: interaction hook");
             return false;
         }
-        g_noesis_hooks_active = install_noesis_hooks();
-        render_log(std::string("install_all_hooks noesis=") +
-                   (g_noesis_hooks_active ? "1" : "0"));
+        // The renderer export hook only forwarded the call and depended on an
+        // unvalidated Noesis prologue. UI handling is owned by HytaleUIScaleHook.
+        g_noesis_hooks_active = false;
         if (!install_swap_hook()) {
             restore_noesis_hooks();
             const bool interaction_restored = restore_interaction_hook();
@@ -4968,6 +5776,7 @@ DWORD WINAPI worker(void*) {
     };
 
     uint32_t observed_install_sequence = g_shared->install_sequence;
+    ULONGLONG unload_requested_at = 0;
     install_all_hooks();
     for (;;) {
         VrCameraControls controls{};
@@ -4975,13 +5784,30 @@ DWORD WINAPI worker(void*) {
             Sleep(20);
             continue;
         }
-        if (controls.unload_requested && g_shared->hook_active &&
-            !g_shared->swap_hook_active) {
-            const bool interaction_restored = restore_interaction_hook();
-            const bool restored = interaction_restored && restore_camera_hook();
-            g_shared->hook_active = restored ? 0u : 1u;
-            g_shared->hook_error = restored ? 0 : 3;
-        } else if (!g_shared->hook_active &&
+        if (controls.unload_requested) {
+            const ULONGLONG now = GetTickCount64();
+            if (unload_requested_at == 0) unload_requested_at = now;
+
+            bool restored = g_shared->hook_active == 0;
+            // Prefer render-thread cleanup. If rendering is paused, restore the
+            // code hooks from the worker after a bounded grace period.
+            if (!restored &&
+                (!g_shared->swap_hook_active || now - unload_requested_at >= 750)) {
+                restored = restore_all_hooks(false);
+            }
+            if (restored) {
+                if (wait_for_hook_callbacks_to_quiesce(3000)) {
+                    render_log("worker unload: hooks restored and callbacks quiescent");
+                    unload_worker_module();
+                }
+                g_shared->hook_error = 7;
+                render_log("worker unload deferred: callbacks are still active");
+            }
+            Sleep(20);
+            continue;
+        }
+        unload_requested_at = 0;
+        if (!g_shared->hook_active &&
                    controls.install_sequence != observed_install_sequence) {
             observed_install_sequence = controls.install_sequence;
             render_log("install sequence changed: reinstall requested");
@@ -5001,22 +5827,11 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID) {
             std::lock_guard<std::mutex> lock(g_render_log_mutex);
             std::ofstream clear_log(render_log_path(), std::ios_base::trunc);
             if (clear_log.is_open()) {
-                clear_log << GetTickCount64() << " DLL_PROCESS_ATTACH v120 native hand\n";
+                clear_log << GetTickCount64() << " DLL_PROCESS_ATTACH v122 floor aligned\n";
             }
         }
         HANDLE thread = CreateThread(nullptr, 0, worker, nullptr, 0, nullptr);
         if (thread) CloseHandle(thread);
-    } else if (reason == DLL_PROCESS_DETACH) {
-        render_log("DLL_PROCESS_DETACH");
-        publish_ui_scale_neutral();
-        if (g_ui_scale_shared) {
-            UnmapViewOfFile(g_ui_scale_shared);
-            g_ui_scale_shared = nullptr;
-        }
-        if (g_ui_scale_mapping) {
-            CloseHandle(g_ui_scale_mapping);
-            g_ui_scale_mapping = nullptr;
-        }
     }
     return TRUE;
 }

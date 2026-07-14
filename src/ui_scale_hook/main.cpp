@@ -11,6 +11,8 @@
 #include <unordered_set>
 #include <MinHook.h>
 
+#include "../ui_scene_depth_policy.h"
+
 // Basic OpenGL Type Definitions
 typedef unsigned int GLenum;
 typedef unsigned int GLuint;
@@ -151,6 +153,7 @@ struct SharedData {
     volatile LONG menuTextureFrame;
     volatile LONG menuCaptureError;
     volatile LONG currentEye;
+    volatile LONG renderFrameSequence;
     volatile LONG suppressMenuInGame;
     volatile LONG menuIgnoreDrawThreshold;
     int firstPersonControllerReanchor;
@@ -254,6 +257,7 @@ int g_menuCaptureWidth = 0;
 int g_menuCaptureHeight = 0;
 DWORD g_menuCaptureUntilTick = 0;
 int g_lastMenuCaptureEye = -1;
+LONG g_lastMenuCaptureFrameSequence = -1;
 bool g_menuCaptureClearedThisEye = false;
 
 constexpr GLenum GL_TEXTURE_2D_VALUE = 0x0DE1;
@@ -285,6 +289,7 @@ DWORD g_lastSkyProgramUseTick = 0;
 GLuint g_cachedSceneDepthTexture = 0;
 GLsizei g_cachedSceneDepthWidth = 0;
 GLsizei g_cachedSceneDepthHeight = 0;
+int g_cachedSceneDepthScore = 0;
 
 std::vector<GLuint> g_loggedBufferIDs;
 std::mutex g_loggedBuffersMutex;
@@ -476,6 +481,15 @@ bool CaptureOrSuppressBatcher2DMenuDraw(GLenum mode, GLsizei count, GLenum type,
     }
 
     const LONG currentEye = InterlockedCompareExchange(&g_sharedData->currentEye, 0, 0);
+    const LONG frameSequence = InterlockedCompareExchange(
+        &g_sharedData->renderFrameSequence, 0, 0);
+    // AFW uses a fixed source eye, so eye changes cannot identify a new frame.
+    // Use the swap sequence instead; timing gaps between UI batches are not
+    // frame boundaries and used to clear partially rendered menus.
+    if (frameSequence != g_lastMenuCaptureFrameSequence) {
+        g_lastMenuCaptureFrameSequence = frameSequence;
+        g_menuCaptureClearedThisEye = false;
+    }
     if (currentEye != g_lastMenuCaptureEye) {
         g_lastMenuCaptureEye = static_cast<int>(currentEye);
         g_menuCaptureClearedThisEye = false;
@@ -652,27 +666,25 @@ bool GetClientSize(int& width, int& height) {
 }
 
 bool IsLikelyLinearSceneDepthTexture(GLsizei width, GLsizei height) {
-    if (width < 512 || height < 256 || width > 4096 || height > 4096) {
-        return false;
-    }
-
     int clientWidth = 0;
     int clientHeight = 0;
-    if (GetClientSize(clientWidth, clientHeight)) {
-        const int toleranceX = (std::max)(8, clientWidth / 32);
-        const int toleranceY = (std::max)(8, clientHeight / 32);
-        const bool halfWindow =
-            std::abs(width * 2 - clientWidth) <= toleranceX &&
-            std::abs(height * 2 - clientHeight) <= toleranceY;
-        if (halfWindow) return true;
-    }
+    GetClientSize(clientWidth, clientHeight);
+    return hytalevr::is_likely_linear_scene_depth_texture(
+        width, height, clientWidth, clientHeight);
+}
 
-    const float aspect = static_cast<float>(width) / static_cast<float>((std::max)(1, height));
-    return aspect >= 1.2f && aspect <= 2.4f;
+int SceneDepthCandidateScore(GLsizei width, GLsizei height) {
+    int clientWidth = 0;
+    int clientHeight = 0;
+    GetClientSize(clientWidth, clientHeight);
+    return hytalevr::scene_depth_candidate_score(
+        width, height, clientWidth, clientHeight);
 }
 
 void PublishSceneDepthTexture(GLuint texture, GLsizei width, GLsizei height, const char* source) {
-    if (!g_sharedData || texture == 0 || !IsLikelyLinearSceneDepthTexture(width, height)) {
+    const int candidateScore = SceneDepthCandidateScore(width, height);
+    if (!g_sharedData || texture == 0 || candidateScore == 0 ||
+        candidateScore < g_cachedSceneDepthScore) {
         return;
     }
 
@@ -691,13 +703,15 @@ void PublishSceneDepthTexture(GLuint texture, GLsizei width, GLsizei height, con
     g_cachedSceneDepthTexture = texture;
     g_cachedSceneDepthWidth = width;
     g_cachedSceneDepthHeight = height;
+    g_cachedSceneDepthScore = candidateScore;
 
     if (previousTexture != static_cast<LONG>(texture) ||
         previousWidth != static_cast<LONG>(width) ||
         previousHeight != static_cast<LONG>(height)) {
         LogMessage(std::string("HytaleUIScaleHook: scene depth texture published from ") +
                    source + " texture=" + std::to_string(texture) +
-                   " size=" + std::to_string(width) + "x" + std::to_string(height));
+                   " size=" + std::to_string(width) + "x" + std::to_string(height) +
+                   " score=" + std::to_string(candidateScore));
     }
 }
 
@@ -1137,6 +1151,7 @@ void InitializeSharedMemory() {
             g_sharedData->menuTextureFrame = 0;
             g_sharedData->menuCaptureError = 0;
             g_sharedData->currentEye = 0;
+            g_sharedData->renderFrameSequence = 0;
             g_sharedData->suppressMenuInGame = 0;
             g_sharedData->menuIgnoreDrawThreshold = 1;
             g_sharedData->firstPersonControllerReanchor = 0;
@@ -1232,19 +1247,15 @@ void WINAPI hook_glUseProgram(GLuint program) {
         g_lastSkyProgramUseTick = GetTickCount();
     }
     if (g_currentProgramFlags.hizReproject) {
-        if (g_cachedSceneDepthTexture != 0) {
-            RefreshCachedSceneDepthTexture();
-        } else {
-            TryPublishTexture0SceneDepth("HiZReprojectProgram use");
-        }
+        TryPublishTexture0SceneDepth("HiZReprojectProgram use");
+        RefreshCachedSceneDepthTexture();
     }
 }
 
 void WINAPI hook_glBindTexture(GLenum target, GLuint texture) {
     real_glBindTexture(target, texture);
     if (target != GL_TEXTURE_2D_VALUE || texture == 0 || g_currentProgram == 0 ||
-        !g_currentProgramFlags.hizReproject || !real_glGetIntegerv ||
-        g_cachedSceneDepthTexture != 0) {
+        !g_currentProgramFlags.hizReproject || !real_glGetIntegerv) {
         return;
     }
 

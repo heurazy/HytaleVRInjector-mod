@@ -1,0 +1,60 @@
+{
+  "alias_info": {},
+  "bindings": {
+    "/actions/hytale": {
+      "chords": [],
+      "haptics": [],
+      "poses": [
+        { "output": "/actions/hytale/in/left_pose", "path": "/user/hand/left/pose/raw" },
+        { "output": "/actions/hytale/in/right_pose", "path": "/user/hand/right/pose/raw" }
+      ],
+      "skeleton": [],
+      "sources": [
+        {
+          "inputs": {
+            "click": { "output": "/actions/hytale/in/sprint" },
+            "position": { "output": "/actions/hytale/in/move" }
+          },
+          "mode": "trackpad",
+          "path": "/user/hand/left/input/trackpad"
+        },
+        {
+          "inputs": {
+            "click": { "output": "/actions/hytale/in/button_x" },
+            "pull": { "output": "/actions/hytale/in/left_trigger" }
+          },
+          "mode": "trigger",
+          "path": "/user/hand/left/input/trigger"
+        },
+        {
+          "inputs": { "click": { "output": "/actions/hytale/in/button_y" } },
+          "mode": "button",
+          "path": "/user/hand/left/input/application_menu"
+        },
+        {
+          "inputs": {
+            "click": { "output": "/actions/hytale/in/right_stick_click" },
+            "position": { "output": "/actions/hytale/in/turn" }
+          },
+          "mode": "trackpad",
+          "path": "/user/hand/right/input/trackpad"
+        },
+        {
+          "inputs": { "pull": { "output": "/actions/hytale/in/right_trigger" } },
+          "mode": "trigger",
+          "path": "/user/hand/right/input/trigger"
+        },
+        {
+          "inputs": { "click": { "output": "/actions/hytale/in/jump" } },
+          "mode": "button",
+          "path": "/user/hand/right/input/application_menu"
+        }
+      ]
+    }
+  },
+  "controller_type": "vive_controller",
+  "description": "Hytale VR Vive wand bindings",
+  "name": "Hytale VR Vive Wands",
+  "options": {},
+  "simulated_actions": []
+}

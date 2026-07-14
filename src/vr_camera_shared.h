@@ -2,9 +2,9 @@
 
 #include <cstdint>
 
-constexpr wchar_t kVrCameraMappingName[] = L"Local\\HytaleVrCamera_v120NativeHand";
+constexpr wchar_t kVrCameraMappingName[] = L"Local\\HytaleVrCamera_v122FloorAligned";
 constexpr uint32_t kVrCameraMagic = 0x48595652; // HYVR
-constexpr uint32_t kVrCameraVersion = 120;
+constexpr uint32_t kVrCameraVersion = 122;
 
 struct VrCameraControls {
     uint32_t enabled = 0;
@@ -17,9 +17,11 @@ struct VrCameraControls {
     uint32_t recenter_sequence = 0;
     float ipd_meters = 0.064f;
     float stereo_separation = 1.0f;
-    float render_scale = 1.0f;
+    // Reuses the former render-scale ABI slot. 1.0 means normal world scale.
+    float world_scale = 1.30f;
     float translation_scale = 1.0f;
     float translation_y_scale = 1.0f;
+    uint32_t sneak_active = 0;
     uint32_t invert_translation_xz = 0;
     uint32_t hand_pointer_enabled = 1;
     uint32_t hide_center_reticle = 1;
@@ -36,16 +38,17 @@ struct VrCameraControls {
     uint32_t menu_ignore_draw_threshold = 1;
     float hand_pointer_distance = 4.0f;
     float turn_speed = 450.0f;
-    // Legacy ABI slot. Floor orientation now comes from SteamVR Standing space.
-    float floor_tilt_degrees = 0.0f;
+    // Reuses a legacy ABI slot so dashboard and hook keep the same structure size.
+    float vr_resolution_scale = 1.0f;
     uint32_t first_person_hand_hidden = 1;
-    uint32_t wide_culling_enabled = 1;
-    float wide_culling_scale = 0.50f;
+    uint32_t reserved_render_option = 0;
+    float reserved_render_value = 1.0f;
     uint32_t hmd_culling_view_enabled = 1;
     float hand_model_scale = 1.0f;
     float hand_model_pitch_degrees = -90.0f;
     float hand_model_yaw_degrees = 0.0f;
     float hand_model_roll_degrees = 0.0f;
+    float hand_depth_tolerance = 0.02f;
 };
 
 struct VrCameraShared {
@@ -64,9 +67,11 @@ struct VrCameraShared {
     uint32_t recenter_sequence = 0;
     float ipd_meters = 0.064f;
     float stereo_separation = 1.0f;
-    float render_scale = 1.0f;
+    // Reuses the former render-scale ABI slot. 1.0 means normal world scale.
+    float world_scale = 1.30f;
     float translation_scale = 1.0f;
     float translation_y_scale = 1.0f;
+    uint32_t sneak_active = 0;
     uint32_t invert_translation_xz = 0;
     uint32_t hand_pointer_enabled = 1;
     uint32_t hide_center_reticle = 1;
@@ -83,16 +88,17 @@ struct VrCameraShared {
     uint32_t menu_ignore_draw_threshold = 1;
     float hand_pointer_distance = 4.0f;
     float turn_speed = 450.0f;
-    // Legacy ABI slot. Kept so dashboard/hook field offsets remain compatible.
-    float floor_tilt_degrees = 0.0f;
+    // Reuses a legacy ABI slot so dashboard and hook keep the same structure size.
+    float vr_resolution_scale = 1.0f;
     uint32_t first_person_hand_hidden = 1;
-    uint32_t wide_culling_enabled = 1;
-    float wide_culling_scale = 0.50f;
+    uint32_t reserved_render_option = 0;
+    float reserved_render_value = 1.0f;
     uint32_t hmd_culling_view_enabled = 1;
     float hand_model_scale = 1.0f;
     float hand_model_pitch_degrees = -90.0f;
     float hand_model_yaw_degrees = 0.0f;
     float hand_model_roll_degrees = 0.0f;
+    float hand_depth_tolerance = 0.02f;
 
     volatile uint32_t hook_active = 0;
     volatile int32_t hook_error = 0;

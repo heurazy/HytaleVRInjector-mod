@@ -16,6 +16,7 @@ This is an experimental mod. It is not affiliated with or endorsed by Hytale, Hy
 - `third_party/openvr/` - minimal OpenVR headers/import library/runtime DLL
 - `third_party/minhook/` - vendored MinHook sources used by the UI hook
 - `BUILDING.md` - rebuild instructions
+- `CHANGELOG.md` - release history and notable changes
 
 ## How to Use
 
@@ -29,6 +30,12 @@ This is an experimental mod. It is not affiliated with or endorsed by Hytale, Hy
 8. Click `Center VR` to inject and align the VR view.
 
 Keep SteamVR running while using the mod. Hytale must stay focused for the mod controls to work correctly.
+
+### VR Resolution
+
+`Resolution %` is available in Advanced options. It controls the AFW eye texture resolution from `50` to `200`, with `100` as the default. The source and output keep the same aspect ratio, so changing this value does not modify the eye projections.
+
+Higher values improve AFW reconstruction and hand/pointer edge resolution at an additional GPU cost. They cannot add world detail that was not present in Hytale's original backbuffer.
 
 ### Video Tutorial
 

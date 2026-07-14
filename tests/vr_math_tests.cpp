@@ -1,7 +1,16 @@
+#include "dashboard_key_bindings.h"
+#include "ui_scene_depth_policy.h"
+#include "vr_camera_shared.h"
 #include "vr_math.h"
+#include "vr_hand_depth.h"
 #include "vr_locomotion.h"
 #include "vr_physical_interactions.h"
+#include "vr_render_resolution.h"
+#include "vr_hook_validation.h"
 
+#include <array>
+#include <cstdint>
+#include <cstring>
 #include <cstdlib>
 #include <iostream>
 
@@ -18,9 +27,77 @@ int main() {
     using namespace hytalevr;
     bool success = true;
 
+    static_assert(sizeof(VrCameraControls) == 160,
+                  "VrCameraControls ABI changed; bump the shared mapping version");
+    const VrCameraControls default_controls{};
+    success &= check(std::fabs(default_controls.vr_resolution_scale - 1.0f) < 0.0001f,
+                     "VR resolution must default to the native AFW output size");
+
+    const RenderResolution resolution_150 =
+        scaled_render_resolution(1920, 1080, 1.5f, 8192);
+    success &= check(resolution_150.width == 2880 && resolution_150.height == 1620 &&
+                         std::fabs(resolution_150.scale - 1.5f) < 0.0001f,
+                     "VR resolution scaling must preserve the source aspect ratio");
+    const RenderResolution resolution_clamped =
+        scaled_render_resolution(1920, 1080, 2.0f, 2048);
+    success &= check(resolution_clamped.width == 2048 && resolution_clamped.height == 1152,
+                     "VR resolution scaling must respect the OpenGL texture limit");
+
+    const std::array<unsigned char, 16> camera_hook_site{
+        0x0F, 0x28, 0xB4, 0x24, 0x80, 0x03, 0x00, 0x00,
+        0x0F, 0x28, 0xBC, 0x24, 0x70, 0x03, 0x00, 0x00,
+    };
+    success &= check(camera_hook_site_valid(camera_hook_site.data()),
+                     "known camera hook prologue was rejected");
+    auto invalid_camera_hook_site = camera_hook_site;
+    invalid_camera_hook_site[12] = 0x60;
+    success &= check(!camera_hook_site_valid(invalid_camera_hook_site.data()),
+                     "camera hook accepted inconsistent stack offsets");
+
+    const std::array<unsigned char, 15> interaction_hook_site{
+        0x0F, 0x29, 0xBD, 0x20, 0xFE, 0xFF, 0xFF,
+        0x44, 0x0F, 0x29, 0x85, 0x10, 0xFE, 0xFF, 0xFF,
+    };
+    success &= check(interaction_hook_site_valid(interaction_hook_site.data()),
+                     "known interaction hook prologue was rejected");
+    auto invalid_interaction_hook_site = interaction_hook_site;
+    invalid_interaction_hook_site[11] = 0x00;
+    success &= check(!interaction_hook_site_valid(invalid_interaction_hook_site.data()),
+                     "interaction hook accepted inconsistent stack offsets");
+
+    std::array<unsigned char, 16> owned_jump{};
+    owned_jump.fill(0x90);
+    owned_jump[0] = 0x48;
+    owned_jump[1] = 0xB8;
+    const uintptr_t jump_destination = static_cast<uintptr_t>(0x12345678u);
+    std::memcpy(owned_jump.data() + 2, &jump_destination, sizeof(jump_destination));
+    owned_jump[10] = 0xFF;
+    owned_jump[11] = 0xE0;
+    success &= check(absolute_jump_patch_matches(
+                         owned_jump.data(), owned_jump.size(),
+                         reinterpret_cast<const void*>(jump_destination)),
+                     "owned absolute jump was rejected");
+    owned_jump.back() = 0xCC;
+    success &= check(!absolute_jump_patch_matches(
+                         owned_jump.data(), owned_jump.size(),
+                         reinterpret_cast<const void*>(jump_destination)),
+                     "modified absolute jump was accepted as owned");
+
     const Matrix4 identity = identity_matrix();
     success &= check(nearly_equal(multiply(identity, identity), identity),
                      "identity multiplication failed");
+
+    Matrix4 invertible = identity;
+    invertible.value[0] = 1.25f;
+    invertible.value[5] = 0.75f;
+    invertible.value[10] = -1.1f;
+    invertible.value[12] = 2.0f;
+    invertible.value[13] = -3.0f;
+    invertible.value[14] = 0.5f;
+    Matrix4 inverted{};
+    success &= check(inverse(invertible, inverted) &&
+                         nearly_equal(multiply(invertible, inverted), identity),
+                     "general matrix inversion failed");
 
     const float origin[9]{
         1.0f, 0.0f, 0.0f,
@@ -92,6 +169,11 @@ int main() {
                          std::fabs(extracted_forward[2] + 1.0f) < 0.0001f,
                      "view forward must use the camera negative Z axis");
 
+    const Matrix4 raised_camera = apply_camera_height_offset(identity, 0.25f);
+    view_pose(raised_camera, extracted_position, extracted_forward);
+    success &= check(std::fabs(extracted_position[1] - 0.25f) < 0.0001f,
+                     "floor alignment must raise the virtual camera in world space");
+
     Matrix4 pitched_view = identity;
     pitched_view.value[5] = 0.8f;
     pitched_view.value[6] = -0.6f;
@@ -144,6 +226,27 @@ int main() {
     success &= check(physical_swing_requested(2.51f) &&
                          !physical_swing_requested(2.49f),
                      "physical swing must use the 2.5 meter per second threshold");
+
+    success &= check(std::fabs(linear_scene_depth(0.25f, 100.0f) - 25.0f) < 0.0001f &&
+                         std::fabs(linear_hand_depth(0.05f) - 20.0f) < 0.0001f,
+                     "hand and scene depth must use the same linear distance units");
+    success &= check(hand_is_occluded(0.10f, 100.0f, 1.0f / 10.6f, 0.5f) &&
+                         !hand_is_occluded(0.10f, 100.0f, 1.0f / 10.4f, 0.5f),
+                     "hand occlusion must use only the explicit additive tolerance");
+
+    success &= check(scene_depth_candidate_score(1280, 684, 2560, 1369) == 100 &&
+                         scene_depth_candidate_score(256, 128, 2560, 1369) == 0,
+                     "scene depth selection must prefer the half-resolution game buffer");
+
+    const HKL keyboard_layout = GetKeyboardLayout(0);
+    const MovementKeys movement_keys = movement_keys_for_layout(keyboard_layout);
+    success &= check(movement_keys.forward != 0 && movement_keys.backward != 0 &&
+                         movement_keys.left != 0 && movement_keys.right != 0,
+                     "physical movement keys must resolve for the active layout");
+    success &= check(parse_key_name(L"  f7 ", 0, keyboard_layout) == VK_F7 &&
+                         parse_key_name(L"espace", 0, keyboard_layout) == VK_SPACE &&
+                         parse_key_name(L"Auto", 'Q', keyboard_layout) == 'Q',
+                     "custom key names must be parsed outside the dashboard implementation");
 
     DigitalStickState stick{};
     stick = digital_stick(0.40f, 0.70f, stick, 0.35f);

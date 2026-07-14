@@ -32,7 +32,16 @@ add_library(hytale_vr_camera_hook SHARED
     src/vr_camera_hook.cpp
 )
 
-set_target_properties(hytale_vr_camera_hook PROPERTIES OUTPUT_NAME "hytale_vr_camera_hook_v120_native_hand")
+set(HYTALE_VR_BINDING_FILES
+    "${CMAKE_CURRENT_SOURCE_DIR}/hytalevr_bindings_oculus_touch.json"
+    "${CMAKE_CURRENT_SOURCE_DIR}/hytalevr_bindings_knuckles.json"
+    "${CMAKE_CURRENT_SOURCE_DIR}/hytalevr_bindings_vive_controller.json"
+    "${CMAKE_CURRENT_SOURCE_DIR}/hytalevr_bindings_holographic_controller.json"
+    "${CMAKE_CURRENT_SOURCE_DIR}/hytalevr_bindings_hpmotioncontroller.json"
+    "${CMAKE_CURRENT_SOURCE_DIR}/hytalevr_bindings_vive_cosmos_controller.json"
+)
+
+set_target_properties(hytale_vr_camera_hook PROPERTIES OUTPUT_NAME "hytale_vr_camera_hook_v122_floor_aligned")
 
 add_custom_command(TARGET hytale_vr_camera_hook POST_BUILD
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
@@ -42,8 +51,8 @@ add_custom_command(TARGET hytale_vr_camera_hook POST_BUILD
         "${CMAKE_CURRENT_SOURCE_DIR}/hytalevr_actions.json"
         "$<TARGET_FILE_DIR:hytale_vr_camera_hook>/hytalevr_actions.json"
     COMMAND ${CMAKE_COMMAND} -E copy_if_different
-        "${CMAKE_CURRENT_SOURCE_DIR}/hytalevr_bindings_oculus_touch.json"
-        "$<TARGET_FILE_DIR:hytale_vr_camera_hook>/hytalevr_bindings_oculus_touch.json"
+        ${HYTALE_VR_BINDING_FILES}
+        "$<TARGET_FILE_DIR:hytale_vr_camera_hook>"
     COMMAND ${CMAKE_COMMAND} -E copy_directory
         "${CMAKE_CURRENT_SOURCE_DIR}/assets"
         "$<TARGET_FILE_DIR:hytale_vr_camera_hook>/assets"
@@ -193,8 +202,14 @@ include(CTest)
 if(BUILD_TESTING)
     add_executable(hytale_vr_math_tests tests/vr_math_tests.cpp)
     target_include_directories(hytale_vr_math_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+    target_link_libraries(hytale_vr_math_tests PRIVATE user32)
     hytale_target_defaults(hytale_vr_math_tests)
     add_test(NAME vr_math COMMAND hytale_vr_math_tests)
+    add_test(NAME vr_bindings
+        COMMAND ${CMAKE_COMMAND}
+            "-DPROJECT_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}"
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/validate_vr_bindings.cmake"
+    )
 endif()
 
 install(TARGETS
@@ -213,7 +228,13 @@ install(FILES
     "${CMAKE_CURRENT_SOURCE_DIR}/third_party/openvr/bin/win64/openvr_api.dll"
     "${CMAKE_CURRENT_SOURCE_DIR}/hytalevr.vrmanifest"
     "${CMAKE_CURRENT_SOURCE_DIR}/hytalevr_actions.json"
-    "${CMAKE_CURRENT_SOURCE_DIR}/hytalevr_bindings_oculus_touch.json"
+    ${HYTALE_VR_BINDING_FILES}
+    DESTINATION .
+)
+install(FILES
+    "${CMAKE_CURRENT_SOURCE_DIR}/README.md"
+    "${CMAKE_CURRENT_SOURCE_DIR}/CHANGELOG.md"
+    "${CMAKE_CURRENT_SOURCE_DIR}/LICENSE"
     DESTINATION .
 )
 install(DIRECTORY
