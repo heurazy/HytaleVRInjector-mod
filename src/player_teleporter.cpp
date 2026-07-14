@@ -2361,12 +2361,22 @@ void publish_vr_controls(bool enabled, bool shutdown_requested, bool unload_requ
         IsDlgButtonChecked(g_window, IDC_VR_HIDE_RETICLE) == BST_CHECKED ? 1u : 0u;
     g_vr_camera_shared->ui_overlay_enabled =
         IsDlgButtonChecked(g_window, IDC_VR_DISABLE_FOREGROUND_EFFECTS) == BST_CHECKED ? 1u : 0u;
+    uint32_t vr_effects = 0u;
+    if (IsDlgButtonChecked(g_window, IDC_VR_DISABLE_SHADOWS) == BST_CHECKED) {
+        vr_effects |= kVrEffectShadows;
+    }
+    if (IsDlgButtonChecked(g_window, IDC_VR_DISABLE_PARTICLES) == BST_CHECKED) {
+        vr_effects |= kVrEffectParticles;
+    }
+    if (IsDlgButtonChecked(g_window, IDC_VR_DISABLE_DISTORTION) == BST_CHECKED) {
+        vr_effects |= kVrEffectDistortion;
+    }
     g_vr_camera_shared->shadows_disabled =
-        IsDlgButtonChecked(g_window, IDC_VR_DISABLE_SHADOWS) == BST_CHECKED ? 1u : 0u;
+        (vr_effects & kVrEffectShadows) != 0u ? 0u : 1u;
     g_vr_camera_shared->particles_disabled =
-        IsDlgButtonChecked(g_window, IDC_VR_DISABLE_PARTICLES) == BST_CHECKED ? 1u : 0u;
+        (vr_effects & kVrEffectParticles) != 0u ? 0u : 1u;
     g_vr_camera_shared->distortion_disabled =
-        IsDlgButtonChecked(g_window, IDC_VR_DISABLE_DISTORTION) == BST_CHECKED ? 1u : 0u;
+        (vr_effects & kVrEffectDistortion) != 0u ? 2u : 1u;
     g_vr_camera_shared->ui_overlay_distance =
         std::clamp(get_float(IDC_VR_MENU_DISTANCE, 1.65f), 0.35f, 6.0f);
     g_vr_camera_shared->ui_overlay_width =
@@ -2390,7 +2400,7 @@ void publish_vr_controls(bool enabled, bool shutdown_requested, bool unload_requ
         std::clamp(get_float(IDC_VR_RESOLUTION_SCALE, 100.0f), 50.0f, 200.0f) * 0.01f;
     g_vr_camera_shared->first_person_hand_hidden =
         IsDlgButtonChecked(g_window, IDC_VR_HIDE_FIRST_PERSON_HAND) == BST_CHECKED ? 1u : 0u;
-    g_vr_camera_shared->reserved_render_option = 0u;
+    g_vr_camera_shared->reserved_render_option = vr_effects;
     g_vr_camera_shared->reserved_render_value = 1.0f;
     g_vr_camera_shared->hmd_culling_view_enabled = 1u;
     g_vr_camera_shared->hand_model_scale =
@@ -2683,9 +2693,9 @@ void create_ui(HWND window) {
     // Column 2 inputs/toggles
     add(L"BUTTON", L"SteamVR stereo", BS_AUTOCHECKBOX, 405, 304, 175, 20, IDC_VR_STEREO);
     add(L"BUTTON", L"Stable VR menus", BS_AUTOCHECKBOX, 405, 328, 175, 20, IDC_VR_DISABLE_FOREGROUND_EFFECTS);
-    add(L"BUTTON", L"Disable shadows", BS_AUTOCHECKBOX, 405, 352, 175, 20, IDC_VR_DISABLE_SHADOWS);
-    add(L"BUTTON", L"Disable particles", BS_AUTOCHECKBOX, 405, 376, 175, 20, IDC_VR_DISABLE_PARTICLES);
-    add(L"BUTTON", L"Disable distortion", BS_AUTOCHECKBOX, 405, 400, 175, 20, IDC_VR_DISABLE_DISTORTION);
+    add(L"BUTTON", L"VR shadows", BS_AUTOCHECKBOX, 405, 352, 175, 20, IDC_VR_DISABLE_SHADOWS);
+    add(L"BUTTON", L"VR particles", BS_AUTOCHECKBOX, 405, 376, 175, 20, IDC_VR_DISABLE_PARTICLES);
+    add(L"BUTTON", L"VR distortion effects", BS_AUTOCHECKBOX, 405, 400, 175, 20, IDC_VR_DISABLE_DISTORTION);
     add(L"BUTTON", L"Quest stick", BS_AUTOCHECKBOX, 405, 424, 175, 20, IDC_VR_QUEST_LOCOMOTION);
     add(L"BUTTON", L"Hide 1P Hand", BS_AUTOCHECKBOX, 405, 448, 175, 20, IDC_VR_HIDE_FIRST_PERSON_HAND);
     add(L"EDIT", L"64.0", WS_BORDER | ES_AUTOHSCROLL, 515, 496, 65, 24, IDC_VR_IPD);

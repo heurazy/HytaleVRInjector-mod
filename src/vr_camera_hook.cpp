@@ -105,6 +105,19 @@ struct UiScaleShared {
     volatile LONG sceneDepthTextureHeight;
     volatile LONG sceneDepthTextureFrame;
     float sceneDepthFarClip;
+    volatile LONG distortionTextureId;
+    volatile LONG distortionTextureWidth;
+    volatile LONG distortionTextureHeight;
+    volatile LONG distortionTextureFrame;
+    volatile LONG vrSceneMatricesValid;
+    volatile LONG vrSceneMatrixSequence;
+    float vrSceneView[16];
+    float vrSceneProjection[16];
+    float vrSceneViewProjection[16];
+    float vrSceneInvView[16];
+    float vrSceneInvViewProjection[16];
+    float vrSceneReprojection[16];
+    float vrSceneProjectionInfo[4];
 };
 HANDLE g_ui_scale_mapping = nullptr;
 UiScaleShared* g_ui_scale_shared = nullptr;
@@ -269,11 +282,13 @@ Matrix4 g_culling_view_projection = identity_matrix();
 Matrix4 g_culling_projection = identity_matrix();
 Matrix4 g_culling_view = identity_matrix();
 Matrix4 g_neutral_view = identity_matrix();
+Matrix4 g_previous_vr_scene_view_projection = identity_matrix();
 bool g_center_view_projection_valid = false;
 bool g_culling_view_projection_valid = false;
 bool g_culling_projection_valid = false;
 bool g_culling_view_valid = false;
 bool g_neutral_view_valid = false;
+bool g_previous_vr_scene_view_projection_valid = false;
 vr::VRActionSetHandle_t g_action_set = vr::k_ulInvalidActionSetHandle;
 vr::VRActionHandle_t g_action_move = vr::k_ulInvalidActionHandle;
 vr::VRActionHandle_t g_action_turn = vr::k_ulInvalidActionHandle;
@@ -336,6 +351,7 @@ constexpr GLenum GL_DYNAMIC_DRAW_VALUE = 0x88E8;
 constexpr GLenum GL_ACTIVE_TEXTURE_VALUE = 0x84E0;
 constexpr GLenum GL_TEXTURE0_VALUE = 0x84C0;
 constexpr GLenum GL_TEXTURE1_VALUE = 0x84C1;
+constexpr GLenum GL_TEXTURE2_VALUE = 0x84C2;
 constexpr GLenum GL_UNPACK_ALIGNMENT_VALUE = 0x0CF5;
 
 bool render_logging_enabled() {
@@ -432,6 +448,8 @@ GLint g_afw_target_projection_uniform = -1;
 GLint g_afw_depth_far_clip_uniform = -1;
 GLint g_afw_enable_warp_uniform = -1;
 GLint g_afw_output_depth_uniform = -1;
+GLint g_afw_distortion_field_uniform = -1;
+GLint g_afw_apply_distortion_uniform = -1;
 Matrix4 g_afw_source_view = identity_matrix();
 Matrix4 g_afw_source_projection = identity_matrix();
 Matrix4 g_afw_eye_view[2]{identity_matrix(), identity_matrix()};
@@ -1035,6 +1053,7 @@ void main() {
 #version 130
 uniform sampler2D uSourceColor;
 uniform sampler2D uSourceDepth;
+uniform sampler2D uDistortionField;
 uniform mat4 uInverseSourceProjection;
 uniform mat4 uSourceProjection;
 uniform mat4 uInverseTargetProjection;
@@ -1044,6 +1063,7 @@ uniform float uDepthFarClip;
 // 0: direct copy, 1: projection correction, 2: depth stereo warp.
 uniform int uEnableWarp;
 uniform int uOutputDepth;
+uniform int uApplyDistortion;
 in vec2 vUv;
 out vec4 fragColor;
 
@@ -1072,11 +1092,20 @@ vec2 mirroredSourceUv(vec2 uv) {
     return clamp(uv, vec2(0.001), vec2(0.999));
 }
 
+vec2 vrEffectSourceUv(vec2 uv) {
+    if (uApplyDistortion == 0) return uv;
+    // Hytale's neutral distortion value is (0, 0), so RG is a signed UV
+    // displacement. Limit pathological values to avoid stretching an eye.
+    vec2 displacement = clamp(texture(uDistortionField, uv).rg,
+                              vec2(-0.04), vec2(0.04));
+    return mirroredSourceUv(uv + displacement);
+}
+
 void main() {
     if (uEnableWarp == 0) {
         fragColor = uOutputDepth != 0
             ? vec4(texture(uSourceDepth, vUv).r, 0.0, 0.0, 1.0)
-            : texture(uSourceColor, vUv);
+            : texture(uSourceColor, vrEffectSourceUv(vUv));
         return;
     }
     if (uEnableWarp == 1) {
@@ -1087,7 +1116,7 @@ void main() {
         }
         fragColor = uOutputDepth != 0
             ? vec4(texture(uSourceDepth, sourceUv).r, 0.0, 0.0, 1.0)
-            : texture(uSourceColor, sourceUv);
+            : texture(uSourceColor, vrEffectSourceUv(sourceUv));
         return;
     }
     vec2 projectionSourceUv = projectionCorrectedSourceUv(vUv);
@@ -1124,7 +1153,7 @@ void main() {
         fragColor = vec4(clamp(targetLinearDepth / uDepthFarClip, 0.0, 1.0),
                          0.0, 0.0, 1.0);
     } else {
-        fragColor = texture(uSourceColor, sampledUv);
+        fragColor = texture(uSourceColor, vrEffectSourceUv(sampledUv));
     }
 }
 )GLSL";
@@ -1161,6 +1190,8 @@ void main() {
         g_gl_get_uniform_location(g_afw_program, "uSourceColor");
     g_afw_source_depth_uniform =
         g_gl_get_uniform_location(g_afw_program, "uSourceDepth");
+    g_afw_distortion_field_uniform =
+        g_gl_get_uniform_location(g_afw_program, "uDistortionField");
     g_afw_inverse_source_projection_uniform =
         g_gl_get_uniform_location(g_afw_program, "uInverseSourceProjection");
     g_afw_source_projection_uniform =
@@ -1177,6 +1208,8 @@ void main() {
         g_gl_get_uniform_location(g_afw_program, "uEnableWarp");
     g_afw_output_depth_uniform =
         g_gl_get_uniform_location(g_afw_program, "uOutputDepth");
+    g_afw_apply_distortion_uniform =
+        g_gl_get_uniform_location(g_afw_program, "uApplyDistortion");
 
     constexpr float vertices[] = {
         -1.0f, -1.0f, 0.0f, 0.0f,
@@ -1532,6 +1565,14 @@ struct SceneDepthTextureSnapshot {
     bool valid = false;
 };
 
+struct DistortionTextureSnapshot {
+    GLuint texture = 0;
+    int width = 0;
+    int height = 0;
+    uint32_t frame = 0;
+    bool valid = false;
+};
+
 SceneDepthTextureSnapshot scene_depth_texture_snapshot() {
     SceneDepthTextureSnapshot snapshot{};
     if (!ensure_ui_scale_mapping() || !g_ui_scale_shared) return snapshot;
@@ -1797,6 +1838,36 @@ bool is_executable_page(DWORD protect) {
     protect &= 0xff;
     return protect == PAGE_EXECUTE || protect == PAGE_EXECUTE_READ ||
            protect == PAGE_EXECUTE_READWRITE || protect == PAGE_EXECUTE_WRITECOPY;
+}
+
+DistortionTextureSnapshot distortion_texture_snapshot() {
+    DistortionTextureSnapshot snapshot{};
+    if (!ensure_ui_scale_mapping() || !g_ui_scale_shared ||
+        g_ui_scale_shared->disableDistortion != 2) {
+        return snapshot;
+    }
+
+    const LONG texture = InterlockedCompareExchange(
+        &g_ui_scale_shared->distortionTextureId, 0, 0);
+    const LONG width = InterlockedCompareExchange(
+        &g_ui_scale_shared->distortionTextureWidth, 0, 0);
+    const LONG height = InterlockedCompareExchange(
+        &g_ui_scale_shared->distortionTextureHeight, 0, 0);
+    const LONG frame = InterlockedCompareExchange(
+        &g_ui_scale_shared->distortionTextureFrame, 0, 0);
+    const LONG current_frame = InterlockedCompareExchange(
+        &g_ui_scale_shared->renderFrameSequence, 0, 0);
+    if (texture <= 0 || width <= 0 || height <= 0 || frame < 0 ||
+        current_frame < frame || current_frame - frame > 2) {
+        return snapshot;
+    }
+
+    snapshot.texture = static_cast<GLuint>(texture);
+    snapshot.width = static_cast<int>(width);
+    snapshot.height = static_cast<int>(height);
+    snapshot.frame = static_cast<uint32_t>(frame);
+    snapshot.valid = true;
+    return snapshot;
 }
 
 bool is_writable_page(DWORD protect) {
@@ -2113,6 +2184,12 @@ bool ensure_ui_scale_mapping() {
     g_ui_scale_shared->sceneDepthTextureHeight = 0;
     g_ui_scale_shared->sceneDepthTextureFrame = 0;
     g_ui_scale_shared->sceneDepthFarClip = 1024.0f;
+    g_ui_scale_shared->distortionTextureId = 0;
+    g_ui_scale_shared->distortionTextureWidth = 0;
+    g_ui_scale_shared->distortionTextureHeight = 0;
+    g_ui_scale_shared->distortionTextureFrame = 0;
+    g_ui_scale_shared->vrSceneMatricesValid = 0;
+    g_ui_scale_shared->vrSceneMatrixSequence = 0;
     return true;
 }
 
@@ -2136,7 +2213,7 @@ void publish_ui_scale_for_eye(const VrCameraControls& controls, vr::EVREye eye) 
     g_ui_scale_shared->disableUboScaling = controls.ui_ubo_scaling_disabled ? 1 : 0;
     g_ui_scale_shared->disableShadows = controls.shadows_disabled ? 1 : 0;
     g_ui_scale_shared->disableParticles = controls.particles_disabled ? 1 : 0;
-    g_ui_scale_shared->disableDistortion = controls.distortion_disabled ? 1 : 0;
+    g_ui_scale_shared->disableDistortion = static_cast<int>(controls.distortion_disabled);
     g_ui_scale_shared->currentEye = eye == vr::Eye_Left ? 0 : 1;
     g_ui_scale_shared->suppressMenuInGame = menu_visible ? 1 : 0;
     g_ui_scale_shared->menuIgnoreDrawThreshold =
@@ -2166,6 +2243,10 @@ void publish_ui_scale_neutral() {
     g_ui_scale_shared->disableShadows = 0;
     g_ui_scale_shared->disableParticles = 0;
     g_ui_scale_shared->disableDistortion = 0;
+    g_ui_scale_shared->distortionTextureId = 0;
+    g_ui_scale_shared->distortionTextureWidth = 0;
+    g_ui_scale_shared->distortionTextureHeight = 0;
+    InterlockedExchange(&g_ui_scale_shared->vrSceneMatricesValid, 0);
     g_ui_scale_shared->hideFirstPerson = 0;
     g_ui_scale_shared->suppressMenuInGame = 0;
     g_ui_scale_shared->menuIgnoreDrawThreshold = 1;
@@ -2185,6 +2266,10 @@ void publish_render_filters_only(const VrCameraControls& controls) {
     g_ui_scale_shared->disableShadows = controls.shadows_disabled ? 1 : 0;
     g_ui_scale_shared->disableParticles = controls.particles_disabled ? 1 : 0;
     g_ui_scale_shared->disableDistortion = 0;
+    g_ui_scale_shared->distortionTextureId = 0;
+    g_ui_scale_shared->distortionTextureWidth = 0;
+    g_ui_scale_shared->distortionTextureHeight = 0;
+    InterlockedExchange(&g_ui_scale_shared->vrSceneMatricesValid, 0);
     g_ui_scale_shared->hideFirstPerson = 0;
     g_ui_scale_shared->suppressMenuInGame = 0;
     g_ui_scale_shared->menuIgnoreDrawThreshold =
@@ -2489,6 +2574,63 @@ Matrix4 compensate_native_sneak_height(const Matrix4& native_view,
     return hytalevr::apply_camera_height_offset(native_view, compensation);
 }
 
+void publish_vr_scene_matrices(const Matrix4& view,
+                               const Matrix4& projection,
+                               const Matrix4& view_projection) {
+    if (!ensure_ui_scale_mapping() || !g_ui_scale_shared) return;
+
+    Matrix4 inverse_view{};
+    Matrix4 inverse_view_projection{};
+    if (!hytalevr::inverse(view, inverse_view) ||
+        !hytalevr::inverse(view_projection, inverse_view_projection)) {
+        InterlockedExchange(&g_ui_scale_shared->vrSceneMatricesValid, 0);
+        return;
+    }
+
+    const bool previous_is_usable =
+        g_previous_vr_scene_view_projection_valid &&
+        matrix_max_delta(g_previous_vr_scene_view_projection, view_projection) < 0.75f;
+    const Matrix4 previous_view_projection = previous_is_usable
+        ? g_previous_vr_scene_view_projection
+        : view_projection;
+    const Matrix4 reprojection = multiply(previous_view_projection, inverse_view);
+
+    float projection_info[4]{};
+    if (std::fabs(projection.value[0]) > 0.0001f &&
+        std::fabs(projection.value[5]) > 0.0001f) {
+        projection_info[0] = -2.0f / projection.value[0];
+        projection_info[1] = -2.0f / projection.value[5];
+        projection_info[2] = (1.0f - projection.value[2]) / projection.value[0];
+        projection_info[3] = (1.0f + projection.value[6]) / projection.value[5];
+    }
+
+    // Odd sequence values mean that a writer is active. The OpenGL hook only
+    // consumes a snapshot when it observes the same even value twice.
+    LONG sequence = InterlockedIncrement(&g_ui_scale_shared->vrSceneMatrixSequence);
+    if ((sequence & 1) == 0) {
+        InterlockedIncrement(&g_ui_scale_shared->vrSceneMatrixSequence);
+    }
+    std::memcpy(g_ui_scale_shared->vrSceneView, view.value, sizeof(view.value));
+    std::memcpy(g_ui_scale_shared->vrSceneProjection, projection.value,
+                sizeof(projection.value));
+    std::memcpy(g_ui_scale_shared->vrSceneViewProjection, view_projection.value,
+                sizeof(view_projection.value));
+    std::memcpy(g_ui_scale_shared->vrSceneInvView, inverse_view.value,
+                sizeof(inverse_view.value));
+    std::memcpy(g_ui_scale_shared->vrSceneInvViewProjection,
+                inverse_view_projection.value, sizeof(inverse_view_projection.value));
+    std::memcpy(g_ui_scale_shared->vrSceneReprojection, reprojection.value,
+                sizeof(reprojection.value));
+    std::memcpy(g_ui_scale_shared->vrSceneProjectionInfo, projection_info,
+                sizeof(projection_info));
+    MemoryBarrier();
+    InterlockedExchange(&g_ui_scale_shared->vrSceneMatricesValid, 1);
+    InterlockedIncrement(&g_ui_scale_shared->vrSceneMatrixSequence);
+
+    g_previous_vr_scene_view_projection = view_projection;
+    g_previous_vr_scene_view_projection_valid = true;
+}
+
 void apply_vr_camera(void* object) {
     HookCallbackScope callback_scope;
     if (g_shared) {
@@ -2685,6 +2827,7 @@ void apply_vr_camera(void* object) {
         ReleaseSRWLockExclusive(&g_camera_lock);
     }
     const Matrix4 view_projection = multiply(projection, eye_view_matrix);
+    publish_vr_scene_matrices(eye_view_matrix, projection, view_projection);
     // Keep the final VR transform in +0x320. When HMD culling is enabled,
     // +0x2E0 stays on flattened headset yaw so world loading/culling follows
     // where the player looks, not only where Hytale's mouse camera points.
@@ -4463,6 +4606,7 @@ bool warp_source_to_eye(GLuint source_texture, int target_eye) {
         return false;
     }
     const SceneDepthTextureSnapshot depth = scene_depth_texture_snapshot();
+    const DistortionTextureSnapshot distortion = distortion_texture_snapshot();
     if (!depth.valid || !depth.texture || !initialize_gl_capture() ||
         !ensure_afw_gl_renderer()) {
         return false;
@@ -4500,6 +4644,7 @@ bool warp_source_to_eye(GLuint source_texture, int target_eye) {
     GLint previous_active_texture = 0;
     GLint previous_texture_0 = 0;
     GLint previous_texture_1 = 0;
+    GLint previous_texture_2 = 0;
     GLint previous_read_fbo = 0;
     GLint previous_draw_fbo = 0;
     GLint previous_viewport[4]{};
@@ -4520,6 +4665,8 @@ bool warp_source_to_eye(GLuint source_texture, int target_eye) {
     glGetIntegerv(GL_TEXTURE_BINDING_2D, &previous_texture_0);
     g_gl_active_texture(GL_TEXTURE1_VALUE);
     glGetIntegerv(GL_TEXTURE_BINDING_2D, &previous_texture_1);
+    g_gl_active_texture(GL_TEXTURE2_VALUE);
+    glGetIntegerv(GL_TEXTURE_BINDING_2D, &previous_texture_2);
 
     g_gl_active_texture(GL_TEXTURE0_VALUE);
     if (!g_eye_textures[target_eye]) {
@@ -4563,6 +4710,8 @@ bool warp_source_to_eye(GLuint source_texture, int target_eye) {
         g_gl_bind_vertex_array(g_afw_vao);
         g_gl_uniform_1i(g_afw_source_color_uniform, 0);
         g_gl_uniform_1i(g_afw_source_depth_uniform, 1);
+        g_gl_uniform_1i(g_afw_distortion_field_uniform, 2);
+        g_gl_uniform_1i(g_afw_apply_distortion_uniform, distortion.valid ? 1 : 0);
         g_gl_uniform_matrix_4fv(g_afw_inverse_source_projection_uniform, 1, GL_FALSE,
                                 inverse_source_projection.value);
         g_gl_uniform_matrix_4fv(g_afw_source_projection_uniform, 1, GL_FALSE,
@@ -4580,6 +4729,8 @@ bool warp_source_to_eye(GLuint source_texture, int target_eye) {
         glBindTexture(GL_TEXTURE_2D, source_texture);
         g_gl_active_texture(GL_TEXTURE1_VALUE);
         glBindTexture(GL_TEXTURE_2D, depth.texture);
+        g_gl_active_texture(GL_TEXTURE2_VALUE);
+        glBindTexture(GL_TEXTURE_2D, distortion.valid ? distortion.texture : 0);
         glDrawArrays(GL_TRIANGLES, 0, 3);
         success = glGetError() == GL_NO_ERROR;
         if (success) {
@@ -4599,6 +4750,8 @@ bool warp_source_to_eye(GLuint source_texture, int target_eye) {
         }
     }
 
+    g_gl_active_texture(GL_TEXTURE2_VALUE);
+    glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(previous_texture_2));
     g_gl_active_texture(GL_TEXTURE1_VALUE);
     glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(previous_texture_1));
     g_gl_active_texture(GL_TEXTURE0_VALUE);
@@ -4627,7 +4780,9 @@ bool warp_source_to_eye(GLuint source_texture, int target_eye) {
                 << " source=" << source_width << "x" << source_height
                 << " output=" << g_texture_width << "x" << g_texture_height
                 << " depth=" << depth.width << "x" << depth.height
-                << " depthFrame=" << depth.frame;
+                << " depthFrame=" << depth.frame
+                << " distortion=" << (distortion.valid ? 1 : 0)
+                << " distortionFrame=" << distortion.frame;
             render_log(out.str());
         }
     }

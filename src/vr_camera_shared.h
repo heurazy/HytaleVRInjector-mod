@@ -6,6 +6,12 @@ constexpr wchar_t kVrCameraMappingName[] = L"Local\\HytaleVrCamera_v122FloorAlig
 constexpr uint32_t kVrCameraMagic = 0x48595652; // HYVR
 constexpr uint32_t kVrCameraVersion = 122;
 
+constexpr uint32_t kVrEffectShadows = 1u << 0;
+constexpr uint32_t kVrEffectParticles = 1u << 1;
+constexpr uint32_t kVrEffectDistortion = 1u << 2;
+constexpr uint32_t kVrEffectDefaults =
+    kVrEffectShadows | kVrEffectParticles | kVrEffectDistortion;
+
 struct VrCameraControls {
     uint32_t enabled = 0;
     uint32_t non_vr_mode = 0;
@@ -28,7 +34,8 @@ struct VrCameraControls {
     uint32_t ui_overlay_enabled = 1;
     uint32_t shadows_disabled = 0;
     uint32_t particles_disabled = 0;
-    uint32_t distortion_disabled = 1;
+    // 0 = native pass, 1 = disabled, 2 = neutralize mono pass and reapply per eye.
+    uint32_t distortion_disabled = 2;
     float ui_overlay_distance = 1.65f;
     float ui_overlay_width = 1.50f;
     float ui_scale = 1.00f;
@@ -41,7 +48,8 @@ struct VrCameraControls {
     // Reuses a legacy ABI slot so dashboard and hook keep the same structure size.
     float vr_resolution_scale = 1.0f;
     uint32_t first_person_hand_hidden = 1;
-    uint32_t reserved_render_option = 0;
+    // Bitmask of kVrEffect* flags. Kept in the existing ABI slot.
+    uint32_t reserved_render_option = kVrEffectDefaults;
     float reserved_render_value = 1.0f;
     uint32_t hmd_culling_view_enabled = 1;
     float hand_model_scale = 1.0f;
@@ -78,7 +86,8 @@ struct VrCameraShared {
     uint32_t ui_overlay_enabled = 1;
     uint32_t shadows_disabled = 0;
     uint32_t particles_disabled = 0;
-    uint32_t distortion_disabled = 1;
+    // 0 = native pass, 1 = disabled, 2 = neutralize mono pass and reapply per eye.
+    uint32_t distortion_disabled = 2;
     float ui_overlay_distance = 1.65f;
     float ui_overlay_width = 1.50f;
     float ui_scale = 1.00f;
@@ -91,7 +100,8 @@ struct VrCameraShared {
     // Reuses a legacy ABI slot so dashboard and hook keep the same structure size.
     float vr_resolution_scale = 1.0f;
     uint32_t first_person_hand_hidden = 1;
-    uint32_t reserved_render_option = 0;
+    // Bitmask of kVrEffect* flags. Kept in the existing ABI slot.
+    uint32_t reserved_render_option = kVrEffectDefaults;
     float reserved_render_value = 1.0f;
     uint32_t hmd_culling_view_enabled = 1;
     float hand_model_scale = 1.0f;

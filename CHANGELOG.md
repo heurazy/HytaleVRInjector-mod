@@ -1,5 +1,20 @@
 # Changelog
 
+## [0.9.5] - 2026-07-14
+
+### VR shadows and effects
+
+- Restored the optional Hytale shadow, particle, water, and distortion passes in VR.
+- Isolated Hytale's mono distortion field and reapplied it once per reconstructed eye to remove duplicated effects.
+- Synchronized the VR view, projection, inverse view-projection, and projection reconstruction data used by Hytale's effect shaders.
+- Corrected the independent SSAO/deferred-shadow temporal reprojection matrix so shadows remain anchored while the headset moves.
+- Added `VR shadows`, `VR particles`, and `VR distortion effects` controls under Advanced options. They are enabled by default.
+
+### Notes
+
+- Restart Hytale completely before replacing an already injected hook DLL.
+- These passes depend on Hytale's current OpenGL program layout and may require compatibility updates after a major renderer change.
+
 ## [0.9.0] - 2026-07-14
 
 ### AFW rendering

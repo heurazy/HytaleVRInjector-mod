@@ -134,6 +134,10 @@ struct MappedBufferState {
     GLsizeiptr length;
 };
 thread_local std::vector<MappedBufferState> g_mappedBuffers;
+thread_local GLuint g_sceneDataBuffer = 0;
+thread_local GLintptr g_sceneDataBufferOffset = 0;
+thread_local unsigned long long g_programUseSerial = 0;
+thread_local unsigned long long g_lastScenePatchProgramUseSerial = 0;
 
 // Shared Memory Structure
 struct SharedData {
@@ -167,6 +171,19 @@ struct SharedData {
     volatile LONG sceneDepthTextureHeight;
     volatile LONG sceneDepthTextureFrame;
     float sceneDepthFarClip;
+    volatile LONG distortionTextureId;
+    volatile LONG distortionTextureWidth;
+    volatile LONG distortionTextureHeight;
+    volatile LONG distortionTextureFrame;
+    volatile LONG vrSceneMatricesValid;
+    volatile LONG vrSceneMatrixSequence;
+    float vrSceneView[16];
+    float vrSceneProjection[16];
+    float vrSceneViewProjection[16];
+    float vrSceneInvView[16];
+    float vrSceneInvViewProjection[16];
+    float vrSceneReprojection[16];
+    float vrSceneProjectionInfo[4];
 };
 SharedData* g_sharedData = nullptr;
 HANDLE g_hMapFile = NULL;
@@ -225,6 +242,11 @@ std::vector<GLuint> g_basicPrograms;
 std::vector<GLuint> g_skyPrograms;
 std::vector<GLuint> g_hizReprojectPrograms;
 std::vector<GLuint> g_possibleFirstPersonPrograms;
+struct ProgramMatrixUniform {
+    GLuint program = 0;
+    GLint location = -1;
+};
+std::vector<ProgramMatrixUniform> g_ssaoReprojectionUniforms;
 std::vector<GLuint> g_uiBufferIDs;
 std::unordered_set<GLuint> g_scannedPrograms;
 std::mutex g_programsMutex;
@@ -261,6 +283,8 @@ LONG g_lastMenuCaptureFrameSequence = -1;
 bool g_menuCaptureClearedThisEye = false;
 
 constexpr GLenum GL_TEXTURE_2D_VALUE = 0x0DE1;
+constexpr GLenum GL_UNIFORM_BUFFER_VALUE = 0x8A11;
+constexpr GLenum GL_UNIFORM_BUFFER_BINDING_VALUE = 0x8A28;
 constexpr GLenum GL_TEXTURE0_VALUE = 0x84C0;
 constexpr GLenum GL_TEXTURE8_VALUE = 0x84C8;
 constexpr GLenum GL_ACTIVE_TEXTURE_VALUE = 0x84E0;
@@ -571,6 +595,15 @@ bool IsSsaoProgram(GLuint program) {
            g_ssaoPrograms.end();
 }
 
+bool IsSsaoReprojectionUniform(GLuint program, GLint location) {
+    if (program == 0 || location < 0) return false;
+    std::lock_guard<std::mutex> lock(g_programsMutex);
+    for (const auto& uniform : g_ssaoReprojectionUniforms) {
+        if (uniform.program == program && uniform.location == location) return true;
+    }
+    return false;
+}
+
 bool IsCloudShadowProgram(GLuint program) {
     if (program == g_currentProgram) return g_currentProgramFlags.cloudShadow;
     std::lock_guard<std::mutex> lock(g_programsMutex);
@@ -867,8 +900,22 @@ void RegisterProgramIfUI(GLuint program) {
                 RegisterProgramOnce(g_sunOcclusionPrograms, program, labelStr, "sun occlusion");
             }
             if (ContainsAny(labelStr, {"SSAOProgram", "SSAOFs", "SSAO"})) {
+                const GLint reprojectionLocation =
+                    real_glGetUniformLocation(program, "uReprojectMatrix");
                 std::lock_guard<std::mutex> lock(g_programsMutex);
                 RegisterProgramOnce(g_ssaoPrograms, program, labelStr, "SSAO");
+                if (reprojectionLocation >= 0) {
+                    const bool alreadyRegistered = std::any_of(
+                        g_ssaoReprojectionUniforms.begin(),
+                        g_ssaoReprojectionUniforms.end(),
+                        [&](const ProgramMatrixUniform& uniform) {
+                            return uniform.program == program;
+                        });
+                    if (!alreadyRegistered) {
+                        g_ssaoReprojectionUniforms.push_back(
+                            {program, reprojectionLocation});
+                    }
+                }
             }
             if (labelStr.find("CloudShadow") != std::string::npos ||
                 labelStr.find("CloudOcclusion") != std::string::npos ||
@@ -1165,6 +1212,12 @@ void InitializeSharedMemory() {
             g_sharedData->sceneDepthTextureHeight = 0;
             g_sharedData->sceneDepthTextureFrame = 0;
             g_sharedData->sceneDepthFarClip = 1024.0f;
+            g_sharedData->distortionTextureId = 0;
+            g_sharedData->distortionTextureWidth = 0;
+            g_sharedData->distortionTextureHeight = 0;
+            g_sharedData->distortionTextureFrame = 0;
+            g_sharedData->vrSceneMatricesValid = 0;
+            g_sharedData->vrSceneMatrixSequence = 0;
         }
         g_sharedData->firstPersonMatrixPatches = 0;
         if (g_sharedData->sceneDepthFarClip <= 0.0f) {
@@ -1239,6 +1292,7 @@ void WINAPI hook_glLinkProgram(GLuint program) {
 
 void WINAPI hook_glUseProgram(GLuint program) {
     g_currentProgram = program;
+    ++g_programUseSerial;
     g_firstPersonMatrixUniformSerial = 0;
     real_glUseProgram(program);
     RegisterProgramIfUI(program);
@@ -1352,6 +1406,26 @@ bool ShouldNeutralizeDistortion() {
            g_sharedData->disableDistortion != 0 &&
            g_currentProgram != 0 &&
            IsPostEffectProgram(g_currentProgram);
+}
+
+bool VrDistortionReprojectionEnabled() {
+    return g_sharedData != nullptr && g_sharedData->disableDistortion == 2;
+}
+
+void PublishDistortionTexture(GLuint texture) {
+    if (!g_sharedData || texture == 0 || !real_glGetTexLevelParameteriv) return;
+
+    GLint width = 0;
+    GLint height = 0;
+    real_glGetTexLevelParameteriv(GL_TEXTURE_2D_VALUE, 0, GL_TEXTURE_WIDTH_VALUE, &width);
+    real_glGetTexLevelParameteriv(GL_TEXTURE_2D_VALUE, 0, GL_TEXTURE_HEIGHT_VALUE, &height);
+    if (width <= 0 || height <= 0) return;
+
+    g_sharedData->distortionTextureId = static_cast<LONG>(texture);
+    g_sharedData->distortionTextureWidth = width;
+    g_sharedData->distortionTextureHeight = height;
+    g_sharedData->distortionTextureFrame = InterlockedCompareExchange(
+        &g_sharedData->renderFrameSequence, 0, 0);
 }
 
 bool EnsureNeutralDistortionTexture() {
@@ -1495,10 +1569,17 @@ void DrawWithOptionalNeutralDistortion(DrawCall drawCall) {
     real_glGetIntegerv(GL_ACTIVE_TEXTURE_VALUE, &savedActiveTexture);
     real_glActiveTexture(GL_TEXTURE8_VALUE);
     real_glGetIntegerv(GL_TEXTURE_BINDING_2D_VALUE, &savedTexture2D);
+    if (VrDistortionReprojectionEnabled()) {
+        PublishDistortionTexture(static_cast<GLuint>(savedTexture2D));
+    } else if (g_sharedData) {
+        g_sharedData->distortionTextureId = 0;
+        g_sharedData->distortionTextureWidth = 0;
+        g_sharedData->distortionTextureHeight = 0;
+    }
     real_glBindTexture(GL_TEXTURE_2D_VALUE, g_neutralDistortionTexture);
 
     if (!g_neutralDistortionLogged) {
-        LogMessage("HytaleUIScaleHook: neutralizing PostEffectProgram uDistortionTexture on GL_TEXTURE8.");
+        LogMessage("HytaleUIScaleHook: isolating PostEffectProgram distortion on GL_TEXTURE8 for VR.");
         g_neutralDistortionLogged = true;
     }
 
@@ -1569,6 +1650,116 @@ void DrawWithOptionalNeutralWaterEffects(DrawCall drawCall) {
     real_glActiveTexture(static_cast<GLenum>(savedActiveTexture));
 }
 
+struct VrSceneMatrixSnapshot {
+    float view[16];
+    float projection[16];
+    float viewProjection[16];
+    float inverseView[16];
+    float inverseViewProjection[16];
+    float reprojection[16];
+    float projectionInfo[4];
+};
+
+bool ReadVrSceneMatrixSnapshot(VrSceneMatrixSnapshot& snapshot) {
+    if (!g_sharedData ||
+        InterlockedCompareExchange(&g_sharedData->vrSceneMatricesValid, 0, 0) == 0) {
+        return false;
+    }
+
+    for (int attempt = 0; attempt < 4; ++attempt) {
+        const LONG begin = InterlockedCompareExchange(
+            &g_sharedData->vrSceneMatrixSequence, 0, 0);
+        if ((begin & 1) != 0) continue;
+
+        memcpy(snapshot.view, g_sharedData->vrSceneView, sizeof(snapshot.view));
+        memcpy(snapshot.projection, g_sharedData->vrSceneProjection,
+               sizeof(snapshot.projection));
+        memcpy(snapshot.viewProjection, g_sharedData->vrSceneViewProjection,
+               sizeof(snapshot.viewProjection));
+        memcpy(snapshot.inverseView, g_sharedData->vrSceneInvView,
+               sizeof(snapshot.inverseView));
+        memcpy(snapshot.inverseViewProjection,
+               g_sharedData->vrSceneInvViewProjection,
+               sizeof(snapshot.inverseViewProjection));
+        memcpy(snapshot.reprojection, g_sharedData->vrSceneReprojection,
+               sizeof(snapshot.reprojection));
+        memcpy(snapshot.projectionInfo, g_sharedData->vrSceneProjectionInfo,
+               sizeof(snapshot.projectionInfo));
+        MemoryBarrier();
+
+        const LONG end = InterlockedCompareExchange(
+            &g_sharedData->vrSceneMatrixSequence, 0, 0);
+        if (begin != end || (end & 1) != 0) continue;
+
+        const float* values = reinterpret_cast<const float*>(&snapshot);
+        for (size_t i = 0; i < sizeof(snapshot) / sizeof(float); ++i) {
+            if (!std::isfinite(values[i])) return false;
+        }
+        return true;
+    }
+    return false;
+}
+
+bool CurrentProgramNeedsVrSceneMatrices() {
+    if (!g_sharedData || g_currentProgram == 0) return false;
+    const bool shadowPass =
+        (g_currentProgramFlags.shadow || g_currentProgramFlags.sunOcclusion ||
+         g_currentProgramFlags.ssao || g_currentProgramFlags.cloudShadow) &&
+        g_sharedData->disableShadows == 0;
+    const bool particlePass =
+        g_currentProgramFlags.particle && g_sharedData->disableParticles == 0;
+    const bool distortionPass =
+        (g_currentProgramFlags.postEffect || g_currentProgramFlags.mapChunkAlpha) &&
+        g_sharedData->disableDistortion == 2;
+    return shadowPass || particlePass || distortionPass;
+}
+
+void PatchVrSceneDataForCurrentProgram() {
+    if (!CurrentProgramNeedsVrSceneMatrices() || !real_glBindBuffer ||
+        !real_glBufferSubData || !real_glGetIntegerv || g_sceneDataBuffer == 0 ||
+        g_lastScenePatchProgramUseSerial == g_programUseSerial) {
+        return;
+    }
+
+    VrSceneMatrixSnapshot snapshot{};
+    if (!ReadVrSceneMatrixSnapshot(snapshot)) return;
+
+    // SceneData_inc.glsl uses std140. The camera section starts after the two
+    // first-person matrices at byte 128 and contains six matrices followed by
+    // ProjInfos, ending at byte 528.
+    float cameraBlock[100]{};
+    size_t cursor = 0;
+    const auto append = [&](const float* source, size_t count) {
+        memcpy(cameraBlock + cursor, source, count * sizeof(float));
+        cursor += count;
+    };
+    append(snapshot.view, 16);
+    append(snapshot.projection, 16);
+    append(snapshot.viewProjection, 16);
+    append(snapshot.inverseView, 16);
+    append(snapshot.inverseViewProjection, 16);
+    append(snapshot.reprojection, 16);
+    append(snapshot.projectionInfo, 4);
+
+    GLint previousBuffer = 0;
+    real_glGetIntegerv(GL_UNIFORM_BUFFER_BINDING_VALUE, &previousBuffer);
+    real_glBindBuffer(GL_UNIFORM_BUFFER_VALUE, g_sceneDataBuffer);
+    real_glBufferSubData(GL_UNIFORM_BUFFER_VALUE,
+                         g_sceneDataBufferOffset + 128,
+                         static_cast<GLsizeiptr>(sizeof(cameraBlock)), cameraBlock);
+    real_glBindBuffer(GL_UNIFORM_BUFFER_VALUE, static_cast<GLuint>(previousBuffer));
+    g_lastScenePatchProgramUseSerial = g_programUseSerial;
+
+    static DWORD lastLogTick = 0;
+    const DWORD now = GetTickCount();
+    if (now - lastLogTick >= 1500) {
+        LogMessage("HytaleUIScaleHook: synchronized VR SceneData matrices for effect program=" +
+                   std::to_string(g_currentProgram) + " buffer=" +
+                   std::to_string(g_sceneDataBuffer));
+        lastLogTick = now;
+    }
+}
+
 void WINAPI hook_glDrawArrays(GLenum mode, GLint first, GLsizei count) {
     if (ShouldSkipFirstPersonDraw()) {
         static bool logged = false;
@@ -1578,6 +1769,7 @@ void WINAPI hook_glDrawArrays(GLenum mode, GLint first, GLsizei count) {
         }
         return;
     }
+    PatchVrSceneDataForCurrentProgram();
     if (ShouldNeutralizeSsaoDraw() || ShouldNeutralizeSunOcclusionDraw() || ShouldNeutralizeCloudShadowDraw()) {
         if (real_glClearColor && real_glClear && real_glGetFloatv) {
             GLfloat previous[4] = {};
@@ -1635,6 +1827,7 @@ void WINAPI hook_glDrawElements(GLenum mode, GLsizei count, GLenum type, const v
         }
         return;
     }
+    PatchVrSceneDataForCurrentProgram();
     if (ShouldNeutralizeSsaoDraw() || ShouldNeutralizeSunOcclusionDraw() || ShouldNeutralizeCloudShadowDraw()) {
         if (real_glClearColor && real_glClear && real_glGetFloatv) {
             GLfloat previous[4] = {};
@@ -1679,11 +1872,42 @@ void WINAPI hook_glDrawElements(GLenum mode, GLsizei count, GLenum type, const v
     });
 }
 
+bool TryPatchSsaoReprojectionMatrix(GLuint program,
+                                    GLint location,
+                                    GLsizei count,
+                                    const GLfloat* value,
+                                    GLfloat (&modified)[16]) {
+    if (!g_sharedData || g_sharedData->disableShadows != 0 || count != 1 ||
+        value == nullptr || !IsSsaoReprojectionUniform(program, location)) {
+        return false;
+    }
+
+    VrSceneMatrixSnapshot snapshot{};
+    if (!ReadVrSceneMatrixSnapshot(snapshot)) return false;
+    memcpy(modified, snapshot.reprojection, sizeof(modified));
+
+    static DWORD lastLogTick = 0;
+    const DWORD now = GetTickCount();
+    if (now - lastLogTick >= 1500) {
+        LogMessage("HytaleUIScaleHook: replaced SSAO/shadow temporal uReprojectMatrix for program=" +
+                   std::to_string(program));
+        lastLogTick = now;
+    }
+    return true;
+}
+
 void WINAPI hook_glUniformMatrix4fv(GLint location, GLsizei count, GLboolean transpose, const GLfloat *value) {
     GLint mvpLoc = -1;
     float scale = (g_sharedData != nullptr) ? g_sharedData->uiScale : 1.0f;
     float offsetX = (g_sharedData != nullptr) ? g_sharedData->offsetX : 0.0f;
     float offsetY = (g_sharedData != nullptr) ? g_sharedData->offsetY : 0.0f;
+
+    GLfloat reprojectionModified[16];
+    if (TryPatchSsaoReprojectionMatrix(g_currentProgram, location, count, value,
+                                       reprojectionModified)) {
+        real_glUniformMatrix4fv(location, count, transpose, reprojectionModified);
+        return;
+    }
 
     GLfloat firstPersonModified[16];
     if (TryPatchFirstPersonMatrix(g_currentProgram, count, value, firstPersonModified)) {
@@ -1731,6 +1955,14 @@ void WINAPI hook_glProgramUniformMatrix4fv(GLuint program, GLint location, GLsiz
     float offsetX = (g_sharedData != nullptr) ? g_sharedData->offsetX : 0.0f;
     float offsetY = (g_sharedData != nullptr) ? g_sharedData->offsetY : 0.0f;
 
+    GLfloat reprojectionModified[16];
+    if (TryPatchSsaoReprojectionMatrix(program, location, count, value,
+                                       reprojectionModified)) {
+        real_glProgramUniformMatrix4fv(program, location, count, transpose,
+                                       reprojectionModified);
+        return;
+    }
+
     GLfloat firstPersonModified[16];
     if (TryPatchFirstPersonMatrix(program, count, value, firstPersonModified)) {
         real_glProgramUniformMatrix4fv(program, location, count, transpose, firstPersonModified);
@@ -1777,11 +2009,21 @@ void WINAPI hook_glBindBuffer(GLenum target, GLuint buffer) {
 
 void WINAPI hook_glBindBufferRange(GLenum target, GLuint index, GLuint buffer, GLintptr offset, GLsizeiptr size) {
     real_glBindBufferRange(target, index, buffer, offset, size);
+    if (target == GL_UNIFORM_BUFFER_VALUE && index == 0) {
+        g_sceneDataBuffer = buffer;
+        g_sceneDataBufferOffset = offset;
+        g_lastScenePatchProgramUseSerial = 0;
+    }
     RegisterBufferIfUI(target, buffer);
 }
 
 void WINAPI hook_glBindBufferBase(GLenum target, GLuint index, GLuint buffer) {
     real_glBindBufferBase(target, index, buffer);
+    if (target == GL_UNIFORM_BUFFER_VALUE && index == 0) {
+        g_sceneDataBuffer = buffer;
+        g_sceneDataBufferOffset = 0;
+        g_lastScenePatchProgramUseSerial = 0;
+    }
     RegisterBufferIfUI(target, buffer);
 }
 
