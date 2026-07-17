@@ -20,9 +20,11 @@
 #include <vector>
 
 #include "dashboard_key_bindings.h"
+#include "dashboard_updater.h"
 
 #ifdef HYTALE_CAMERA_MODE
 #include <openvr.h>
+#include "ui_scale_shared.h"
 #include "vr_camera_shared.h"
 #include "vr_locomotion.h"
 #endif
@@ -92,7 +94,16 @@ enum ControlId {
     IDC_VR_HAND_MODEL_YAW,
     IDC_VR_HAND_MODEL_ROLL,
     IDC_VR_HAND_DEPTH_TOLERANCE,
+    IDC_VR_HELD_ITEM_X,
+    IDC_VR_HELD_ITEM_Y,
+    IDC_VR_HELD_ITEM_Z,
+    IDC_VR_HELD_ITEM_SCALE,
     IDC_VR_RESOLUTION_SCALE,
+    IDC_VR_SUPERSAMPLING,
+    IDC_VR_SHARPENING,
+    IDC_VR_SHARPEN_STRENGTH,
+    IDC_VR_EDGE_AA,
+    IDC_VR_PROJECTION_CORRECTION,
     IDC_VR_ADVANCED_OPTIONS,
     IDC_VR_KEY_FORWARD,
     IDC_VR_KEY_BACKWARD,
@@ -863,9 +874,20 @@ void update_tab_visibility() {
         IDC_VR_DISABLE_PARTICLES, IDC_VR_DISABLE_DISTORTION, IDC_VR_QUEST_LOCOMOTION,
         IDC_VR_HIDE_FIRST_PERSON_HAND, IDC_VR_IPD, IDC_VR_SEPARATION,
         IDC_VR_WORLD_SCALE, IDC_VR_HAND_MODEL_SCALE, IDC_VR_HAND_MODEL_PITCH,
-        IDC_VR_HAND_MODEL_YAW, IDC_VR_HAND_MODEL_ROLL, IDC_VR_RESOLUTION_SCALE
+        IDC_VR_HAND_MODEL_YAW, IDC_VR_HAND_MODEL_ROLL, IDC_VR_RESOLUTION_SCALE,
+        IDC_VR_SUPERSAMPLING, IDC_VR_SHARPENING, IDC_VR_SHARPEN_STRENGTH,
+        IDC_VR_EDGE_AA, IDC_VR_PROJECTION_CORRECTION,
+        IDC_VR_HELD_ITEM_X, IDC_VR_HELD_ITEM_Y, IDC_VR_HELD_ITEM_Z,
+        IDC_VR_HELD_ITEM_SCALE
     };
     for (int id : col2_ids) ShowWindow(control(id), showTab2);
+    const int showQuality =
+        (g_current_tab == 0 || g_current_tab == 2) ? SW_SHOW : SW_HIDE;
+    int quality_ids[] = {
+        IDC_VR_SUPERSAMPLING, IDC_VR_RESOLUTION_SCALE,
+        IDC_VR_SHARPENING, IDC_VR_SHARPEN_STRENGTH
+    };
+    for (int id : quality_ids) ShowWindow(control(id), showQuality);
     
     // Column 3 IDs
     int showTab3 = ((g_current_tab == 0 && advanced) || g_current_tab == 3) ? SW_SHOW : SW_HIDE;
@@ -905,13 +927,21 @@ void layout_controls_for_current_tab() {
     };
 
     if (g_current_tab == 0) {
+        const bool advanced = advanced_options_enabled();
         // Dashboard layout
         // Column 1
         setPos(IDC_CURRENT_X, 235, 304, 135, 24);
         setPos(IDC_CURRENT_Y, 235, 334, 135, 24);
         setPos(IDC_CURRENT_Z, 235, 364, 135, 24);
         setPos(IDC_TOLERANCE, 295, 394, 75, 24);
-        setPos(IDC_VR_RESOLUTION_SCALE, 305, 440, 65, 24);
+        setPos(IDC_VR_HELD_ITEM_X, 215, 456, 75, 24);
+        setPos(IDC_VR_HELD_ITEM_Y, 295, 456, 75, 24);
+        setPos(IDC_VR_HELD_ITEM_Z, 215, 508, 75, 24);
+        setPos(IDC_VR_HELD_ITEM_SCALE, 295, 508, 75, 24);
+        setPos(IDC_VR_HAND_MODEL_SCALE, 215, 560, 75, 24);
+        setPos(IDC_VR_HAND_MODEL_PITCH, 295, 560, 75, 24);
+        setPos(IDC_VR_HAND_MODEL_YAW, 215, 612, 75, 24);
+        setPos(IDC_VR_HAND_MODEL_ROLL, 295, 612, 75, 24);
         
         // Candidates list box
         setPos(IDC_CANDIDATES, 215, 166, 845, 46);
@@ -924,9 +954,22 @@ void layout_controls_for_current_tab() {
         setPos(IDC_VR_DISABLE_DISTORTION, 405, 408, 180, 24);
         setPos(IDC_VR_QUEST_LOCOMOTION, 405, 434, 180, 24);
         setPos(IDC_VR_HIDE_FIRST_PERSON_HAND, 405, 460, 180, 24);
-        setPos(IDC_VR_IPD, 515, 500, 70, 24);
-        setPos(IDC_VR_SEPARATION, 515, 528, 70, 24);
-        setPos(IDC_VR_WORLD_SCALE, 515, 556, 70, 24);
+        if (advanced) {
+            setPos(IDC_VR_SUPERSAMPLING, 405, 486, 110, 24);
+            setPos(IDC_VR_RESOLUTION_SCALE, 520, 486, 65, 24);
+            setPos(IDC_VR_SHARPENING, 405, 512, 110, 24);
+            setPos(IDC_VR_SHARPEN_STRENGTH, 520, 512, 65, 24);
+        } else {
+            setPos(IDC_VR_SUPERSAMPLING, 215, 285, 140, 24);
+            setPos(IDC_VR_RESOLUTION_SCALE, 360, 285, 65, 24);
+            setPos(IDC_VR_SHARPENING, 455, 285, 140, 24);
+            setPos(IDC_VR_SHARPEN_STRENGTH, 600, 285, 65, 24);
+        }
+        setPos(IDC_VR_EDGE_AA, 405, 538, 180, 24);
+        setPos(IDC_VR_PROJECTION_CORRECTION, 405, 564, 180, 24);
+        setPos(IDC_VR_IPD, 515, 592, 70, 24);
+        setPos(IDC_VR_SEPARATION, 515, 618, 70, 24);
+        setPos(IDC_VR_WORLD_SCALE, 515, 644, 70, 24);
         
         // Column 3
         setPos(IDC_VR_KEY_FORWARD, 685, 328, 75, 24);
@@ -976,10 +1019,19 @@ void layout_controls_for_current_tab() {
         setPos(IDC_VR_DISABLE_DISTORTION, 250, 300, 220, 20);
         setPos(IDC_VR_QUEST_LOCOMOTION, 250, 330, 220, 20);
         setPos(IDC_VR_HIDE_FIRST_PERSON_HAND, 250, 360, 220, 20);
-        setPos(IDC_VR_RESOLUTION_SCALE, 380, 420, 150, 24);
-        setPos(IDC_VR_IPD, 380, 508, 150, 24);
-        setPos(IDC_VR_SEPARATION, 380, 538, 150, 24);
-        setPos(IDC_VR_WORLD_SCALE, 380, 568, 150, 24);
+        setPos(IDC_VR_SUPERSAMPLING, 250, 390, 220, 20);
+        setPos(IDC_VR_RESOLUTION_SCALE, 480, 388, 80, 24);
+        setPos(IDC_VR_SHARPENING, 250, 420, 220, 20);
+        setPos(IDC_VR_SHARPEN_STRENGTH, 480, 418, 80, 24);
+        setPos(IDC_VR_EDGE_AA, 250, 450, 220, 20);
+        setPos(IDC_VR_PROJECTION_CORRECTION, 250, 480, 260, 20);
+        setPos(IDC_VR_IPD, 760, 180, 150, 24);
+        setPos(IDC_VR_SEPARATION, 760, 210, 150, 24);
+        setPos(IDC_VR_WORLD_SCALE, 760, 240, 150, 24);
+        setPos(IDC_VR_HELD_ITEM_X, 620, 330, 75, 24);
+        setPos(IDC_VR_HELD_ITEM_Y, 705, 330, 75, 24);
+        setPos(IDC_VR_HELD_ITEM_Z, 620, 382, 75, 24);
+        setPos(IDC_VR_HELD_ITEM_SCALE, 705, 382, 75, 24);
     } 
     else if (g_current_tab == 3) {
         // Keybindings layout
@@ -1020,6 +1072,7 @@ bool advanced_options_enabled() {
 }
 
 void update_advanced_visibility() {
+    layout_controls_for_current_tab();
     update_tab_visibility();
 }
 #endif
@@ -1591,18 +1644,27 @@ bool update_head_origin_yaw() {
     return true;
 }
 
-bool head_based_locomotion_axes(float& x, float& y) {
-    if (!g_vr_head_origin_yaw_valid) return false;
+bool compensate_head_based_locomotion_axes(float& x, float& y) {
+    if (!g_vr_head_origin_yaw_valid || !g_vr_camera_shared ||
+        g_vr_camera_shared->camera_yaw_valid == 0) {
+        return false;
+    }
     Vec3 hmd{};
     float rotation[9]{};
     if (!read_hmd_pose(hmd, rotation)) return false;
-    const float yaw = hmd_yaw_from_rotation(rotation) - g_vr_head_origin_yaw;
-    const float c = std::cos(yaw);
-    const float s = std::sin(yaw);
-    const float raw_x = x;
-    const float raw_y = y;
-    x = raw_x * c + raw_y * s;
-    y = raw_y * c - raw_x * s;
+
+    const float native_yaw = g_vr_camera_shared->native_camera_yaw;
+    const float body_yaw = g_vr_camera_shared->body_camera_yaw;
+    if (!std::isfinite(native_yaw) || !std::isfinite(body_yaw)) return false;
+
+    const float hmd_relative_yaw = normalize_angle(
+        hmd_yaw_from_rotation(rotation) - g_vr_head_origin_yaw);
+    const float target_native_yaw = normalize_angle(body_yaw + hmd_relative_yaw);
+    const float yaw_error = normalize_angle(target_native_yaw - native_yaw);
+    const hytalevr::LocomotionAxes axes =
+        hytalevr::rotate_locomotion_axes(x, y, yaw_error);
+    x = axes.x;
+    y = axes.y;
     return true;
 }
 
@@ -1755,6 +1817,24 @@ void release_quest_keys() {
     g_button_a_release_at = 0;
     g_sneak_toggled = false;
     g_quest_stick_state = {};
+}
+
+void update_quest_movement_keys(const MovementKeys& keys,
+                                const hytalevr::DigitalStickState& state) {
+    const WORD forward = key_override(IDC_VR_KEY_FORWARD, keys.forward);
+    const WORD backward = key_override(IDC_VR_KEY_BACKWARD, keys.backward);
+    const WORD left = key_override(IDC_VR_KEY_LEFT, keys.left);
+    const WORD right = key_override(IDC_VR_KEY_RIGHT, keys.right);
+
+    if (!state.forward) set_injected_key(g_injected_keys.forward, forward, false);
+    if (!state.backward) set_injected_key(g_injected_keys.backward, backward, false);
+    if (!state.left) set_injected_key(g_injected_keys.left, left, false);
+    if (!state.right) set_injected_key(g_injected_keys.right, right, false);
+
+    if (state.forward) set_injected_key(g_injected_keys.forward, forward, true);
+    if (state.backward) set_injected_key(g_injected_keys.backward, backward, true);
+    if (state.left) set_injected_key(g_injected_keys.left, left, true);
+    if (state.right) set_injected_key(g_injected_keys.right, right, true);
 }
 
 void set_injected_mouse_button(bool& state, DWORD down_flag, DWORD up_flag, bool down) {
@@ -2076,14 +2156,7 @@ void update_quest_locomotion() {
         g_quest_stick_x = 0.0f;
         g_quest_stick_y = 0.0f;
         g_quest_stick_state = {};
-        set_injected_key(g_injected_keys.forward,
-                         key_override(IDC_VR_KEY_FORWARD, movement_keys.forward), false);
-        set_injected_key(g_injected_keys.backward,
-                         key_override(IDC_VR_KEY_BACKWARD, movement_keys.backward), false);
-        set_injected_key(g_injected_keys.left,
-                         key_override(IDC_VR_KEY_LEFT, movement_keys.left), false);
-        set_injected_key(g_injected_keys.right,
-                         key_override(IDC_VR_KEY_RIGHT, movement_keys.right), false);
+        update_quest_movement_keys(movement_keys, g_quest_stick_state);
         set_injected_key(g_injected_keys.jump,
                          key_override(IDC_VR_KEY_JUMP, VK_SPACE), physical_jump);
         set_injected_key(g_injected_keys.sprint,
@@ -2093,20 +2166,10 @@ void update_quest_locomotion() {
 
     const float deadzone = std::clamp(get_float(IDC_VR_QUEST_DEADZONE, 0.35f),
                                       0.10f, 0.90f);
+    compensate_head_based_locomotion_axes(g_quest_stick_x, g_quest_stick_y);
     g_quest_stick_state = hytalevr::digital_stick(
         g_quest_stick_x, g_quest_stick_y, g_quest_stick_state, deadzone);
-    set_injected_key(g_injected_keys.forward,
-                     key_override(IDC_VR_KEY_FORWARD, movement_keys.forward),
-                     g_quest_stick_state.forward);
-    set_injected_key(g_injected_keys.backward,
-                     key_override(IDC_VR_KEY_BACKWARD, movement_keys.backward),
-                     g_quest_stick_state.backward);
-    set_injected_key(g_injected_keys.left,
-                     key_override(IDC_VR_KEY_LEFT, movement_keys.left),
-                     g_quest_stick_state.left);
-    set_injected_key(g_injected_keys.right,
-                     key_override(IDC_VR_KEY_RIGHT, movement_keys.right),
-                     g_quest_stick_state.right);
+    update_quest_movement_keys(movement_keys, g_quest_stick_state);
     set_injected_key(g_injected_keys.jump, key_override(IDC_VR_KEY_JUMP, VK_SPACE), jump);
     set_injected_key(g_injected_keys.sprint, key_override(IDC_VR_KEY_SPRINT, VK_SHIFT), sprint);
 }
@@ -2165,6 +2228,28 @@ bool remote_load_library(HANDLE process, const std::wstring& path) {
     }
     VirtualFreeEx(process, remote, 0, MEM_RELEASE);
     return success;
+}
+
+bool ui_scale_mapping_compatible(DWORD timeout_ms) {
+    const ULONGLONG deadline = GetTickCount64() + timeout_ms;
+    do {
+        HANDLE mapping = OpenFileMappingW(
+            FILE_MAP_READ, FALSE, hytalevr::kUiScaleMappingNameW);
+        if (mapping) {
+            auto* shared = static_cast<const hytalevr::UiScaleSharedData*>(
+                MapViewOfFile(
+                    mapping, FILE_MAP_READ, 0, 0,
+                    sizeof(hytalevr::UiScaleSharedData)));
+            const bool compatible =
+                shared && hytalevr::ui_scale_shared_data_compatible(*shared);
+            if (shared) UnmapViewOfFile(shared);
+            CloseHandle(mapping);
+            return compatible;
+        }
+        if (GetTickCount64() >= deadline) break;
+        Sleep(10);
+    } while (true);
+    return false;
 }
 
 bool has_loaded_vr_camera_hook(DWORD pid, const wchar_t* required_module) {
@@ -2280,11 +2365,24 @@ bool inject_vr_camera_hook() {
         return false;
     }
 
-    const bool success = (is_module_loaded(g_pid, L"HytaleUIScaleHook.dll") ||
-                          remote_load_library(process, ui_hook)) &&
-                         (is_module_loaded(g_pid, L"openvr_api.dll") ||
-                          remote_load_library(process, openvr)) &&
-                         remote_load_library(process, dll);
+    const bool ui_hook_was_loaded =
+        is_module_loaded(g_pid, L"HytaleUIScaleHook.dll");
+    if (ui_hook_was_loaded && !ui_scale_mapping_compatible(500)) {
+        CloseHandle(process);
+        set_status(
+            L"An older UI hook is loaded in Hytale. Restart Hytale before "
+            L"injecting this dashboard version.");
+        return false;
+    }
+    const bool ui_hook_loaded =
+        ui_hook_was_loaded || remote_load_library(process, ui_hook);
+    const bool ui_hook_compatible =
+        ui_hook_loaded && ui_scale_mapping_compatible(1000);
+    const bool success =
+        ui_hook_compatible &&
+        (is_module_loaded(g_pid, L"openvr_api.dll") ||
+         remote_load_library(process, openvr)) &&
+        remote_load_library(process, dll);
     CloseHandle(process);
     if (!success) {
         set_status(L"VR hook v122 injection failed. Close Hytale if an old DLL is loaded, then restart the dashboard.");
@@ -2361,7 +2459,7 @@ void publish_vr_controls(bool enabled, bool shutdown_requested, bool unload_requ
         IsDlgButtonChecked(g_window, IDC_VR_HIDE_RETICLE) == BST_CHECKED ? 1u : 0u;
     g_vr_camera_shared->ui_overlay_enabled =
         IsDlgButtonChecked(g_window, IDC_VR_DISABLE_FOREGROUND_EFFECTS) == BST_CHECKED ? 1u : 0u;
-    uint32_t vr_effects = 0u;
+    uint32_t vr_effects = kVrEffectQualityControlsPresent;
     if (IsDlgButtonChecked(g_window, IDC_VR_DISABLE_SHADOWS) == BST_CHECKED) {
         vr_effects |= kVrEffectShadows;
     }
@@ -2370,6 +2468,18 @@ void publish_vr_controls(bool enabled, bool shutdown_requested, bool unload_requ
     }
     if (IsDlgButtonChecked(g_window, IDC_VR_DISABLE_DISTORTION) == BST_CHECKED) {
         vr_effects |= kVrEffectDistortion;
+    }
+    if (IsDlgButtonChecked(g_window, IDC_VR_SUPERSAMPLING) == BST_CHECKED) {
+        vr_effects |= kVrEffectSupersampling;
+    }
+    if (IsDlgButtonChecked(g_window, IDC_VR_SHARPENING) == BST_CHECKED) {
+        vr_effects |= kVrEffectSharpening;
+    }
+    if (IsDlgButtonChecked(g_window, IDC_VR_EDGE_AA) == BST_CHECKED) {
+        vr_effects |= kVrEffectEdgeAa;
+    }
+    if (IsDlgButtonChecked(g_window, IDC_VR_PROJECTION_CORRECTION) == BST_CHECKED) {
+        vr_effects |= kVrEffectProjectionCorrection;
     }
     g_vr_camera_shared->shadows_disabled =
         (vr_effects & kVrEffectShadows) != 0u ? 0u : 1u;
@@ -2397,11 +2507,12 @@ void publish_vr_controls(bool enabled, bool shutdown_requested, bool unload_requ
     g_vr_camera_shared->turn_speed =
         std::clamp(get_float(IDC_VR_TURN_SPEED, 450.0f), 50.0f, 2000.0f);
     g_vr_camera_shared->vr_resolution_scale =
-        std::clamp(get_float(IDC_VR_RESOLUTION_SCALE, 100.0f), 50.0f, 200.0f) * 0.01f;
+        std::clamp(get_float(IDC_VR_RESOLUTION_SCALE, 125.0f), 100.0f, 200.0f) * 0.01f;
     g_vr_camera_shared->first_person_hand_hidden =
         IsDlgButtonChecked(g_window, IDC_VR_HIDE_FIRST_PERSON_HAND) == BST_CHECKED ? 1u : 0u;
     g_vr_camera_shared->reserved_render_option = vr_effects;
-    g_vr_camera_shared->reserved_render_value = 1.0f;
+    g_vr_camera_shared->reserved_render_value =
+        std::clamp(get_float(IDC_VR_SHARPEN_STRENGTH, 20.0f), 0.0f, 100.0f) * 0.01f;
     g_vr_camera_shared->hmd_culling_view_enabled = 1u;
     g_vr_camera_shared->hand_model_scale =
         std::clamp(get_float(IDC_VR_HAND_MODEL_SCALE, 1.0f), 0.10f, 5.0f);
@@ -2413,6 +2524,14 @@ void publish_vr_controls(bool enabled, bool shutdown_requested, bool unload_requ
         std::clamp(get_float(IDC_VR_HAND_MODEL_ROLL, 0.0f), -180.0f, 180.0f);
     g_vr_camera_shared->hand_depth_tolerance =
         std::clamp(get_float(IDC_VR_HAND_DEPTH_TOLERANCE, 0.02f), 0.0f, 1.0f);
+    g_vr_camera_shared->held_item_offset_x =
+        std::clamp(get_float(IDC_VR_HELD_ITEM_X, 0.0f), -0.30f, 0.30f);
+    g_vr_camera_shared->held_item_offset_y =
+        std::clamp(get_float(IDC_VR_HELD_ITEM_Y, 0.0f), -0.30f, 0.30f);
+    g_vr_camera_shared->held_item_offset_z =
+        std::clamp(get_float(IDC_VR_HELD_ITEM_Z, -0.10f), -0.30f, 0.30f);
+    g_vr_camera_shared->held_item_scale =
+        std::clamp(get_float(IDC_VR_HELD_ITEM_SCALE, 0.30f), 0.10f, 2.0f);
     g_vr_camera_shared->swap_eyes = 0u;
     g_vr_camera_shared->shutdown_requested = shutdown_requested ? 1u : 0u;
     g_vr_camera_shared->unload_requested = unload_requested ? 1u : 0u;
@@ -2687,8 +2806,14 @@ void create_ui(HWND window) {
     add(L"EDIT", L"121.000", WS_BORDER | ES_AUTOHSCROLL, 235, 334, 135, 24, IDC_CURRENT_Y);
     add(L"EDIT", L"256.118", WS_BORDER | ES_AUTOHSCROLL, 235, 364, 135, 24, IDC_CURRENT_Z);
     add(L"EDIT", L"0.10", WS_BORDER | ES_AUTOHSCROLL, 295, 394, 75, 24, IDC_TOLERANCE);
-    add(L"EDIT", L"100", WS_BORDER | ES_AUTOHSCROLL, 305, 440, 65, 24,
-        IDC_VR_RESOLUTION_SCALE);
+    add(L"EDIT", L"0.00", WS_BORDER | ES_AUTOHSCROLL, 215, 456, 75, 24,
+        IDC_VR_HELD_ITEM_X);
+    add(L"EDIT", L"0.00", WS_BORDER | ES_AUTOHSCROLL, 295, 456, 75, 24,
+        IDC_VR_HELD_ITEM_Y);
+    add(L"EDIT", L"-0.10", WS_BORDER | ES_AUTOHSCROLL, 215, 508, 75, 24,
+        IDC_VR_HELD_ITEM_Z);
+    add(L"EDIT", L"0.30", WS_BORDER | ES_AUTOHSCROLL, 295, 508, 75, 24,
+        IDC_VR_HELD_ITEM_SCALE);
 
     // Column 2 inputs/toggles
     add(L"BUTTON", L"SteamVR stereo", BS_AUTOCHECKBOX, 405, 304, 175, 20, IDC_VR_STEREO);
@@ -2698,13 +2823,25 @@ void create_ui(HWND window) {
     add(L"BUTTON", L"VR distortion effects", BS_AUTOCHECKBOX, 405, 400, 175, 20, IDC_VR_DISABLE_DISTORTION);
     add(L"BUTTON", L"Quest stick", BS_AUTOCHECKBOX, 405, 424, 175, 20, IDC_VR_QUEST_LOCOMOTION);
     add(L"BUTTON", L"Hide 1P Hand", BS_AUTOCHECKBOX, 405, 448, 175, 20, IDC_VR_HIDE_FIRST_PERSON_HAND);
-    add(L"EDIT", L"64.0", WS_BORDER | ES_AUTOHSCROLL, 515, 496, 65, 24, IDC_VR_IPD);
-    add(L"EDIT", L"100", WS_BORDER | ES_AUTOHSCROLL, 515, 522, 65, 24, IDC_VR_SEPARATION);
-    add(L"EDIT", L"130", WS_BORDER | ES_AUTOHSCROLL, 515, 548, 65, 24, IDC_VR_WORLD_SCALE);
-    add(L"EDIT", L"1.00", WS_BORDER | ES_AUTOHSCROLL, 405, 596, 78, 24, IDC_VR_HAND_MODEL_SCALE);
-    add(L"EDIT", L"-90", WS_BORDER | ES_AUTOHSCROLL, 502, 596, 78, 24, IDC_VR_HAND_MODEL_PITCH);
-    add(L"EDIT", L"0", WS_BORDER | ES_AUTOHSCROLL, 405, 648, 78, 24, IDC_VR_HAND_MODEL_YAW);
-    add(L"EDIT", L"0", WS_BORDER | ES_AUTOHSCROLL, 502, 648, 78, 24, IDC_VR_HAND_MODEL_ROLL);
+    add(L"BUTTON", L"Supersampling %", BS_AUTOCHECKBOX, 405, 486, 110, 20,
+        IDC_VR_SUPERSAMPLING);
+    add(L"EDIT", L"125", WS_BORDER | ES_AUTOHSCROLL, 520, 486, 65, 24,
+        IDC_VR_RESOLUTION_SCALE);
+    add(L"BUTTON", L"Sharpening %", BS_AUTOCHECKBOX, 405, 512, 110, 20,
+        IDC_VR_SHARPENING);
+    add(L"EDIT", L"20", WS_BORDER | ES_AUTOHSCROLL, 520, 512, 65, 24,
+        IDC_VR_SHARPEN_STRENGTH);
+    add(L"BUTTON", L"VR FXAA", BS_AUTOCHECKBOX, 405, 538, 175, 20,
+        IDC_VR_EDGE_AA);
+    add(L"BUTTON", L"Stereo projection", BS_AUTOCHECKBOX, 405, 564, 175, 20,
+        IDC_VR_PROJECTION_CORRECTION);
+    add(L"EDIT", L"64.0", WS_BORDER | ES_AUTOHSCROLL, 515, 592, 65, 24, IDC_VR_IPD);
+    add(L"EDIT", L"100", WS_BORDER | ES_AUTOHSCROLL, 515, 618, 65, 24, IDC_VR_SEPARATION);
+    add(L"EDIT", L"130", WS_BORDER | ES_AUTOHSCROLL, 515, 644, 65, 24, IDC_VR_WORLD_SCALE);
+    add(L"EDIT", L"1.00", WS_BORDER | ES_AUTOHSCROLL, 215, 560, 75, 24, IDC_VR_HAND_MODEL_SCALE);
+    add(L"EDIT", L"-90", WS_BORDER | ES_AUTOHSCROLL, 295, 560, 75, 24, IDC_VR_HAND_MODEL_PITCH);
+    add(L"EDIT", L"0", WS_BORDER | ES_AUTOHSCROLL, 215, 612, 75, 24, IDC_VR_HAND_MODEL_YAW);
+    add(L"EDIT", L"0", WS_BORDER | ES_AUTOHSCROLL, 295, 612, 75, 24, IDC_VR_HAND_MODEL_ROLL);
 
     // Column 3 inputs
     add(L"EDIT", L"Auto", WS_BORDER | ES_AUTOHSCROLL, 685, 328, 75, 24, IDC_VR_KEY_FORWARD);
@@ -2798,6 +2935,8 @@ void create_ui(HWND window) {
     CheckDlgButton(g_window, IDC_VR_DISABLE_SHADOWS, BST_CHECKED);
     CheckDlgButton(g_window, IDC_VR_DISABLE_PARTICLES, BST_CHECKED);
     CheckDlgButton(g_window, IDC_VR_DISABLE_DISTORTION, BST_CHECKED);
+    CheckDlgButton(g_window, IDC_VR_EDGE_AA, BST_CHECKED);
+    CheckDlgButton(g_window, IDC_VR_PROJECTION_CORRECTION, BST_CHECKED);
     CheckDlgButton(g_window, IDC_VR_MENU_MOUSE, BST_CHECKED);
     CheckDlgButton(g_window, IDC_VR_NO_UBO_UI, BST_CHECKED);
     CheckDlgButton(g_window, IDC_VR_HIDE_FIRST_PERSON_HAND, BST_CHECKED);
@@ -2806,6 +2945,9 @@ void create_ui(HWND window) {
 }
 
 LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lparam) {
+    if (hytalevr::dashboard_updater::handle_message(window, message)) {
+        return 0;
+    }
     switch (message) {
 #ifdef HYTALE_CAMERA_MODE
     case kScanCompleteMessage: {
@@ -2940,7 +3082,11 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
                 const bool advanced = advanced_options_enabled();
                 drawPanel(200.0f, 20.0f, 860.0f, 95.0f, L"Quick Actions");
                 drawPanel(200.0f, 130.0f, 860.0f, 95.0f, L"Player Coordinate Block");
-                if (advanced) drawPanel(200.0f, 240.0f, 860.0f, 430.0f, L"Advanced Options");
+                if (advanced) {
+                    drawPanel(200.0f, 240.0f, 860.0f, 430.0f, L"Advanced Options");
+                } else {
+                    drawPanel(200.0f, 240.0f, 860.0f, 100.0f, L"VR Quality");
+                }
                 
                 Gdiplus::Font colHeaderFont(&fontFamily, 9.5f, Gdiplus::FontStyleBold | Gdiplus::FontStyleUnderline, Gdiplus::UnitPoint);
                 Gdiplus::SolidBrush colHeaderBrush(gdip_rgb(229, 231, 235));
@@ -2949,7 +3095,7 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
                 Gdiplus::SolidBrush labelBrush(gdip_rgb(156, 163, 175));
                 
                 if (advanced) {
-                    g.DrawString(L"Scan / Resolution", -1, &colHeaderFont, Gdiplus::PointF(215.0f, 275.0f), &colHeaderBrush);
+                    g.DrawString(L"Scan / Item", -1, &colHeaderFont, Gdiplus::PointF(215.0f, 275.0f), &colHeaderBrush);
                     g.DrawString(L"Rendering Settings", -1, &colHeaderFont, Gdiplus::PointF(405.0f, 275.0f), &colHeaderBrush);
                     g.DrawString(L"Keybindings", -1, &colHeaderFont, Gdiplus::PointF(605.0f, 275.0f), &colHeaderBrush);
                     g.DrawString(L"UI/Pointer Settings", -1, &colHeaderFont, Gdiplus::PointF(815.0f, 275.0f), &colHeaderBrush);
@@ -2957,14 +3103,17 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
                     g.DrawString(L"Y", -1, &labelFont, Gdiplus::PointF(215.0f, 338.0f), &labelBrush);
                     g.DrawString(L"Z", -1, &labelFont, Gdiplus::PointF(215.0f, 368.0f), &labelBrush);
                     g.DrawString(L"Tolerance", -1, &labelFont, Gdiplus::PointF(215.0f, 398.0f), &labelBrush);
-                    g.DrawString(L"Resolution %", -1, &labelFont, Gdiplus::PointF(215.0f, 444.0f), &labelBrush);
-                    g.DrawString(L"IPD mm", -1, &labelFont, Gdiplus::PointF(405.0f, 504.0f), &labelBrush);
-                    g.DrawString(L"Separation %", -1, &labelFont, Gdiplus::PointF(405.0f, 532.0f), &labelBrush);
-                    g.DrawString(L"World scale %", -1, &labelFont, Gdiplus::PointF(405.0f, 560.0f), &labelBrush);
-                    g.DrawString(L"Hand scale", -1, &labelFont, Gdiplus::PointF(405.0f, 580.0f), &labelBrush);
-                    g.DrawString(L"Pitch", -1, &labelFont, Gdiplus::PointF(502.0f, 580.0f), &labelBrush);
-                    g.DrawString(L"Yaw", -1, &labelFont, Gdiplus::PointF(405.0f, 632.0f), &labelBrush);
-                    g.DrawString(L"Roll", -1, &labelFont, Gdiplus::PointF(502.0f, 632.0f), &labelBrush);
+                    g.DrawString(L"Item X m", -1, &labelFont, Gdiplus::PointF(215.0f, 440.0f), &labelBrush);
+                    g.DrawString(L"Item Y m", -1, &labelFont, Gdiplus::PointF(295.0f, 440.0f), &labelBrush);
+                    g.DrawString(L"Item Z m", -1, &labelFont, Gdiplus::PointF(215.0f, 492.0f), &labelBrush);
+                    g.DrawString(L"Item scale", -1, &labelFont, Gdiplus::PointF(295.0f, 492.0f), &labelBrush);
+                    g.DrawString(L"Hand scale", -1, &labelFont, Gdiplus::PointF(215.0f, 544.0f), &labelBrush);
+                    g.DrawString(L"Pitch", -1, &labelFont, Gdiplus::PointF(295.0f, 544.0f), &labelBrush);
+                    g.DrawString(L"Yaw", -1, &labelFont, Gdiplus::PointF(215.0f, 596.0f), &labelBrush);
+                    g.DrawString(L"Roll", -1, &labelFont, Gdiplus::PointF(295.0f, 596.0f), &labelBrush);
+                    g.DrawString(L"IPD mm", -1, &labelFont, Gdiplus::PointF(405.0f, 596.0f), &labelBrush);
+                    g.DrawString(L"Separation %", -1, &labelFont, Gdiplus::PointF(405.0f, 622.0f), &labelBrush);
+                    g.DrawString(L"World scale %", -1, &labelFont, Gdiplus::PointF(405.0f, 648.0f), &labelBrush);
                     g.DrawString(L"Custom Keys", -1, &labelFont, Gdiplus::PointF(605.0f, 308.0f), &labelBrush);
                     g.DrawString(L"Forward", -1, &labelFont, Gdiplus::PointF(605.0f, 332.0f), &labelBrush);
                     g.DrawString(L"Backward", -1, &labelFont, Gdiplus::PointF(605.0f, 358.0f), &labelBrush);
@@ -3002,10 +3151,9 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
                 Gdiplus::Font labelFont(&fontFamily, 9.5f, Gdiplus::FontStyleRegular, Gdiplus::UnitPoint);
                 Gdiplus::SolidBrush labelBrush(gdip_rgb(156, 163, 175));
                 
-                g.DrawString(L"IPD mm", -1, &labelFont, Gdiplus::PointF(220.0f, 508.0f), &labelBrush);
-                g.DrawString(L"Separation %", -1, &labelFont, Gdiplus::PointF(220.0f, 538.0f), &labelBrush);
-                g.DrawString(L"World scale %", -1, &labelFont, Gdiplus::PointF(220.0f, 568.0f), &labelBrush);
-                g.DrawString(L"VR resolution %", -1, &labelFont, Gdiplus::PointF(220.0f, 424.0f), &labelBrush);
+                g.DrawString(L"IPD mm", -1, &labelFont, Gdiplus::PointF(620.0f, 184.0f), &labelBrush);
+                g.DrawString(L"Separation %", -1, &labelFont, Gdiplus::PointF(620.0f, 214.0f), &labelBrush);
+                g.DrawString(L"World scale %", -1, &labelFont, Gdiplus::PointF(620.0f, 244.0f), &labelBrush);
             } else if (g_current_tab == 3) {
                 drawPanel(200.0f, 20.0f, 780.0f, 570.0f, L"Keybindings");
                 
@@ -3151,6 +3299,7 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
 #endif
         return 0;
     case WM_DESTROY:
+        hytalevr::dashboard_updater::shutdown();
         if (g_background_brush) DeleteObject(g_background_brush);
         if (g_edit_background_brush) DeleteObject(g_edit_background_brush);
         if (g_list_background_brush) DeleteObject(g_list_background_brush);
@@ -3178,6 +3327,11 @@ LRESULT CALLBACK window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lp
 
 int WINAPI wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE,
                     _In_ PWSTR, _In_ int show_command) {
+    if (const std::optional<int> updater_result =
+            hytalevr::dashboard_updater::run_apply_mode()) {
+        return *updater_result;
+    }
+
     Gdiplus::GdiplusStartupInput gdiplusStartupInput;
     Gdiplus::GdiplusStartup(&g_gdiplusToken, &gdiplusStartupInput, nullptr);
 
@@ -3210,6 +3364,7 @@ int WINAPI wWinMain(_In_ HINSTANCE instance, _In_opt_ HINSTANCE,
     }
     ShowWindow(window, show_command);
     UpdateWindow(window);
+    hytalevr::dashboard_updater::start_update_check(window);
 
     MSG message{};
     while (GetMessageW(&message, nullptr, 0, 0) > 0) {

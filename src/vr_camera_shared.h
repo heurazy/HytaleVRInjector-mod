@@ -9,8 +9,15 @@ constexpr uint32_t kVrCameraVersion = 122;
 constexpr uint32_t kVrEffectShadows = 1u << 0;
 constexpr uint32_t kVrEffectParticles = 1u << 1;
 constexpr uint32_t kVrEffectDistortion = 1u << 2;
+constexpr uint32_t kVrEffectSupersampling = 1u << 3;
+constexpr uint32_t kVrEffectSharpening = 1u << 4;
+constexpr uint32_t kVrEffectEdgeAa = 1u << 5;
+constexpr uint32_t kVrEffectProjectionCorrection = 1u << 6;
+constexpr uint32_t kVrEffectQualityControlsPresent = 1u << 31;
 constexpr uint32_t kVrEffectDefaults =
-    kVrEffectShadows | kVrEffectParticles | kVrEffectDistortion;
+    kVrEffectShadows | kVrEffectParticles | kVrEffectDistortion |
+    kVrEffectEdgeAa | kVrEffectProjectionCorrection |
+    kVrEffectQualityControlsPresent;
 
 struct VrCameraControls {
     uint32_t enabled = 0;
@@ -50,13 +57,17 @@ struct VrCameraControls {
     uint32_t first_person_hand_hidden = 1;
     // Bitmask of kVrEffect* flags. Kept in the existing ABI slot.
     uint32_t reserved_render_option = kVrEffectDefaults;
-    float reserved_render_value = 1.0f;
+    float reserved_render_value = 0.20f;
     uint32_t hmd_culling_view_enabled = 1;
     float hand_model_scale = 1.0f;
     float hand_model_pitch_degrees = -90.0f;
     float hand_model_yaw_degrees = 0.0f;
     float hand_model_roll_degrees = 0.0f;
     float hand_depth_tolerance = 0.02f;
+    float held_item_offset_x = 0.0f;
+    float held_item_offset_y = 0.0f;
+    float held_item_offset_z = -0.10f;
+    float held_item_scale = 0.30f;
 };
 
 struct VrCameraShared {
@@ -102,13 +113,17 @@ struct VrCameraShared {
     uint32_t first_person_hand_hidden = 1;
     // Bitmask of kVrEffect* flags. Kept in the existing ABI slot.
     uint32_t reserved_render_option = kVrEffectDefaults;
-    float reserved_render_value = 1.0f;
+    float reserved_render_value = 0.20f;
     uint32_t hmd_culling_view_enabled = 1;
     float hand_model_scale = 1.0f;
     float hand_model_pitch_degrees = -90.0f;
     float hand_model_yaw_degrees = 0.0f;
     float hand_model_roll_degrees = 0.0f;
     float hand_depth_tolerance = 0.02f;
+    float held_item_offset_x = 0.0f;
+    float held_item_offset_y = 0.0f;
+    float held_item_offset_z = -0.10f;
+    float held_item_scale = 0.30f;
 
     volatile uint32_t hook_active = 0;
     volatile int32_t hook_error = 0;

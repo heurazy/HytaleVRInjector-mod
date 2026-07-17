@@ -30,6 +30,13 @@ Testing/
 # Runtime logs and local packages
 *.log
 app-v*/
+HytaleVR-*-test/
+HytaleVR-*-test.zip
+HytaleVR-native-stereo-*.zip
+HytaleVRInjector-mod-*-windows-x64.zip
+crash-dumps/
+native_capture_thumb.png
+NATIVE_STEREO_TESTING.md
 hytale_vr_render_debug.log
 hytale_scaler_debug.log
 

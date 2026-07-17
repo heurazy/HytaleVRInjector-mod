@@ -1,10 +1,12 @@
 cmake_minimum_required(VERSION 3.20)
 
-project(hytale_camera_tool LANGUAGES CXX)
+project(hytale_camera_tool VERSION 1.0.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
+set(HYTALEVR_DASHBOARD_VERSION "${PROJECT_VERSION}" CACHE STRING
+    "Version reported by the dashboard updater")
 
 option(HYTALE_BUILD_EXPERIMENTAL_PROBE "Build the crash-prone OpenGL probe" OFF)
 
@@ -30,6 +32,7 @@ endif()
 
 add_library(hytale_vr_camera_hook SHARED
     src/vr_camera_hook.cpp
+    src/vr_item_assets.cpp
 )
 
 set(HYTALE_VR_BINDING_FILES
@@ -70,11 +73,13 @@ target_include_directories(hytale_vr_camera_hook PRIVATE
 target_link_libraries(hytale_vr_camera_hook PRIVATE
     opengl32
     gdiplus
+    ole32
     "${CMAKE_CURRENT_SOURCE_DIR}/third_party/openvr/lib/win64/openvr_api.lib"
 )
 
 add_executable(hytale_camera_dashboard WIN32
     src/player_teleporter.cpp
+    src/dashboard_updater.cpp
 )
 add_dependencies(hytale_camera_dashboard HytaleUIScaleHook)
 
@@ -96,6 +101,7 @@ add_executable(hytale_noesis_probe_tool
 
 add_executable(hytale_player_teleporter WIN32
     src/player_teleporter.cpp
+    src/dashboard_updater.cpp
 )
 
 target_compile_definitions(hytale_camera_dashboard PRIVATE
@@ -104,6 +110,7 @@ target_compile_definitions(hytale_camera_dashboard PRIVATE
     UNICODE
     _UNICODE
     HYTALE_CAMERA_MODE
+    HYTALEVR_DASHBOARD_VERSION="${HYTALEVR_DASHBOARD_VERSION}"
 )
 
 target_compile_definitions(hytale_viewtarget_writer PRIVATE
@@ -140,29 +147,36 @@ target_compile_definitions(hytale_player_teleporter PRIVATE
     UNICODE
     _UNICODE
     HYTALE_CAMERA_MODE
+    HYTALEVR_DASHBOARD_VERSION="${HYTALEVR_DASHBOARD_VERSION}"
 )
 
 target_link_libraries(hytale_camera_dashboard PRIVATE
+    bcrypt
     comctl32
     shell32
     gdiplus
     dwmapi
+    winhttp
     "${CMAKE_CURRENT_SOURCE_DIR}/third_party/openvr/lib/win64/openvr_api.lib"
 )
 
 target_include_directories(hytale_camera_dashboard PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/third_party"
     "${CMAKE_CURRENT_SOURCE_DIR}/third_party/openvr/headers"
 )
 
 target_link_libraries(hytale_player_teleporter PRIVATE
+    bcrypt
     comctl32
     shell32
     gdiplus
     dwmapi
+    winhttp
     "${CMAKE_CURRENT_SOURCE_DIR}/third_party/openvr/lib/win64/openvr_api.lib"
 )
 
 target_include_directories(hytale_player_teleporter PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/third_party"
     "${CMAKE_CURRENT_SOURCE_DIR}/third_party/openvr/headers"
 )
 
@@ -200,11 +214,47 @@ set_target_properties(${hytale_runtime_targets} PROPERTIES
 
 include(CTest)
 if(BUILD_TESTING)
+    add_executable(hytale_dashboard_update_tests
+        tests/dashboard_update_tests.cpp
+    )
+    target_include_directories(hytale_dashboard_update_tests PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/src"
+    )
+    hytale_target_defaults(hytale_dashboard_update_tests)
+    add_test(NAME dashboard_update COMMAND hytale_dashboard_update_tests)
+
     add_executable(hytale_vr_math_tests tests/vr_math_tests.cpp)
     target_include_directories(hytale_vr_math_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
     target_link_libraries(hytale_vr_math_tests PRIVATE user32)
     hytale_target_defaults(hytale_vr_math_tests)
     add_test(NAME vr_math COMMAND hytale_vr_math_tests)
+
+    add_executable(hytale_vr_item_assets_smoketest
+        tests/vr_item_assets_smoketest.cpp
+        src/vr_item_assets.cpp
+    )
+    target_include_directories(hytale_vr_item_assets_smoketest PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/src"
+    )
+    target_compile_definitions(hytale_vr_item_assets_smoketest PRIVATE
+        WIN32_LEAN_AND_MEAN
+        NOMINMAX
+    )
+    target_link_libraries(hytale_vr_item_assets_smoketest PRIVATE gdiplus ole32)
+    hytale_target_defaults(hytale_vr_item_assets_smoketest)
+
+    add_executable(hytale_vr_item_live_diagnostic
+        tests/vr_item_live_diagnostic.cpp
+    )
+    target_include_directories(hytale_vr_item_live_diagnostic PRIVATE
+        "${CMAKE_CURRENT_SOURCE_DIR}/src"
+    )
+    target_compile_definitions(hytale_vr_item_live_diagnostic PRIVATE
+        WIN32_LEAN_AND_MEAN
+        NOMINMAX
+    )
+    hytale_target_defaults(hytale_vr_item_live_diagnostic)
+
     add_test(NAME vr_bindings
         COMMAND ${CMAKE_COMMAND}
             "-DPROJECT_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}"

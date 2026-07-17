@@ -7,7 +7,9 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cctype>
+#include <climits>
 #include <cmath>
 #include <cstddef>
 #include <cstdlib>
@@ -15,17 +17,24 @@
 #include <cstring>
 #include <fstream>
 #include <iomanip>
+#include <limits>
 #include <mutex>
+#include <memory>
 #include <sstream>
 #include <string>
+#include <thread>
+#include <unordered_map>
 #include <vector>
 
 #include "vr_camera_shared.h"
 #include "vr_hand_depth.h"
+#include "vr_held_item.h"
 #include "vr_hook_validation.h"
+#include "vr_item_assets.h"
 #include "vr_math.h"
 #include "vr_physical_interactions.h"
 #include "vr_render_resolution.h"
+#include "ui_scale_shared.h"
 
 namespace {
 
@@ -74,55 +83,12 @@ public:
     HookCallbackScope& operator=(const HookCallbackScope&) = delete;
 };
 
-struct UiScaleShared {
-    float uiScale;
-    float offsetX;
-    float offsetY;
-    int disableUboScaling;
-    int disableShadows;
-    int disableParticles;
-    int disableDistortion;
-    int hideFirstPerson;
-    volatile LONG menuVisibleCounter;
-    volatile LONG menuLargeDrawCounter;
-    volatile LONG menuTextureId;
-    volatile LONG menuTextureWidth;
-    volatile LONG menuTextureHeight;
-    volatile LONG menuTextureFrame;
-    volatile LONG menuCaptureError;
-    volatile LONG currentEye;
-    volatile LONG renderFrameSequence;
-    volatile LONG suppressMenuInGame;
-    volatile LONG menuIgnoreDrawThreshold;
-    int firstPersonControllerReanchor;
-    int firstPersonControllerPoseValid;
-    float firstPersonHandNdcX;
-    float firstPersonHandNdcY;
-    float firstPersonHandDepth;
-    volatile LONG firstPersonMatrixPatches;
-    volatile LONG sceneDepthTextureId;
-    volatile LONG sceneDepthTextureWidth;
-    volatile LONG sceneDepthTextureHeight;
-    volatile LONG sceneDepthTextureFrame;
-    float sceneDepthFarClip;
-    volatile LONG distortionTextureId;
-    volatile LONG distortionTextureWidth;
-    volatile LONG distortionTextureHeight;
-    volatile LONG distortionTextureFrame;
-    volatile LONG vrSceneMatricesValid;
-    volatile LONG vrSceneMatrixSequence;
-    float vrSceneView[16];
-    float vrSceneProjection[16];
-    float vrSceneViewProjection[16];
-    float vrSceneInvView[16];
-    float vrSceneInvViewProjection[16];
-    float vrSceneReprojection[16];
-    float vrSceneProjectionInfo[4];
-};
+using UiScaleShared = hytalevr::UiScaleSharedData;
 HANDLE g_ui_scale_mapping = nullptr;
 UiScaleShared* g_ui_scale_shared = nullptr;
 bool menu_visible_recently();
 bool ensure_ui_scale_mapping();
+bool initialize_gl_capture();
 bool controller_hand_ndc_for_eye(vr::EVREye eye, float& ndc_x, float& ndc_y, float& depth);
 bool project_tracking_point_to_eye_ndc(int eye, const float hmd[12],
                                        const float absolute[3],
@@ -133,11 +99,17 @@ void clear_scissor_rect(int x, int y, int width, int height,
 void* g_hook_memory = nullptr;
 unsigned char* g_hook_target = nullptr;
 std::array<unsigned char, 16> g_original{};
+constexpr size_t kCameraViewOffset = 0x2E0;
+constexpr size_t kCameraViewProjectionOffset = 0x320;
+constexpr size_t kCameraProjectionOffset = 0x4E0;
 void* g_interaction_hook_memory = nullptr;
 unsigned char* g_interaction_hook_target = nullptr;
 std::array<unsigned char, 15> g_interaction_original{};
 using SdlGlSwapWindowFn = void(__cdecl*)(void*);
 using SdlGetWindowSizeFn = bool(__cdecl*)(void*, int*, int*);
+using SdlSetWindowSizeFn = bool(__cdecl*)(void*, int, int);
+using SdlGetWindowFlagsFn = uint64_t(__cdecl*)(void*);
+using SdlSyncWindowFn = bool(__cdecl*)(void*);
 using NoesisRenderFn = void(__fastcall*)(void*);
 using NoesisAnyFn = void(__fastcall*)(void*, void*, void*, void*);
 using GlGenFramebuffersFn = void(APIENTRY*)(GLsizei, GLuint*);
@@ -174,10 +146,30 @@ using GlEnableVertexAttribArrayFn = void(APIENTRY*)(GLuint);
 using GlVertexAttribPointerFn = void(APIENTRY*)(GLuint, GLint, GLenum, GLboolean, GLsizei,
                                                 const void*);
 using GlActiveTextureFn = void(APIENTRY*)(GLenum);
+using GlGetTextureSubImageFn = void(APIENTRY*)(
+    GLuint, GLint, GLint, GLint, GLint, GLsizei, GLsizei, GLsizei,
+    GLenum, GLenum, GLsizei, void*);
 SdlGlSwapWindowFn g_swap_trampoline = nullptr;
 SdlGetWindowSizeFn g_sdl_get_window_size_in_pixels = nullptr;
+SdlGetWindowSizeFn g_sdl_get_window_size = nullptr;
+SdlSetWindowSizeFn g_sdl_set_window_size = nullptr;
+SdlGetWindowFlagsFn g_sdl_get_window_flags = nullptr;
+SdlSyncWindowFn g_sdl_sync_window = nullptr;
+void* g_supersampled_window = nullptr;
+int g_supersample_base_width = 0;
+int g_supersample_base_height = 0;
+int g_supersample_target_width = 0;
+int g_supersample_target_height = 0;
+bool g_source_supersampling_active = false;
 unsigned char* g_swap_target = nullptr;
 std::array<unsigned char, 14> g_swap_original{};
+void* g_engine_render_hook_memory = nullptr;
+unsigned char* g_engine_render_hook_target = nullptr;
+unsigned char* g_engine_render_loop_target = nullptr;
+unsigned char* g_engine_render_final_stage_target = nullptr;
+unsigned char* g_engine_render_final_stage_stub = nullptr;
+std::array<unsigned char, 7> g_engine_render_original{};
+std::array<unsigned char, 5> g_engine_render_final_stage_original{};
 void* g_noesis_begin_memory = nullptr;
 void* g_noesis_end_memory = nullptr;
 void* g_noesis_renderer_memory = nullptr;
@@ -193,6 +185,10 @@ NoesisAnyFn g_noesis_renderer_trampoline = nullptr;
 bool g_noesis_hooks_active = false;
 vr::IVRSystem* g_vr_system = nullptr;
 vr::VROverlayHandle_t g_ui_overlay = vr::k_ulOverlayHandleInvalid;
+vr::HmdMatrix34_t g_ui_overlay_world_transform{};
+bool g_ui_overlay_world_transform_valid = false;
+uint32_t g_ui_overlay_recenter_sequence = ~0u;
+float g_ui_overlay_anchor_distance = 0.0f;
 GLuint g_eye_textures[2]{};
 GLuint g_afw_source_texture = 0;
 GLuint g_eye_depth_textures[2]{};
@@ -204,6 +200,9 @@ int g_texture_height = 0;
 int g_source_texture_width = 0;
 int g_source_texture_height = 0;
 volatile LONG g_render_eye = 0;
+volatile LONG g_engine_render_pass = 0;
+volatile LONG g_engine_stereo_pair_ready = 0;
+bool g_engine_render_hook_active = false;
 uint32_t g_last_swap_recenter_sequence = 0;
 uint32_t g_consecutive_submit_failures = 0;
 ULONGLONG g_last_successful_submit_tick = 0;
@@ -224,7 +223,7 @@ float g_floor_height_world_scale = 1.30f;
 float g_native_standing_camera_y = 0.0f;
 bool g_native_standing_camera_y_valid = false;
 float g_last_sneak_height_compensation = 0.0f;
-bool g_runtime_active = false;
+std::atomic<bool> g_runtime_active{false};
 GLuint g_capture_fbo = 0;
 GLuint g_ui_fbo = 0;
 GLuint g_ui_texture = 0;
@@ -266,6 +265,7 @@ GlBufferDataFn g_gl_buffer_data = nullptr;
 GlEnableVertexAttribArrayFn g_gl_enable_vertex_attrib_array = nullptr;
 GlVertexAttribPointerFn g_gl_vertex_attrib_pointer = nullptr;
 GlActiveTextureFn g_gl_active_texture = nullptr;
+GlGetTextureSubImageFn g_gl_get_texture_sub_image = nullptr;
 void* g_primary_camera = nullptr;
 ULONGLONG g_last_primary_camera_tick = 0;
 SRWLOCK g_camera_lock = SRWLOCK_INIT;
@@ -307,6 +307,9 @@ vr::VRActionHandle_t g_action_right_stick_click = vr::k_ulInvalidActionHandle;
 bool g_actions_ready = false;
 bool g_right_trigger_pressed = false;
 bool g_left_trigger_pressed = false;
+bool g_right_attack_suppresses_left_item = false;
+bool g_left_attack_suppresses_right_item = false;
+bool g_left_use_locks_placeable_to_right = false;
 bool g_left_grip_pressed = false;
 bool g_right_grip_pressed = false;
 hytalevr::PhysicalMotionHistory g_hmd_motion_history;
@@ -352,7 +355,15 @@ constexpr GLenum GL_ACTIVE_TEXTURE_VALUE = 0x84E0;
 constexpr GLenum GL_TEXTURE0_VALUE = 0x84C0;
 constexpr GLenum GL_TEXTURE1_VALUE = 0x84C1;
 constexpr GLenum GL_TEXTURE2_VALUE = 0x84C2;
+constexpr GLenum GL_TEXTURE3_VALUE = 0x84C3;
+constexpr GLenum GL_TEXTURE4_VALUE = 0x84C4;
+constexpr GLenum GL_TEXTURE5_VALUE = 0x84C5;
 constexpr GLenum GL_UNPACK_ALIGNMENT_VALUE = 0x0CF5;
+constexpr GLenum GL_DEPTH_ATTACHMENT_VALUE = 0x8D00;
+constexpr GLenum GL_DEPTH_COMPONENT_VALUE = 0x1902;
+constexpr GLint GL_DEPTH_COMPONENT24_VALUE = 0x81A6;
+constexpr GLenum GL_DEPTH_FUNC_VALUE = 0x0B74;
+constexpr GLenum GL_DEPTH_WRITEMASK_VALUE = 0x0B72;
 
 bool render_logging_enabled() {
     static int enabled = -1;
@@ -379,6 +390,17 @@ void render_log(const std::string& message) {
     std::ofstream log(render_log_path(), std::ios_base::app);
     if (!log.is_open()) return;
     log << GetTickCount64() << " " << message << "\n";
+}
+
+void item_diagnostic_log_once(uint32_t bit, const std::string& message) {
+    static std::atomic<uint32_t> logged_bits{0};
+    const uint32_t previous =
+        logged_bits.fetch_or(bit, std::memory_order_relaxed);
+    if ((previous & bit) != 0) return;
+    std::lock_guard<std::mutex> lock(g_render_log_mutex);
+    std::ofstream log(render_log_path(), std::ios_base::app);
+    if (!log.is_open()) return;
+    log << GetTickCount64() << " held-item diagnostic: " << message << "\n";
 }
 
 std::string matrix_summary(const Matrix4& matrix) {
@@ -424,9 +446,17 @@ bool g_hand_texture_loaded = false;
 bool g_hand_texture_attempted = false;
 ULONG_PTR g_hand_gdiplus_token = 0;
 GLuint g_hand_texture_gl = 0;
+GLuint g_torch_flame_texture_gl = 0;
+uint32_t g_torch_flame_texture_width = 0;
+uint32_t g_torch_flame_texture_height = 0;
+bool g_torch_flame_texture_attempted = false;
 GLuint g_hand_program = 0;
 GLuint g_hand_vao = 0;
 GLuint g_hand_vbo = 0;
+GLuint g_hand_item_depth_texture = 0;
+int g_hand_item_depth_width = 0;
+int g_hand_item_depth_height = 0;
+bool g_hand_item_depth_active = false;
 GLint g_hand_texture_uniform = -1;
 GLint g_hand_scene_depth_uniform = -1;
 GLint g_hand_use_scene_depth_uniform = -1;
@@ -435,11 +465,128 @@ GLint g_hand_depth_far_clip_uniform = -1;
 GLint g_hand_depth_bias_uniform = -1;
 bool g_hand_gl_attempted = false;
 bool g_hand_gl_ready = false;
+
+struct HeldItemAtlasKey {
+    GLuint texture = 0;
+    int offset_x = 0;
+    int offset_y = 0;
+    int atlas_width = 0;
+    int atlas_height = 0;
+    GLuint vertex_array = 0;
+    int index_count = 0;
+    int uv_min_x = 0;
+    int uv_min_y = 0;
+    int uv_max_x = 0;
+    int uv_max_y = 0;
+
+    bool operator==(const HeldItemAtlasKey& other) const {
+        return texture == other.texture &&
+               offset_x == other.offset_x &&
+               offset_y == other.offset_y &&
+               atlas_width == other.atlas_width &&
+               atlas_height == other.atlas_height &&
+               vertex_array == other.vertex_array &&
+               index_count == other.index_count &&
+               uv_min_x == other.uv_min_x &&
+               uv_min_y == other.uv_min_y &&
+               uv_max_x == other.uv_max_x &&
+               uv_max_y == other.uv_max_y;
+    }
+};
+
+struct CapturedHeldItemRegion {
+    std::vector<uint8_t> rgba;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    uint64_t signature = 0;
+};
+
+struct HeldItemCacheKey {
+    uint64_t texture_signature = 0;
+    int index_count = 0;
+    int uv_span_x = 0;
+    int uv_span_y = 0;
+
+    bool operator==(const HeldItemCacheKey& other) const {
+        return texture_signature == other.texture_signature &&
+               index_count == other.index_count &&
+               uv_span_x == other.uv_span_x &&
+               uv_span_y == other.uv_span_y;
+    }
+};
+
+struct HeldItemCacheKeyHash {
+    size_t operator()(const HeldItemCacheKey& value) const {
+        size_t hash = static_cast<size_t>(value.texture_signature);
+        hash ^= static_cast<size_t>(
+            value.texture_signature >> 32) * 0x9e3779b1u;
+        hash ^= static_cast<size_t>(
+            static_cast<uint32_t>(value.index_count)) << 1;
+        hash ^= static_cast<size_t>(
+            static_cast<uint32_t>(value.uv_span_x)) << 17;
+        hash ^= static_cast<size_t>(
+            static_cast<uint32_t>(value.uv_span_y)) << 25;
+        return hash;
+    }
+};
+
+struct CachedHeldItemAsset {
+    size_t definition_index = 0;
+    hytalevr::VrItemRenderAsset asset;
+    uint64_t last_used = 0;
+};
+
+struct LoadedVrItemState {
+    HeldItemAtlasKey key{};
+    HeldItemCacheKey identity{};
+    bool key_valid = false;
+    bool identity_valid = false;
+    bool asset_ready = false;
+    size_t definition_index = 0;
+    LONG last_verified_frame = -1;
+    hytalevr::VrItemRenderAsset asset;
+    GLuint texture_gl = 0;
+};
+
+struct PendingHeldItemDetection {
+    HeldItemCacheKey identity{};
+    bool identity_valid = false;
+    size_t definition_index = (std::numeric_limits<size_t>::max)();
+    bool fallback = false;
+    int confirmations = 0;
+    LONG last_frame = -1;
+};
+
+std::mutex g_item_catalog_mutex;
+std::shared_ptr<hytalevr::VrItemAssetCatalog> g_item_catalog;
+std::atomic<int> g_item_catalog_state{0};
+std::thread g_item_catalog_thread;
+LoadedVrItemState g_loaded_items[2];
+PendingHeldItemDetection g_pending_item_detections[2];
+std::unordered_map<HeldItemCacheKey, CachedHeldItemAsset, HeldItemCacheKeyHash>
+    g_held_item_asset_cache;
+uint64_t g_held_item_cache_sequence = 0;
+std::atomic<ULONGLONG> g_held_item_detection_hold_until[2]{};
+std::atomic<ULONGLONG> g_held_item_suppressed_until[2]{};
+std::atomic<LONG> g_stable_held_item_presence_mask{0};
+LONG g_last_item_detection_frame = -1;
+
 GLuint g_afw_program = 0;
 GLuint g_afw_vao = 0;
 GLuint g_afw_vbo = 0;
 GLint g_afw_source_color_uniform = -1;
 GLint g_afw_source_depth_uniform = -1;
+GLint g_afw_held_item_color_uniform = -1;
+GLint g_afw_held_item_depth_uniform = -1;
+GLint g_afw_use_held_item_depth_uniform = -1;
+GLint g_afw_remove_held_item_background_uniform = -1;
+GLint g_afw_source_texel_size_uniform = -1;
+GLint g_afw_eye_scene_depth_uniform = -1;
+GLint g_afw_composite_held_item_uniform = -1;
+GLint g_afw_held_item_uv_shift_uniform = -1;
+GLint g_afw_held_item_source_center_uniform = -1;
+GLint g_afw_held_item_radius_uniform = -1;
+GLint g_afw_held_item_depth_bias_uniform = -1;
 GLint g_afw_inverse_source_projection_uniform = -1;
 GLint g_afw_source_projection_uniform = -1;
 GLint g_afw_inverse_target_projection_uniform = -1;
@@ -450,6 +597,9 @@ GLint g_afw_enable_warp_uniform = -1;
 GLint g_afw_output_depth_uniform = -1;
 GLint g_afw_distortion_field_uniform = -1;
 GLint g_afw_apply_distortion_uniform = -1;
+GLint g_afw_sharpen_enabled_uniform = -1;
+GLint g_afw_sharpen_strength_uniform = -1;
+GLint g_afw_edge_aa_enabled_uniform = -1;
 Matrix4 g_afw_source_view = identity_matrix();
 Matrix4 g_afw_source_projection = identity_matrix();
 Matrix4 g_afw_eye_view[2]{identity_matrix(), identity_matrix()};
@@ -466,6 +616,88 @@ std::wstring module_directory() {
     wchar_t* slash = wcsrchr(path, L'\\');
     if (slash) slash[1] = L'\0';
     return path;
+}
+
+bool file_exists(const std::wstring& path) {
+    const DWORD attributes = GetFileAttributesW(path.c_str());
+    return attributes != INVALID_FILE_ATTRIBUTES &&
+           (attributes & FILE_ATTRIBUTE_DIRECTORY) == 0;
+}
+
+std::wstring parent_directory(std::wstring path) {
+    while (!path.empty() && (path.back() == L'\\' || path.back() == L'/')) {
+        path.pop_back();
+    }
+    const size_t slash = path.find_last_of(L"\\/");
+    return slash == std::wstring::npos ? std::wstring() : path.substr(0, slash);
+}
+
+std::wstring find_hytale_assets_zip() {
+    wchar_t executable[MAX_PATH]{};
+    if (GetModuleFileNameW(nullptr, executable, MAX_PATH) > 0) {
+        const std::wstring client_directory = parent_directory(executable);
+        const std::wstring game_directory = parent_directory(client_directory);
+        const std::wstring beside_client = game_directory + L"\\Assets.zip";
+        if (file_exists(beside_client)) return beside_client;
+    }
+
+    wchar_t appdata[MAX_PATH]{};
+    if (GetEnvironmentVariableW(L"APPDATA", appdata, MAX_PATH) == 0) return {};
+    const std::wstring install =
+        std::wstring(appdata) + L"\\Hytale\\install\\";
+    const std::array<std::wstring, 2> channels{L"release", L"pre-release"};
+    for (const std::wstring& channel : channels) {
+        const std::wstring candidate =
+            install + channel + L"\\package\\game\\latest\\Assets.zip";
+        if (file_exists(candidate)) return candidate;
+    }
+    return {};
+}
+
+void ensure_item_catalog_loading() {
+    int expected = 0;
+    if (!g_item_catalog_state.compare_exchange_strong(expected, 1)) return;
+    const std::wstring assets_zip = find_hytale_assets_zip();
+    if (assets_zip.empty()) {
+        g_item_catalog_state.store(-1);
+        render_log("item assets: Hytale Assets.zip was not found");
+        return;
+    }
+    try {
+        g_item_catalog_thread = std::thread([assets_zip]() {
+            auto catalog = std::make_shared<hytalevr::VrItemAssetCatalog>();
+            std::string error;
+            if (!hytalevr::load_vr_item_asset_catalog(
+                    assets_zip, *catalog, error)) {
+                render_log("item assets: catalog load failed: " + error);
+                item_diagnostic_log_once(
+                    1u, "catalog load failed: " + error);
+                g_item_catalog_state.store(-1);
+                return;
+            }
+            const size_t definitions = catalog->definitions.size();
+            const size_t candidates = catalog->texture_candidates.size();
+            {
+                std::lock_guard<std::mutex> lock(g_item_catalog_mutex);
+                g_item_catalog = std::move(catalog);
+            }
+            g_item_catalog_state.store(2);
+            std::ostringstream out;
+            out << "item assets: catalog ready definitions=" << definitions
+                << " textures=" << candidates;
+            render_log(out.str());
+            item_diagnostic_log_once(2u, out.str());
+        });
+    } catch (...) {
+        g_item_catalog_state.store(-1);
+        render_log("item assets: catalog worker could not be started");
+    }
+}
+
+void join_item_catalog_loader() {
+    if (g_item_catalog_thread.joinable()) {
+        g_item_catalog_thread.join();
+    }
 }
 
 bool ensure_hand_gdiplus() {
@@ -996,6 +1228,8 @@ bool load_hand_gl_functions() {
     g_gl_vertex_attrib_pointer =
         load_gl_proc<GlVertexAttribPointerFn>("glVertexAttribPointer");
     g_gl_active_texture = load_gl_proc<GlActiveTextureFn>("glActiveTexture");
+    g_gl_get_texture_sub_image =
+        load_gl_proc<GlGetTextureSubImageFn>("glGetTextureSubImage");
 
     return g_gl_create_shader && g_gl_shader_source && g_gl_compile_shader &&
         g_gl_get_shader_iv && g_gl_create_program && g_gl_attach_shader &&
@@ -1053,6 +1287,9 @@ void main() {
 #version 130
 uniform sampler2D uSourceColor;
 uniform sampler2D uSourceDepth;
+uniform sampler2D uHeldItemColor;
+uniform sampler2D uHeldItemDepth;
+uniform sampler2D uEyeSceneDepth;
 uniform sampler2D uDistortionField;
 uniform mat4 uInverseSourceProjection;
 uniform mat4 uSourceProjection;
@@ -1064,13 +1301,46 @@ uniform float uDepthFarClip;
 uniform int uEnableWarp;
 uniform int uOutputDepth;
 uniform int uApplyDistortion;
+uniform int uUseHeldItemDepth;
+uniform int uRemoveHeldItemFromBackground;
+uniform int uCompositeHeldItem;
+uniform int uSharpenEnabled;
+uniform float uSharpenStrength;
+uniform int uEdgeAaEnabled;
+uniform vec2 uSourceTexelSize;
+uniform vec2 uHeldItemUvShift;
+uniform vec2 uHeldItemSourceCenter;
+uniform float uHeldItemRadius;
+uniform float uHeldItemDepthBias;
 in vec2 vUv;
 out vec4 fragColor;
+
+vec3 linearToSrgb(vec3 colour) {
+    vec3 bounded = clamp(colour, vec3(0.0), vec3(1.0));
+    vec3 low = bounded * 12.92;
+    vec3 high = 1.055 * pow(bounded, vec3(1.0 / 2.4)) - 0.055;
+    return mix(low, high, step(vec3(0.0031308), bounded));
+}
 
 vec3 sourceViewPosition(vec2 uv, float linearDepth) {
     vec4 ray = uInverseSourceProjection * vec4(uv * 2.0 - 1.0, -1.0, 1.0);
     ray /= max(abs(ray.w), 0.00001);
     return ray.xyz * (linearDepth / max(-ray.z, 0.0001));
+}
+
+float combinedLinearDepth(vec2 uv) {
+    float linearDepth = texture(uSourceDepth, uv).r * uDepthFarClip;
+    if (uUseHeldItemDepth == 0) return linearDepth;
+
+    float hardwareDepth = texture(uHeldItemDepth, uv).r;
+    if (hardwareDepth >= 0.999999) return linearDepth;
+    vec4 itemView = uInverseSourceProjection *
+        vec4(uv * 2.0 - 1.0, hardwareDepth * 2.0 - 1.0, 1.0);
+    if (abs(itemView.w) <= 0.00001) return linearDepth;
+    itemView /= itemView.w;
+    float itemDepth = max(-itemView.z, 0.0);
+    if (itemDepth <= 0.001 || itemDepth >= uDepthFarClip) return linearDepth;
+    return min(linearDepth, itemDepth);
 }
 
 vec2 projectionCorrectedSourceUv(vec2 targetUv) {
@@ -1101,11 +1371,188 @@ vec2 vrEffectSourceUv(vec2 uv) {
     return mirroredSourceUv(uv + displacement);
 }
 
+bool hasHeldItemDepth(vec2 uv) {
+    if (uRemoveHeldItemFromBackground == 0) return false;
+    return texture(uHeldItemDepth, clamp(uv, vec2(0.001), vec2(0.999))).r < 0.999999;
+}
+
+vec2 backgroundSourceUv(vec2 uv) {
+    vec2 boundedUv = clamp(uv, vec2(0.001), vec2(0.999));
+    if (!hasHeldItemDepth(boundedUv)) return boundedUv;
+
+    // The final Hytale frame already contains the item. Find the nearest
+    // neighbouring final-colour pixel outside its depth mask so the regular
+    // AFW pass does not leave a second, flat copy behind the 3D reprojection.
+    for (int stepIndex = 1; stepIndex <= 48; ++stepIndex) {
+        float stepPixels = float(stepIndex * 4);
+        vec2 xOffset = vec2(uSourceTexelSize.x * stepPixels, 0.0);
+        vec2 yOffset = vec2(0.0, uSourceTexelSize.y * stepPixels);
+        vec2 candidate = clamp(boundedUv - xOffset, vec2(0.001), vec2(0.999));
+        if (!hasHeldItemDepth(candidate)) return candidate;
+        candidate = clamp(boundedUv + xOffset, vec2(0.001), vec2(0.999));
+        if (!hasHeldItemDepth(candidate)) return candidate;
+        candidate = clamp(boundedUv - yOffset, vec2(0.001), vec2(0.999));
+        if (!hasHeldItemDepth(candidate)) return candidate;
+        candidate = clamp(boundedUv + yOffset, vec2(0.001), vec2(0.999));
+        if (!hasHeldItemDepth(candidate)) return candidate;
+    }
+    return boundedUv;
+}
+
+vec4 sourceColour(vec2 uv) {
+    // Item depth is expressed in the undistorted geometry coordinates. Remove
+    // the source item there first, then apply the same final colour-field
+    // mapping used by the rest of the AFW image.
+    vec2 cleanGeometryUv = backgroundSourceUv(uv);
+    return texture(uSourceColor, vrEffectSourceUv(cleanGeometryUv));
+}
+
+float colourLuma(vec3 colour) {
+    return dot(colour, vec3(0.2126, 0.7152, 0.0722));
+}
+
+vec4 qualitySourceColour(vec2 uv) {
+    vec4 center = sourceColour(uv);
+    if (uSharpenEnabled == 0 && uEdgeAaEnabled == 0) return center;
+
+    vec3 colour = center.rgb;
+    vec3 neighbourAverage = center.rgb;
+    vec3 localMin = center.rgb;
+    vec3 localMax = center.rgb;
+
+    if (uEdgeAaEnabled != 0) {
+        vec3 northWest =
+            sourceColour(uv + uSourceTexelSize * vec2(-1.0, -1.0)).rgb;
+        vec3 northEast =
+            sourceColour(uv + uSourceTexelSize * vec2(1.0, -1.0)).rgb;
+        vec3 southWest =
+            sourceColour(uv + uSourceTexelSize * vec2(-1.0, 1.0)).rgb;
+        vec3 southEast =
+            sourceColour(uv + uSourceTexelSize * vec2(1.0, 1.0)).rgb;
+        neighbourAverage =
+            (northWest + northEast + southWest + southEast) * 0.25;
+        localMin = min(center.rgb, min(min(northWest, northEast),
+                                       min(southWest, southEast)));
+        localMax = max(center.rgb, max(max(northWest, northEast),
+                                       max(southWest, southEast)));
+
+        float lumaNorthWest = colourLuma(northWest);
+        float lumaNorthEast = colourLuma(northEast);
+        float lumaSouthWest = colourLuma(southWest);
+        float lumaSouthEast = colourLuma(southEast);
+        float lumaCenter = colourLuma(center.rgb);
+        float lumaMin = min(lumaCenter, min(min(lumaNorthWest, lumaNorthEast),
+                                            min(lumaSouthWest, lumaSouthEast)));
+        float lumaMax = max(lumaCenter, max(max(lumaNorthWest, lumaNorthEast),
+                                            max(lumaSouthWest, lumaSouthEast)));
+        float lumaRange = lumaMax - lumaMin;
+        float edgeThreshold = max(0.025, lumaMax * 0.10);
+        if (lumaRange >= edgeThreshold) {
+            vec2 direction;
+            direction.x = -((lumaNorthWest + lumaNorthEast) -
+                            (lumaSouthWest + lumaSouthEast));
+            direction.y = ((lumaNorthWest + lumaSouthWest) -
+                           (lumaNorthEast + lumaSouthEast));
+            float directionReduce = max(
+                (lumaNorthWest + lumaNorthEast +
+                 lumaSouthWest + lumaSouthEast) * 0.0078125,
+                0.0009765625);
+            float inverseDirection =
+                1.0 / (min(abs(direction.x), abs(direction.y)) +
+                       directionReduce);
+            direction = clamp(direction * inverseDirection,
+                              vec2(-8.0), vec2(8.0)) * uSourceTexelSize;
+
+            vec3 colourA = 0.5 * (
+                sourceColour(uv + direction * (1.0 / 3.0 - 0.5)).rgb +
+                sourceColour(uv + direction * (2.0 / 3.0 - 0.5)).rgb);
+            vec3 colourB = colourA * 0.5 + 0.25 * (
+                sourceColour(uv + direction * -0.5).rgb +
+                sourceColour(uv + direction * 0.5).rgb);
+            float lumaB = colourLuma(colourB);
+            vec3 filteredColour = (lumaB < lumaMin || lumaB > lumaMax)
+                ? colourA
+                : colourB;
+            float edgeStrength = clamp(
+                (lumaRange - edgeThreshold) /
+                    max(edgeThreshold * 2.0, 0.0001),
+                0.0, 1.0);
+            // Keep fine distant texture contrast while still smoothing strong
+            // silhouettes. Full FXAA replacement softens foliage and blocks.
+            colour = mix(center.rgb, filteredColour, edgeStrength * 0.60);
+        }
+    } else {
+        vec3 left = sourceColour(
+            uv - vec2(uSourceTexelSize.x, 0.0)).rgb;
+        vec3 right = sourceColour(
+            uv + vec2(uSourceTexelSize.x, 0.0)).rgb;
+        vec3 up = sourceColour(
+            uv - vec2(0.0, uSourceTexelSize.y)).rgb;
+        vec3 down = sourceColour(
+            uv + vec2(0.0, uSourceTexelSize.y)).rgb;
+        neighbourAverage = (left + right + up + down) * 0.25;
+        localMin = min(center.rgb, min(min(left, right), min(up, down)));
+        localMax = max(center.rgb, max(max(left, right), max(up, down)));
+    }
+
+    if (uSharpenEnabled != 0) {
+        vec3 detail = center.rgb - neighbourAverage;
+        colour += detail * clamp(uSharpenStrength, 0.0, 1.0);
+        colour = clamp(colour, localMin - vec3(0.015), localMax + vec3(0.015));
+    }
+    return vec4(clamp(colour, vec3(0.0), vec3(1.0)), center.a);
+}
+
 void main() {
+    if (uCompositeHeldItem != 0) {
+        vec2 sourceUv = vUv - uHeldItemUvShift;
+        bool validItem = false;
+        for (int iteration = 0; iteration < 4; ++iteration) {
+            if (sourceUv.x <= 0.0 || sourceUv.x >= 1.0 ||
+                sourceUv.y <= 0.0 || sourceUv.y >= 1.0 ||
+                distance(sourceUv, uHeldItemSourceCenter) > uHeldItemRadius) {
+                discard;
+            }
+            float iterationDepth = texture(uHeldItemDepth, sourceUv).r;
+            if (iterationDepth >= 0.999999) discard;
+            vec4 iterationView = uInverseSourceProjection *
+                vec4(sourceUv * 2.0 - 1.0, iterationDepth * 2.0 - 1.0, 1.0);
+            if (abs(iterationView.w) <= 0.00001) discard;
+            iterationView /= iterationView.w;
+            vec4 iterationTargetView = uSourceToTargetView * iterationView;
+            vec4 iterationTargetClip = uTargetProjection * iterationTargetView;
+            if (abs(iterationTargetClip.w) <= 0.00001) discard;
+            vec2 projectedUv = iterationTargetClip.xy / iterationTargetClip.w * 0.5 + 0.5;
+            sourceUv += vUv - projectedUv;
+            validItem = true;
+        }
+        if (!validItem || sourceUv.x <= 0.0 || sourceUv.x >= 1.0 ||
+            sourceUv.y <= 0.0 || sourceUv.y >= 1.0 ||
+            distance(sourceUv, uHeldItemSourceCenter) > uHeldItemRadius) {
+            discard;
+        }
+        float hardwareDepth = texture(uHeldItemDepth, sourceUv).r;
+        if (hardwareDepth >= 0.999999) discard;
+        vec4 itemView = uInverseSourceProjection *
+            vec4(sourceUv * 2.0 - 1.0, hardwareDepth * 2.0 - 1.0, 1.0);
+        if (abs(itemView.w) <= 0.00001) discard;
+        itemView /= itemView.w;
+        vec4 targetItemView = uSourceToTargetView * itemView;
+        float itemDepth = max(-targetItemView.z, 0.0);
+        float sceneDepth = texture(uEyeSceneDepth, vUv).r * uDepthFarClip;
+        if (itemDepth <= 0.001 || itemDepth > sceneDepth + uHeldItemDepthBias) {
+            discard;
+        }
+        vec4 heldItemColour = texture(uHeldItemColor, sourceUv);
+        heldItemColour.rgb = linearToSrgb(heldItemColour.rgb);
+        heldItemColour.a = 1.0;
+        fragColor = heldItemColour;
+        return;
+    }
     if (uEnableWarp == 0) {
         fragColor = uOutputDepth != 0
-            ? vec4(texture(uSourceDepth, vUv).r, 0.0, 0.0, 1.0)
-            : texture(uSourceColor, vrEffectSourceUv(vUv));
+            ? vec4(combinedLinearDepth(vUv) / uDepthFarClip, 0.0, 0.0, 1.0)
+            : qualitySourceColour(vUv);
         return;
     }
     if (uEnableWarp == 1) {
@@ -1115,8 +1562,8 @@ void main() {
             sourceUv = vUv;
         }
         fragColor = uOutputDepth != 0
-            ? vec4(texture(uSourceDepth, sourceUv).r, 0.0, 0.0, 1.0)
-            : texture(uSourceColor, vrEffectSourceUv(sourceUv));
+            ? vec4(combinedLinearDepth(sourceUv) / uDepthFarClip, 0.0, 0.0, 1.0)
+            : qualitySourceColour(sourceUv);
         return;
     }
     vec2 projectionSourceUv = projectionCorrectedSourceUv(vUv);
@@ -1126,7 +1573,7 @@ void main() {
         vec2 boundedUv = clamp(sourceUv, vec2(0.001), vec2(0.999));
         float linearDepth = 1.0;
         if (uEnableWarp == 2) {
-            linearDepth = texture(uSourceDepth, boundedUv).r * uDepthFarClip;
+            linearDepth = combinedLinearDepth(boundedUv);
             if (linearDepth <= 0.001 || linearDepth >= uDepthFarClip * 0.999) break;
         }
         validDepth = true;
@@ -1146,14 +1593,14 @@ void main() {
     }
     vec2 sampledUv = mirroredSourceUv(sourceUv);
     if (uOutputDepth != 0) {
-        float sourceLinearDepth = texture(uSourceDepth, sampledUv).r * uDepthFarClip;
+        float sourceLinearDepth = combinedLinearDepth(sampledUv);
         vec4 targetDepthPosition = uSourceToTargetView *
             vec4(sourceViewPosition(sampledUv, sourceLinearDepth), 1.0);
         float targetLinearDepth = max(-targetDepthPosition.z, 0.0);
         fragColor = vec4(clamp(targetLinearDepth / uDepthFarClip, 0.0, 1.0),
                          0.0, 0.0, 1.0);
     } else {
-        fragColor = texture(uSourceColor, vrEffectSourceUv(sampledUv));
+        fragColor = qualitySourceColour(sampledUv);
     }
 }
 )GLSL";
@@ -1190,6 +1637,28 @@ void main() {
         g_gl_get_uniform_location(g_afw_program, "uSourceColor");
     g_afw_source_depth_uniform =
         g_gl_get_uniform_location(g_afw_program, "uSourceDepth");
+    g_afw_held_item_color_uniform =
+        g_gl_get_uniform_location(g_afw_program, "uHeldItemColor");
+    g_afw_held_item_depth_uniform =
+        g_gl_get_uniform_location(g_afw_program, "uHeldItemDepth");
+    g_afw_use_held_item_depth_uniform =
+        g_gl_get_uniform_location(g_afw_program, "uUseHeldItemDepth");
+    g_afw_remove_held_item_background_uniform =
+        g_gl_get_uniform_location(g_afw_program, "uRemoveHeldItemFromBackground");
+    g_afw_source_texel_size_uniform =
+        g_gl_get_uniform_location(g_afw_program, "uSourceTexelSize");
+    g_afw_eye_scene_depth_uniform =
+        g_gl_get_uniform_location(g_afw_program, "uEyeSceneDepth");
+    g_afw_composite_held_item_uniform =
+        g_gl_get_uniform_location(g_afw_program, "uCompositeHeldItem");
+    g_afw_held_item_uv_shift_uniform =
+        g_gl_get_uniform_location(g_afw_program, "uHeldItemUvShift");
+    g_afw_held_item_source_center_uniform =
+        g_gl_get_uniform_location(g_afw_program, "uHeldItemSourceCenter");
+    g_afw_held_item_radius_uniform =
+        g_gl_get_uniform_location(g_afw_program, "uHeldItemRadius");
+    g_afw_held_item_depth_bias_uniform =
+        g_gl_get_uniform_location(g_afw_program, "uHeldItemDepthBias");
     g_afw_distortion_field_uniform =
         g_gl_get_uniform_location(g_afw_program, "uDistortionField");
     g_afw_inverse_source_projection_uniform =
@@ -1210,6 +1679,12 @@ void main() {
         g_gl_get_uniform_location(g_afw_program, "uOutputDepth");
     g_afw_apply_distortion_uniform =
         g_gl_get_uniform_location(g_afw_program, "uApplyDistortion");
+    g_afw_sharpen_enabled_uniform =
+        g_gl_get_uniform_location(g_afw_program, "uSharpenEnabled");
+    g_afw_sharpen_strength_uniform =
+        g_gl_get_uniform_location(g_afw_program, "uSharpenStrength");
+    g_afw_edge_aa_enabled_uniform =
+        g_gl_get_uniform_location(g_afw_program, "uEdgeAaEnabled");
 
     constexpr float vertices[] = {
         -1.0f, -1.0f, 0.0f, 0.0f,
@@ -1248,11 +1723,11 @@ in vec2 aPos;
 in vec2 aUv;
 in float aShade;
 in float aInverseDepth;
-out vec2 vUv;
+out vec2 vUvOverDepth;
 out float vShade;
 out float vInverseDepth;
 void main() {
-    vUv = vec2(aUv.x, 1.0 - aUv.y);
+    vUvOverDepth = vec2(aUv.x, 1.0 - aUv.y) * aInverseDepth;
     vShade = aShade;
     vInverseDepth = aInverseDepth;
     gl_Position = vec4(aPos, 0.0, 1.0);
@@ -1573,6 +2048,24 @@ struct DistortionTextureSnapshot {
     bool valid = false;
 };
 
+struct HeldItemDepthTextureSnapshot {
+    GLuint color_texture = 0;
+    GLuint depth_texture = 0;
+    int width = 0;
+    int height = 0;
+    uint32_t frame = 0;
+    LONG visible_mask = 0;
+    float view_positions[2][3]{};
+    bool valid = false;
+};
+
+struct HeldItemAtlasSnapshot {
+    HeldItemAtlasKey keys[2]{};
+    LONG frame = -1;
+    LONG valid_mask = 0;
+    bool valid = false;
+};
+
 SceneDepthTextureSnapshot scene_depth_texture_snapshot() {
     SceneDepthTextureSnapshot snapshot{};
     if (!ensure_ui_scale_mapping() || !g_ui_scale_shared) return snapshot;
@@ -1596,6 +2089,134 @@ SceneDepthTextureSnapshot scene_depth_texture_snapshot() {
         : 1024.0f;
     snapshot.valid = true;
     return snapshot;
+}
+
+HeldItemDepthTextureSnapshot held_item_depth_texture_snapshot() {
+    HeldItemDepthTextureSnapshot snapshot{};
+    if (!ensure_ui_scale_mapping() || !g_ui_scale_shared) return snapshot;
+
+    const LONG texture = InterlockedCompareExchange(
+        &g_ui_scale_shared->heldItemDepthTextureId, 0, 0);
+    const LONG color_texture = InterlockedCompareExchange(
+        &g_ui_scale_shared->heldItemLayerTextureId, 0, 0);
+    const LONG width = InterlockedCompareExchange(
+        &g_ui_scale_shared->heldItemDepthTextureWidth, 0, 0);
+    const LONG height = InterlockedCompareExchange(
+        &g_ui_scale_shared->heldItemDepthTextureHeight, 0, 0);
+    const LONG frame = InterlockedCompareExchange(
+        &g_ui_scale_shared->heldItemDepthTextureFrame, 0, 0);
+    const LONG current_frame = InterlockedCompareExchange(
+        &g_ui_scale_shared->renderFrameSequence, 0, 0);
+    const LONG visible_mask = InterlockedCompareExchange(
+        &g_ui_scale_shared->heldItemLayerVisibleMask, 0, 0);
+    std::memcpy(snapshot.view_positions,
+                g_ui_scale_shared->heldItemLayerViewPositions,
+                sizeof(snapshot.view_positions));
+    MemoryBarrier();
+    if (texture <= 0 || color_texture <= 0 || width <= 0 || height <= 0 ||
+        visible_mask == 0 || frame < 0 ||
+        current_frame != frame + 1) {
+        return snapshot;
+    }
+
+    snapshot.color_texture = static_cast<GLuint>(color_texture);
+    snapshot.depth_texture = static_cast<GLuint>(texture);
+    snapshot.width = static_cast<int>(width);
+    snapshot.height = static_cast<int>(height);
+    snapshot.frame = static_cast<uint32_t>(frame);
+    snapshot.visible_mask = visible_mask;
+    snapshot.valid = true;
+    return snapshot;
+}
+
+HeldItemAtlasSnapshot held_item_atlas_snapshot() {
+    HeldItemAtlasSnapshot snapshot{};
+    if (!ensure_ui_scale_mapping() || !g_ui_scale_shared) return snapshot;
+
+    for (int attempt = 0; attempt < 8; ++attempt) {
+        const LONG before = InterlockedCompareExchange(
+            &g_ui_scale_shared->heldItemAtlasSequence, 0, 0);
+        if ((before & 1) != 0) {
+            YieldProcessor();
+            continue;
+        }
+        MemoryBarrier();
+        snapshot.frame = InterlockedCompareExchange(
+            &g_ui_scale_shared->heldItemAtlasFrame, 0, 0);
+        snapshot.valid_mask = InterlockedCompareExchange(
+            &g_ui_scale_shared->heldItemAtlasValidMask, 0, 0);
+        for (int side = 0; side < 2; ++side) {
+            HeldItemAtlasKey& key = snapshot.keys[side];
+            key.texture = static_cast<GLuint>(InterlockedCompareExchange(
+                &g_ui_scale_shared->heldItemAtlasTextureIds[side], 0, 0));
+            key.offset_x = InterlockedCompareExchange(
+                &g_ui_scale_shared->heldItemAtlasOffsets[side][0], 0, 0);
+            key.offset_y = InterlockedCompareExchange(
+                &g_ui_scale_shared->heldItemAtlasOffsets[side][1], 0, 0);
+            key.atlas_width = InterlockedCompareExchange(
+                &g_ui_scale_shared->heldItemAtlasSizes[side][0], 0, 0);
+            key.atlas_height = InterlockedCompareExchange(
+                &g_ui_scale_shared->heldItemAtlasSizes[side][1], 0, 0);
+            key.vertex_array = static_cast<GLuint>(InterlockedCompareExchange(
+                &g_ui_scale_shared->heldItemVertexArrayIds[side], 0, 0));
+            key.index_count = InterlockedCompareExchange(
+                &g_ui_scale_shared->heldItemIndexCounts[side], 0, 0);
+            key.uv_min_x = InterlockedCompareExchange(
+                &g_ui_scale_shared->heldItemUvBounds[side][0], 0, 0);
+            key.uv_min_y = InterlockedCompareExchange(
+                &g_ui_scale_shared->heldItemUvBounds[side][1], 0, 0);
+            key.uv_max_x = InterlockedCompareExchange(
+                &g_ui_scale_shared->heldItemUvBounds[side][2], 0, 0);
+            key.uv_max_y = InterlockedCompareExchange(
+                &g_ui_scale_shared->heldItemUvBounds[side][3], 0, 0);
+        }
+        MemoryBarrier();
+        const LONG after = InterlockedCompareExchange(
+            &g_ui_scale_shared->heldItemAtlasSequence, 0, 0);
+        if (before != after || (after & 1) != 0) continue;
+
+        const LONG current_frame = InterlockedCompareExchange(
+            &g_ui_scale_shared->renderFrameSequence, 0, 0);
+        if (snapshot.frame < 0 || current_frame != snapshot.frame + 1 ||
+            snapshot.valid_mask == 0) {
+            if (snapshot.frame >= 0) {
+                item_diagnostic_log_once(
+                    4u, "atlas snapshot is stale frame=" +
+                            std::to_string(snapshot.frame) +
+                            " current=" + std::to_string(current_frame) +
+                            " mask=" + std::to_string(snapshot.valid_mask));
+            }
+            return HeldItemAtlasSnapshot{};
+        }
+        snapshot.valid = true;
+        item_diagnostic_log_once(
+            8u, "atlas snapshot received frame=" +
+                    std::to_string(snapshot.frame) +
+                    " mask=" + std::to_string(snapshot.valid_mask));
+        return snapshot;
+    }
+    return HeldItemAtlasSnapshot{};
+}
+
+LONG held_item_presence_mask() {
+    if (!ensure_ui_scale_mapping() || !g_ui_scale_shared) return 0;
+    for (int attempt = 0; attempt < 4; ++attempt) {
+        const LONG frame_before = InterlockedCompareExchange(
+            &g_ui_scale_shared->heldItemMatrixFrame, 0, 0);
+        MemoryBarrier();
+        const LONG mask = InterlockedCompareExchange(
+            &g_ui_scale_shared->heldItemLayerVisibleMask, 0, 0);
+        MemoryBarrier();
+        const LONG frame_after = InterlockedCompareExchange(
+            &g_ui_scale_shared->heldItemMatrixFrame, 0, 0);
+        const LONG current_frame = InterlockedCompareExchange(
+            &g_ui_scale_shared->renderFrameSequence, 0, 0);
+        if (frame_before == frame_after &&
+            frame_after >= 0 && current_frame == frame_after + 1) {
+            return mask;
+        }
+    }
+    return 0;
 }
 
 void fill_projected_triangle(const ProjectedHandTriangle& triangle,
@@ -1646,10 +2267,76 @@ void fill_projected_triangle(const ProjectedHandTriangle& triangle,
     }
 }
 
-bool draw_projected_hand_triangles_gl(const std::vector<ProjectedHandTriangle>& triangles,
-                                      int width, int height, int eye,
-                                      const VrCameraControls& controls) {
-    if (triangles.empty() || width <= 0 || height <= 0 || !ensure_hand_gl_renderer()) {
+bool begin_hand_item_depth(int width, int height) {
+    if (width <= 0 || height <= 0 || !initialize_gl_capture()) return false;
+    GLint draw_framebuffer = 0;
+    glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING_VALUE, &draw_framebuffer);
+    if (draw_framebuffer == 0) return false;
+
+    GLint old_active_texture = GL_TEXTURE0_VALUE;
+    GLint old_texture = 0;
+    glGetIntegerv(GL_ACTIVE_TEXTURE_VALUE, &old_active_texture);
+    g_gl_active_texture(GL_TEXTURE0_VALUE);
+    glGetIntegerv(GL_TEXTURE_BINDING_2D, &old_texture);
+    if (!g_hand_item_depth_texture ||
+        g_hand_item_depth_width != width ||
+        g_hand_item_depth_height != height) {
+        if (g_hand_item_depth_texture) {
+            glDeleteTextures(1, &g_hand_item_depth_texture);
+            g_hand_item_depth_texture = 0;
+        }
+        glGenTextures(1, &g_hand_item_depth_texture);
+        glBindTexture(GL_TEXTURE_2D, g_hand_item_depth_texture);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE_VALUE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE_VALUE);
+        glTexImage2D(
+            GL_TEXTURE_2D, 0, GL_DEPTH_COMPONENT24_VALUE,
+            width, height, 0, GL_DEPTH_COMPONENT_VALUE,
+            GL_UNSIGNED_INT, nullptr);
+        g_hand_item_depth_width = width;
+        g_hand_item_depth_height = height;
+    }
+    glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(old_texture));
+    g_gl_active_texture(static_cast<GLenum>(old_active_texture));
+    if (!g_hand_item_depth_texture) return false;
+
+    g_gl_framebuffer_texture_2d(
+        GL_DRAW_FRAMEBUFFER_VALUE, GL_DEPTH_ATTACHMENT_VALUE,
+        GL_TEXTURE_2D, g_hand_item_depth_texture, 0);
+    if (g_gl_check_framebuffer_status(GL_DRAW_FRAMEBUFFER_VALUE) !=
+        GL_FRAMEBUFFER_COMPLETE_VALUE) {
+        g_gl_framebuffer_texture_2d(
+            GL_DRAW_FRAMEBUFFER_VALUE, GL_DEPTH_ATTACHMENT_VALUE,
+            GL_TEXTURE_2D, 0, 0);
+        return false;
+    }
+
+    GLboolean old_depth_mask = GL_TRUE;
+    glGetBooleanv(GL_DEPTH_WRITEMASK_VALUE, &old_depth_mask);
+    glDepthMask(GL_TRUE);
+    glClearDepth(1.0);
+    glClear(GL_DEPTH_BUFFER_BIT);
+    glDepthMask(old_depth_mask);
+    g_hand_item_depth_active = true;
+    return true;
+}
+
+void end_hand_item_depth() {
+    if (!g_hand_item_depth_active) return;
+    g_gl_framebuffer_texture_2d(
+        GL_DRAW_FRAMEBUFFER_VALUE, GL_DEPTH_ATTACHMENT_VALUE,
+        GL_TEXTURE_2D, 0, 0);
+    g_hand_item_depth_active = false;
+}
+
+bool draw_projected_textured_triangles_gl(
+        const std::vector<ProjectedHandTriangle>& triangles,
+        int width, int height, int eye, GLuint texture, float depth_bias,
+        bool alpha_blend = false) {
+    if (triangles.empty() || width <= 0 || height <= 0 || texture == 0 ||
+        !ensure_hand_gl_renderer()) {
         return false;
     }
 
@@ -1679,13 +2366,21 @@ bool draw_projected_hand_triangles_gl(const std::vector<ProjectedHandTriangle>& 
     GLint old_texture0 = 0;
     GLint old_texture1 = 0;
     GLint old_viewport[4]{};
+    GLint old_depth_func = GL_LESS;
+    GLint old_blend_src = GL_ONE;
+    GLint old_blend_dst = GL_ZERO;
     GLboolean old_color_mask[4]{};
+    GLboolean old_depth_mask = GL_TRUE;
     glGetIntegerv(GL_CURRENT_PROGRAM_VALUE, &old_program);
     glGetIntegerv(GL_VERTEX_ARRAY_BINDING_VALUE, &old_vertex_array);
     glGetIntegerv(GL_ARRAY_BUFFER_BINDING_VALUE, &old_array_buffer);
     glGetIntegerv(GL_ACTIVE_TEXTURE_VALUE, &old_active_texture);
     glGetIntegerv(GL_VIEWPORT_VALUE, old_viewport);
+    glGetIntegerv(GL_DEPTH_FUNC_VALUE, &old_depth_func);
+    glGetIntegerv(GL_BLEND_SRC, &old_blend_src);
+    glGetIntegerv(GL_BLEND_DST, &old_blend_dst);
     glGetBooleanv(GL_COLOR_WRITEMASK, old_color_mask);
+    glGetBooleanv(GL_DEPTH_WRITEMASK_VALUE, &old_depth_mask);
     g_gl_active_texture(GL_TEXTURE0_VALUE);
     glGetIntegerv(GL_TEXTURE_BINDING_2D, &old_texture0);
     g_gl_active_texture(GL_TEXTURE1_VALUE);
@@ -1699,9 +2394,21 @@ bool draw_projected_hand_triangles_gl(const std::vector<ProjectedHandTriangle>& 
     glViewport(0, 0, width, height);
     glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
     glDisable(GL_SCISSOR_TEST);
-    glDisable(GL_DEPTH_TEST);
+    if (g_hand_item_depth_active) {
+        glEnable(GL_DEPTH_TEST);
+        glDepthFunc(GL_LESS);
+        glDepthMask(alpha_blend ? GL_FALSE : GL_TRUE);
+    } else {
+        glDisable(GL_DEPTH_TEST);
+        if (alpha_blend) glDepthMask(GL_FALSE);
+    }
     glDisable(GL_CULL_FACE);
-    glDisable(GL_BLEND);
+    if (alpha_blend) {
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+    } else {
+        glDisable(GL_BLEND);
+    }
 
     g_gl_use_program(g_hand_program);
     g_gl_uniform_1i(g_hand_texture_uniform, 0);
@@ -1733,9 +2440,9 @@ bool draw_projected_hand_triangles_gl(const std::vector<ProjectedHandTriangle>& 
     g_gl_uniform_1i(g_hand_use_scene_depth_uniform, use_scene_depth ? 1 : 0);
     g_gl_uniform_1f(g_hand_depth_far_clip_uniform, scene_depth.far_clip);
     g_gl_uniform_1f(g_hand_depth_bias_uniform,
-                    std::clamp(controls.hand_depth_tolerance, 0.0f, 1.0f));
+                    std::clamp(depth_bias, 0.0f, 1.0f));
     g_gl_active_texture(GL_TEXTURE0_VALUE);
-    glBindTexture(GL_TEXTURE_2D, g_hand_texture_gl);
+    glBindTexture(GL_TEXTURE_2D, texture);
     if (use_scene_depth) {
         g_gl_active_texture(GL_TEXTURE1_VALUE);
         glBindTexture(GL_TEXTURE_2D, scene_depth_texture);
@@ -1759,8 +2466,12 @@ bool draw_projected_hand_triangles_gl(const std::vector<ProjectedHandTriangle>& 
                                reinterpret_cast<void*>(offsetof(HandDrawVertex, depth)));
     glDrawArrays(GL_TRIANGLES, 0, static_cast<GLsizei>(vertices.size()));
 
+    glBlendFunc(static_cast<GLenum>(old_blend_src),
+                static_cast<GLenum>(old_blend_dst));
     if (blend_enabled) glEnable(GL_BLEND); else glDisable(GL_BLEND);
     if (cull_enabled) glEnable(GL_CULL_FACE); else glDisable(GL_CULL_FACE);
+    glDepthFunc(static_cast<GLenum>(old_depth_func));
+    glDepthMask(old_depth_mask);
     if (depth_enabled) glEnable(GL_DEPTH_TEST); else glDisable(GL_DEPTH_TEST);
     if (scissor_enabled) glEnable(GL_SCISSOR_TEST); else glDisable(GL_SCISSOR_TEST);
     glColorMask(old_color_mask[0], old_color_mask[1], old_color_mask[2], old_color_mask[3]);
@@ -1774,6 +2485,1010 @@ bool draw_projected_hand_triangles_gl(const std::vector<ProjectedHandTriangle>& 
     glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(old_texture0));
     g_gl_active_texture(static_cast<GLenum>(old_active_texture));
     return true;
+}
+
+bool valid_item_atlas_key(const HeldItemAtlasKey& key) {
+    return key.texture != 0 && key.offset_x >= 0 && key.offset_y >= 0 &&
+           key.atlas_width > 0 && key.atlas_height > 0 &&
+           key.offset_x < key.atlas_width && key.offset_y < key.atlas_height &&
+           key.index_count > 0;
+}
+
+bool read_item_atlas_patch(const HeldItemAtlasKey& key,
+                           uint32_t width,
+                           uint32_t height,
+                           int x_offset,
+                           int y_offset,
+                           std::vector<uint8_t>& rgba) {
+    if (!g_gl_get_texture_sub_image || width == 0 || height == 0 ||
+        x_offset < 0 ||
+        x_offset + static_cast<int>(width) > key.atlas_width ||
+        y_offset < 0 || y_offset + static_cast<int>(height) > key.atlas_height) {
+        return false;
+    }
+    const size_t byte_count =
+        static_cast<size_t>(width) * static_cast<size_t>(height) * 4;
+    if (byte_count > static_cast<size_t>((std::numeric_limits<GLsizei>::max)())) {
+        return false;
+    }
+    rgba.resize(byte_count);
+    g_gl_get_texture_sub_image(
+        key.texture, 0, x_offset, y_offset, 0,
+        static_cast<GLsizei>(width), static_cast<GLsizei>(height), 1,
+        GL_RGBA, GL_UNSIGNED_BYTE, static_cast<GLsizei>(byte_count), rgba.data());
+    return true;
+}
+
+bool match_held_item_definition(const HeldItemAtlasKey& key,
+                                const hytalevr::VrItemAssetCatalog& catalog,
+                                size_t& definition_index,
+                                double& score,
+                                bool& exact_match,
+                                double& score_margin) {
+    definition_index = (std::numeric_limits<size_t>::max)();
+    exact_match = false;
+    score_margin = (std::numeric_limits<double>::infinity)();
+    if (!valid_item_atlas_key(key) || !g_gl_get_texture_sub_image) {
+        item_diagnostic_log_once(
+            16u, g_gl_get_texture_sub_image
+                     ? "atlas key is invalid"
+                     : "glGetTextureSubImage is unavailable");
+        return false;
+    }
+    score = (std::numeric_limits<double>::infinity)();
+    double best_rank = (std::numeric_limits<double>::infinity)();
+    double second_best_rank = (std::numeric_limits<double>::infinity)();
+    size_t best_definition = 0;
+    bool found = false;
+    bool alpha_match_found = false;
+    double alpha_match_score =
+        (std::numeric_limits<double>::infinity)();
+    double alpha_match_rank =
+        (std::numeric_limits<double>::infinity)();
+    double alpha_second_rank =
+        (std::numeric_limits<double>::infinity)();
+    size_t alpha_match_definition = 0;
+
+    const int observed_span_x =
+        (std::max)(0, key.uv_max_x - key.uv_min_x);
+    const int observed_span_y =
+        (std::max)(0, key.uv_max_y - key.uv_min_y);
+    const auto structural_score =
+        [&](const hytalevr::VrItemAssetDefinition& definition) {
+            const int expected_span_x =
+                (std::max)(0, definition.uv_max_x - definition.uv_min_x);
+            const int expected_span_y =
+                (std::max)(0, definition.uv_max_y - definition.uv_min_y);
+            double value = 0.0;
+            if (observed_span_x > 0 && expected_span_x > 0) {
+                value += std::abs(observed_span_x - expected_span_x) * 4.0;
+            }
+            if (observed_span_y > 0 && expected_span_y > 0) {
+                value += std::abs(observed_span_y - expected_span_y) * 4.0;
+            }
+            if (key.index_count > 0 && definition.expected_vertex_count > 0) {
+                value += std::abs(
+                    key.index_count -
+                    static_cast<int>(definition.expected_vertex_count)) * 0.20;
+            }
+            value -= static_cast<double>(definition.preference) * 0.001;
+            return value;
+        };
+    const auto structurally_compatible =
+        [&](const hytalevr::VrItemAssetDefinition& definition) {
+            const int expected_span_x =
+                (std::max)(0, definition.uv_max_x - definition.uv_min_x);
+            const int expected_span_y =
+                (std::max)(0, definition.uv_max_y - definition.uv_min_y);
+            if (observed_span_x > 0 && expected_span_x > 0 &&
+                std::abs(observed_span_x - expected_span_x) >
+                    (std::max)(4, observed_span_x / 8)) {
+                return false;
+            }
+            if (observed_span_y > 0 && expected_span_y > 0 &&
+                std::abs(observed_span_y - expected_span_y) >
+                    (std::max)(4, observed_span_y / 8)) {
+                return false;
+            }
+            if (key.index_count > 0 && definition.expected_vertex_count > 0 &&
+                std::abs(
+                    key.index_count -
+                    static_cast<int>(definition.expected_vertex_count)) >
+                    (std::max)(48, key.index_count / 3)) {
+                return false;
+            }
+            return true;
+        };
+
+    struct CandidateSelection {
+        const hytalevr::VrItemTextureCandidate* candidate = nullptr;
+        size_t definition = 0;
+        double structure = 0.0;
+    };
+    std::vector<CandidateSelection> selections;
+    const auto select_candidates = [&](bool strict) {
+        selections.clear();
+        for (const hytalevr::VrItemTextureCandidate& candidate :
+             catalog.texture_candidates) {
+            size_t selected_definition =
+                (std::numeric_limits<size_t>::max)();
+            double selected_score =
+                (std::numeric_limits<double>::infinity)();
+            for (size_t candidate_definition :
+                 candidate.definition_indices) {
+                if (candidate_definition >= catalog.definitions.size()) continue;
+                const hytalevr::VrItemAssetDefinition& definition =
+                    catalog.definitions[candidate_definition];
+                if (strict && !structurally_compatible(definition)) continue;
+                const double candidate_score =
+                    structural_score(definition);
+                if (candidate_score < selected_score) {
+                    selected_score = candidate_score;
+                    selected_definition = candidate_definition;
+                }
+            }
+            if (selected_definition < catalog.definitions.size()) {
+                selections.push_back({
+                    &candidate, selected_definition, selected_score});
+            }
+        }
+    };
+    select_candidates(true);
+    if (selections.empty()) select_candidates(false);
+    // Exact matches can return immediately. Trying the closest mesh/UV layouts
+    // first avoids hundreds of synchronous atlas readbacks for common items.
+    std::stable_sort(
+        selections.begin(), selections.end(),
+        [](const CandidateSelection& left, const CandidateSelection& right) {
+            return left.structure < right.structure;
+        });
+
+    struct PatchKey {
+        int x = 0;
+        int y = 0;
+        uint32_t width = 0;
+        uint32_t height = 0;
+
+        bool operator==(const PatchKey& other) const {
+            return x == other.x && y == other.y &&
+                   width == other.width && height == other.height;
+        }
+    };
+    struct PatchKeyHash {
+        size_t operator()(const PatchKey& value) const {
+            size_t hash = static_cast<size_t>(
+                static_cast<uint32_t>(value.x));
+            hash ^= static_cast<size_t>(
+                static_cast<uint32_t>(value.y)) << 1;
+            hash ^= static_cast<size_t>(value.width) << 32;
+            hash ^= static_cast<size_t>(value.height) << 17;
+            return hash;
+        }
+    };
+    std::unordered_map<PatchKey, std::vector<uint8_t>, PatchKeyHash>
+        patch_cache;
+
+    for (const CandidateSelection& selection : selections) {
+        const hytalevr::VrItemTextureCandidate& candidate =
+            *selection.candidate;
+        const hytalevr::VrItemAssetDefinition& definition =
+            catalog.definitions[selection.definition];
+        const uint32_t width = candidate.width;
+        const uint32_t height = candidate.height;
+        const int x_offset = key.offset_x - definition.uv_min_x;
+        const int direct_y_offset = key.offset_y - definition.uv_min_y;
+        if (x_offset < 0 ||
+            x_offset + static_cast<int>(width) > key.atlas_width ||
+            static_cast<int>(height) > key.atlas_height) {
+            continue;
+        }
+        const std::array<int, 2> y_offsets{
+            key.atlas_height - direct_y_offset - static_cast<int>(height),
+            direct_y_offset};
+        for (int location = 0; location < 2; ++location) {
+            if (location == 1 && y_offsets[1] == y_offsets[0]) continue;
+            const PatchKey patch_key{
+                x_offset, y_offsets[location], width, height};
+            auto patch_it = patch_cache.find(patch_key);
+            if (patch_it == patch_cache.end()) {
+                std::vector<uint8_t> patch;
+                if (!read_item_atlas_patch(
+                        key, width, height, x_offset,
+                        y_offsets[location], patch)) {
+                    continue;
+                }
+                patch_it = patch_cache.emplace(
+                    patch_key, std::move(patch)).first;
+            }
+            const std::vector<uint8_t>& patch = patch_it->second;
+            const size_t stride = static_cast<size_t>(width) * 4;
+            const uint64_t fingerprint = hytalevr::vr_item_texture_fingerprint(
+                patch.data(), width, height, stride, false);
+            const uint64_t alpha_fingerprint =
+                hytalevr::vr_item_alpha_fingerprint(
+                    patch.data(), width, height, stride, false);
+
+            if (fingerprint == candidate.fingerprint ||
+                fingerprint == candidate.flipped_fingerprint) {
+                definition_index = selection.definition;
+                score = 0.0;
+                exact_match = true;
+                return true;
+            }
+
+            const double normal = hytalevr::vr_item_texture_difference(
+                patch.data(), stride, false, candidate);
+            const double flipped = hytalevr::vr_item_texture_difference(
+                patch.data(), stride, true, candidate);
+            const double difference = (std::min)(normal, flipped);
+            const double rank =
+                difference +
+                std::clamp(selection.structure, 0.0, 256.0) * 0.12;
+            if (alpha_fingerprint == candidate.alpha_fingerprint ||
+                alpha_fingerprint == candidate.flipped_alpha_fingerprint) {
+                if (rank < alpha_match_rank) {
+                    alpha_second_rank = alpha_match_rank;
+                    alpha_match_rank = rank;
+                    alpha_match_score = difference;
+                    alpha_match_definition = selection.definition;
+                    alpha_match_found = true;
+                } else if (rank < alpha_second_rank) {
+                    alpha_second_rank = rank;
+                }
+            }
+            if (rank < best_rank) {
+                second_best_rank = best_rank;
+                best_rank = rank;
+                score = difference;
+                best_definition = selection.definition;
+                found = true;
+            } else if (rank < second_best_rank) {
+                second_best_rank = rank;
+            }
+        }
+    }
+    if (alpha_match_found) {
+        definition_index = alpha_match_definition;
+        score = alpha_match_score;
+        score_margin = alpha_second_rank - alpha_match_rank;
+        const bool separated =
+            !std::isfinite(alpha_second_rank) || score <= 12.0 ||
+            score_margin >= 1.0;
+        return score <= 64.0 && separated;
+    }
+    if (!found) return false;
+    definition_index = best_definition;
+    score_margin = second_best_rank - best_rank;
+    const bool separated =
+        !std::isfinite(second_best_rank) || score <= 8.0 ||
+        score_margin >= 1.0;
+    return score <= 32.0 && separated;
+}
+
+bool capture_held_item_region(const HeldItemAtlasKey& key,
+                              CapturedHeldItemRegion& region,
+                              std::string& error) {
+    region = {};
+    const int observed_width =
+        (std::max)(1, key.uv_max_x - key.uv_min_x);
+    const int observed_height =
+        (std::max)(1, key.uv_max_y - key.uv_min_y);
+    const uint32_t width = static_cast<uint32_t>(
+        std::clamp(observed_width, 1, 512));
+    const uint32_t height = static_cast<uint32_t>(
+        std::clamp(observed_height, 1, 512));
+    if (key.offset_x < 0 ||
+        key.offset_x + static_cast<int>(width) > key.atlas_width) {
+        error = "captured item UV region is outside the atlas";
+        return false;
+    }
+
+    const std::array<int, 2> y_offsets{
+        key.atlas_height - key.offset_y - static_cast<int>(height),
+        key.offset_y};
+    std::vector<uint8_t> best_patch;
+    uint64_t best_coverage = 0;
+    for (int location = 0; location < 2; ++location) {
+        if (location == 1 && y_offsets[1] == y_offsets[0]) continue;
+        std::vector<uint8_t> patch;
+        if (!read_item_atlas_patch(
+                key, width, height, key.offset_x,
+                y_offsets[location], patch)) {
+            continue;
+        }
+        uint64_t coverage = 0;
+        for (size_t pixel = 0; pixel + 3 < patch.size(); pixel += 4) {
+            coverage += patch[pixel + 3];
+        }
+        if (best_patch.empty() || coverage > best_coverage) {
+            best_coverage = coverage;
+            best_patch = std::move(patch);
+        }
+    }
+    if (best_patch.empty() || best_coverage == 0) {
+        error = "captured item atlas region is empty";
+        return false;
+    }
+    region.width = width;
+    region.height = height;
+    region.rgba = std::move(best_patch);
+    const size_t stride = static_cast<size_t>(width) * 4;
+    const uint64_t normal = hytalevr::vr_item_texture_fingerprint(
+        region.rgba.data(), width, height, stride, false);
+    const uint64_t flipped = hytalevr::vr_item_texture_fingerprint(
+        region.rgba.data(), width, height, stride, true);
+    region.signature = normal == 0
+        ? flipped
+        : (flipped == 0 ? normal : (std::min)(normal, flipped));
+    return region.signature != 0;
+}
+
+HeldItemCacheKey held_item_cache_key(
+        const HeldItemAtlasKey& key,
+        const CapturedHeldItemRegion& region) {
+    return {
+        region.signature,
+        key.index_count,
+        (std::max)(0, key.uv_max_x - key.uv_min_x),
+        (std::max)(0, key.uv_max_y - key.uv_min_y)};
+}
+
+bool confirm_held_item_detection(int side,
+                                 const HeldItemCacheKey& identity,
+                                 size_t definition_index,
+                                 bool fallback,
+                                 bool exact_match,
+                                 LONG frame) {
+    if (side < 0 || side > 1) return false;
+    PendingHeldItemDetection& pending = g_pending_item_detections[side];
+    if (exact_match) {
+        pending = {};
+        return true;
+    }
+
+    const bool consecutive =
+        pending.identity_valid &&
+        pending.identity == identity &&
+        pending.definition_index == definition_index &&
+        pending.fallback == fallback &&
+        pending.last_frame >= 0 &&
+        frame > pending.last_frame &&
+        frame - pending.last_frame <= 12;
+    if (!consecutive) {
+        pending = {};
+        pending.identity = identity;
+        pending.identity_valid = true;
+        pending.definition_index = definition_index;
+        pending.fallback = fallback;
+        pending.confirmations = 1;
+    } else {
+        ++pending.confirmations;
+    }
+    pending.last_frame = frame;
+    if (pending.confirmations < 2) return false;
+    pending = {};
+    return true;
+}
+
+bool load_captured_item_fallback(const CapturedHeldItemRegion& region,
+                                 LoadedVrItemState& state,
+                                 std::string& error) {
+    if (region.rgba.empty() || region.width == 0 || region.height == 0) {
+        error = "captured item region is unavailable";
+        return false;
+    }
+    state.definition_index = (std::numeric_limits<size_t>::max)();
+    return hytalevr::build_vr_item_fallback_cube(
+        region.rgba, region.width, region.height, state.asset, error);
+}
+
+void cache_loaded_held_item(const HeldItemCacheKey& key,
+                            const LoadedVrItemState& state) {
+    if (key.texture_signature == 0 || !state.asset_ready) {
+        return;
+    }
+    CachedHeldItemAsset cached{};
+    cached.definition_index = state.definition_index;
+    cached.asset = state.asset;
+    cached.last_used = ++g_held_item_cache_sequence;
+    g_held_item_asset_cache[key] = std::move(cached);
+    constexpr size_t kMaximumCachedItems = 64;
+    if (g_held_item_asset_cache.size() <= kMaximumCachedItems) return;
+
+    auto oldest = g_held_item_asset_cache.end();
+    for (auto it = g_held_item_asset_cache.begin();
+         it != g_held_item_asset_cache.end(); ++it) {
+        if (oldest == g_held_item_asset_cache.end() ||
+            it->second.last_used < oldest->second.last_used) {
+            oldest = it;
+        }
+    }
+    if (oldest != g_held_item_asset_cache.end()) {
+        g_held_item_asset_cache.erase(oldest);
+    }
+}
+
+bool upload_held_item_texture(LoadedVrItemState& state) {
+    if (state.asset.texture_rgba.empty() ||
+        state.asset.texture_width == 0 || state.asset.texture_height == 0 ||
+        !ensure_hand_gl_renderer()) {
+        return false;
+    }
+    GLint old_active_texture = GL_TEXTURE0_VALUE;
+    GLint old_texture = 0;
+    GLint old_unpack = 4;
+    glGetIntegerv(GL_ACTIVE_TEXTURE_VALUE, &old_active_texture);
+    g_gl_active_texture(GL_TEXTURE0_VALUE);
+    glGetIntegerv(GL_TEXTURE_BINDING_2D, &old_texture);
+    glGetIntegerv(GL_UNPACK_ALIGNMENT_VALUE, &old_unpack);
+    if (state.texture_gl) glDeleteTextures(1, &state.texture_gl);
+    glGenTextures(1, &state.texture_gl);
+    glBindTexture(GL_TEXTURE_2D, state.texture_gl);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE_VALUE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE_VALUE);
+    glPixelStorei(GL_UNPACK_ALIGNMENT_VALUE, 1);
+    glTexImage2D(
+        GL_TEXTURE_2D, 0, GL_RGBA,
+        static_cast<GLsizei>(state.asset.texture_width),
+        static_cast<GLsizei>(state.asset.texture_height), 0,
+        GL_RGBA, GL_UNSIGNED_BYTE, state.asset.texture_rgba.data());
+    glPixelStorei(GL_UNPACK_ALIGNMENT_VALUE, old_unpack);
+    glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(old_texture));
+    g_gl_active_texture(static_cast<GLenum>(old_active_texture));
+    return state.texture_gl != 0;
+}
+
+bool ensure_torch_flame_texture() {
+    if (g_torch_flame_texture_gl != 0) return true;
+    if (g_torch_flame_texture_attempted ||
+        g_item_catalog_state.load(std::memory_order_acquire) != 2 ||
+        !ensure_hand_gl_renderer()) {
+        return false;
+    }
+
+    std::shared_ptr<hytalevr::VrItemAssetCatalog> catalog;
+    {
+        std::lock_guard<std::mutex> lock(g_item_catalog_mutex);
+        catalog = g_item_catalog;
+    }
+    if (!catalog) return false;
+
+    g_torch_flame_texture_attempted = true;
+    std::vector<uint8_t> rgba;
+    std::string error;
+    if (!hytalevr::load_vr_asset_texture(
+            *catalog,
+            "Common/Particles/Textures/Fire/Fire_Center_Erosion32.png",
+            g_torch_flame_texture_width, g_torch_flame_texture_height,
+            rgba, error) ||
+        g_torch_flame_texture_width < 2 ||
+        g_torch_flame_texture_height < 2) {
+        render_log("torch flame: texture load failed: " + error);
+        return false;
+    }
+
+    GLint old_active_texture = GL_TEXTURE0_VALUE;
+    GLint old_texture = 0;
+    GLint old_unpack = 4;
+    glGetIntegerv(GL_ACTIVE_TEXTURE_VALUE, &old_active_texture);
+    g_gl_active_texture(GL_TEXTURE0_VALUE);
+    glGetIntegerv(GL_TEXTURE_BINDING_2D, &old_texture);
+    glGetIntegerv(GL_UNPACK_ALIGNMENT_VALUE, &old_unpack);
+    glGenTextures(1, &g_torch_flame_texture_gl);
+    glBindTexture(GL_TEXTURE_2D, g_torch_flame_texture_gl);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE_VALUE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE_VALUE);
+    glPixelStorei(GL_UNPACK_ALIGNMENT_VALUE, 1);
+    glTexImage2D(
+        GL_TEXTURE_2D, 0, GL_RGBA,
+        static_cast<GLsizei>(g_torch_flame_texture_width),
+        static_cast<GLsizei>(g_torch_flame_texture_height), 0,
+        GL_RGBA, GL_UNSIGNED_BYTE, rgba.data());
+    glPixelStorei(GL_UNPACK_ALIGNMENT_VALUE, old_unpack);
+    glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(old_texture));
+    g_gl_active_texture(static_cast<GLenum>(old_active_texture));
+    if (g_torch_flame_texture_gl != 0) {
+        render_log(
+            "torch flame: Hytale particle texture loaded " +
+            std::to_string(g_torch_flame_texture_width) + "x" +
+            std::to_string(g_torch_flame_texture_height));
+    }
+    return g_torch_flame_texture_gl != 0;
+}
+
+void update_held_item_assets(const HeldItemAtlasSnapshot& snapshot) {
+    ensure_item_catalog_loading();
+    if (!snapshot.valid || snapshot.frame == g_last_item_detection_frame ||
+        g_item_catalog_state.load() != 2) {
+        return;
+    }
+    g_last_item_detection_frame = snapshot.frame;
+    const ULONGLONG now = GetTickCount64();
+    std::shared_ptr<hytalevr::VrItemAssetCatalog> catalog;
+    {
+        std::lock_guard<std::mutex> lock(g_item_catalog_mutex);
+        catalog = g_item_catalog;
+    }
+    if (!catalog) return;
+
+    for (int side = 0; side < 2; ++side) {
+        if (now < g_held_item_detection_hold_until[side].load(
+                      std::memory_order_relaxed) ||
+            now < g_held_item_suppressed_until[side].load(
+                      std::memory_order_relaxed)) {
+            continue;
+        }
+        if ((snapshot.valid_mask & (1L << side)) == 0) continue;
+        const HeldItemAtlasKey& key = snapshot.keys[side];
+        if (!valid_item_atlas_key(key)) continue;
+        LoadedVrItemState& current_state = g_loaded_items[side];
+        if (current_state.asset_ready && current_state.key_valid &&
+            current_state.key == key) {
+            // Texture id, atlas position, VAO, index count and UV bounds form
+            // the draw identity. Re-reading unchanged GPU data every 30 frames
+            // caused the regular render-thread freezes seen in VR.
+            current_state.last_verified_frame = snapshot.frame;
+            g_pending_item_detections[side] = {};
+            continue;
+        }
+
+        CapturedHeldItemRegion captured_region;
+        std::string capture_error;
+        const bool captured = capture_held_item_region(
+            key, captured_region, capture_error);
+        HeldItemCacheKey cache_key{};
+        if (captured) {
+            cache_key = held_item_cache_key(key, captured_region);
+            if (current_state.asset_ready && current_state.identity_valid &&
+                current_state.identity == cache_key) {
+                current_state.key = key;
+                current_state.key_valid = true;
+                current_state.last_verified_frame = snapshot.frame;
+                g_pending_item_detections[side] = {};
+                continue;
+            }
+            const auto cached = g_held_item_asset_cache.find(cache_key);
+            if (cached != g_held_item_asset_cache.end()) {
+                LoadedVrItemState restored{};
+                restored.key = key;
+                restored.identity = cache_key;
+                restored.key_valid = true;
+                restored.identity_valid = true;
+                restored.definition_index = cached->second.definition_index;
+                restored.last_verified_frame = snapshot.frame;
+                restored.asset = cached->second.asset;
+                cached->second.last_used = ++g_held_item_cache_sequence;
+                if (upload_held_item_texture(restored)) {
+                    restored.asset_ready = true;
+                    if (current_state.texture_gl) {
+                        glDeleteTextures(1, &current_state.texture_gl);
+                    }
+                    current_state = std::move(restored);
+                    g_pending_item_detections[side] = {};
+                    render_log(
+                        "held item: cache restored side=" +
+                        std::to_string(side) + " id=" +
+                        current_state.asset.definition.id);
+                    continue;
+                }
+            }
+        }
+
+        LoadedVrItemState next_state{};
+        next_state.key = key;
+        next_state.key_valid = true;
+        next_state.last_verified_frame = snapshot.frame;
+        if (captured) {
+            next_state.identity = cache_key;
+            next_state.identity_valid = true;
+        }
+
+        size_t definition_index = 0;
+        double score = 0.0;
+        bool exact_match = false;
+        double score_margin = 0.0;
+        const bool matched = match_held_item_definition(
+            key, *catalog, definition_index, score, exact_match, score_margin);
+        const bool fallback = !matched;
+        const size_t confirmed_definition = matched
+            ? definition_index
+            : (std::numeric_limits<size_t>::max)();
+        if (!captured && !exact_match) {
+            render_log(
+                "held item: capture failed side=" + std::to_string(side) +
+                " reason=" + capture_error);
+            continue;
+        }
+        if (captured &&
+            !confirm_held_item_detection(
+                side, cache_key, confirmed_definition, fallback,
+                exact_match, snapshot.frame)) {
+            continue;
+        }
+
+        if (!matched) {
+            std::ostringstream out;
+            out << "held item: atlas match failed side=" << side
+                << " offset=" << key.offset_x << "," << key.offset_y
+                << " atlas=" << key.atlas_width << "x" << key.atlas_height
+                << " bestScore=" << std::fixed << std::setprecision(2) << score
+                << " margin=" << score_margin;
+            if (definition_index < catalog->definitions.size()) {
+                out << " bestId=" << catalog->definitions[definition_index].id;
+            }
+            render_log(out.str());
+            item_diagnostic_log_once(32u << side, out.str());
+            std::string fallback_error;
+            if (!captured ||
+                !load_captured_item_fallback(
+                    captured_region, next_state, fallback_error)) {
+                render_log(
+                    "held item: captured fallback failed: " +
+                    (captured ? fallback_error : capture_error));
+                continue;
+            }
+        } else {
+            if (current_state.asset_ready &&
+                current_state.definition_index == definition_index) {
+                current_state.key = key;
+                current_state.key_valid = true;
+                current_state.last_verified_frame = snapshot.frame;
+                if (captured) {
+                    current_state.identity = cache_key;
+                    current_state.identity_valid = true;
+                    cache_loaded_held_item(cache_key, current_state);
+                }
+                continue;
+            }
+            std::string error;
+            next_state.definition_index = definition_index;
+            if (!hytalevr::load_vr_item_render_asset(
+                    *catalog, definition_index, next_state.asset, error)) {
+                render_log("held item: asset load failed: " + error);
+                if (!captured ||
+                    !load_captured_item_fallback(
+                        captured_region, next_state, error)) {
+                    render_log(
+                        "held item: captured fallback failed: " +
+                        (captured ? error : capture_error));
+                    continue;
+                }
+            }
+        }
+        if (!upload_held_item_texture(next_state)) {
+            render_log("held item: OpenGL texture upload failed");
+            continue;
+        }
+        next_state.asset_ready = true;
+        if (captured) cache_loaded_held_item(cache_key, next_state);
+        if (current_state.texture_gl) {
+            glDeleteTextures(1, &current_state.texture_gl);
+        }
+        current_state = std::move(next_state);
+        std::ostringstream out;
+        out << "held item: matched side=" << side
+            << " id=" << current_state.asset.definition.id
+            << " score=" << std::fixed << std::setprecision(2) << score
+            << " margin=" << score_margin
+            << " exact=" << (exact_match ? 1 : 0)
+            << " vertices=" << current_state.asset.vertices.size();
+        render_log(out.str());
+        item_diagnostic_log_once(128u << side, out.str());
+    }
+}
+
+Vec3 transform_item_local_point(float x, float y, float z,
+                                const float controller[12],
+                                bool right_hand,
+                                const VrCameraControls& controls) {
+    const float world_scale = validated_world_scale(controls);
+    const float scale =
+        (1.0f / 64.0f) * std::clamp(controls.held_item_scale, 0.10f, 2.0f) *
+        world_scale;
+    const float local_right =
+        x * scale * (right_hand ? 1.0f : -1.0f) +
+        std::clamp(controls.held_item_offset_x, -0.30f, 0.30f) * world_scale;
+    const float local_up =
+        z * scale +
+        std::clamp(controls.held_item_offset_y, -0.30f, 0.30f) * world_scale;
+    const float local_forward =
+        y * scale -
+        std::clamp(controls.held_item_offset_z, -0.30f, 0.30f) * world_scale;
+
+    Vec3 world{};
+    for (int row = 0; row < 3; ++row) {
+        const float right = controller[row * 4 + 0];
+        const float up = controller[row * 4 + 1];
+        const float forward = -controller[row * 4 + 2];
+        (&world.x)[row] = controller[row * 4 + 3] +
+            right * local_right + up * local_up + forward * local_forward;
+    }
+    return world;
+}
+
+Vec3 transform_item_vertex(const hytalevr::VrItemVertex& vertex,
+                           const float controller[12],
+                           bool right_hand,
+                           const VrCameraControls& controls) {
+    return transform_item_local_point(
+        vertex.x, vertex.y, vertex.z, controller, right_hand, controls);
+}
+
+Vec3 transform_item_normal(const hytalevr::VrItemVertex& vertex,
+                           const float controller[12],
+                           bool right_hand) {
+    const float local_right = vertex.nx * (right_hand ? 1.0f : -1.0f);
+    const float local_up = vertex.nz;
+    const float local_forward = vertex.ny;
+    Vec3 world{};
+    for (int row = 0; row < 3; ++row) {
+        const float right = controller[row * 4 + 0];
+        const float up = controller[row * 4 + 1];
+        const float forward = -controller[row * 4 + 2];
+        (&world.x)[row] =
+            right * local_right + up * local_up + forward * local_forward;
+    }
+    const float length =
+        std::sqrt(world.x * world.x + world.y * world.y + world.z * world.z);
+    if (length > 0.0001f) {
+        world.x /= length;
+        world.y /= length;
+        world.z /= length;
+    }
+    return world;
+}
+
+void draw_vr_torch_flame(int eye, int width, int height,
+                         const float hmd[12],
+                         const float controller[12],
+                         bool right_hand,
+                         const VrCameraControls& controls,
+                         const hytalevr::VrItemRenderAsset& asset) {
+    if (!asset.needs_flame_effect || !asset.flame_anchor.valid ||
+        !hytalevr::vr_item_id_is_torch(asset.definition.id) ||
+        !ensure_torch_flame_texture()) {
+        return;
+    }
+
+    Vec3 anchor = transform_item_local_point(
+        asset.flame_anchor.x, asset.flame_anchor.y, asset.flame_anchor.z,
+        controller, right_hand, controls);
+    Vec3 billboard_right{hmd[0], hmd[4], hmd[8]};
+    const float right_length = std::sqrt(
+        billboard_right.x * billboard_right.x +
+        billboard_right.y * billboard_right.y +
+        billboard_right.z * billboard_right.z);
+    if (right_length <= 0.0001f) return;
+    billboard_right.x /= right_length;
+    billboard_right.y /= right_length;
+    billboard_right.z /= right_length;
+
+    const float model_scale =
+        (1.0f / 64.0f) *
+        std::clamp(controls.held_item_scale, 0.10f, 2.0f) *
+        validated_world_scale(controls);
+    const float phase = static_cast<float>(
+        (GetTickCount64() % 1000ull) * (6.28318530717958647692 / 1000.0));
+    const float flame_width = 16.0f * model_scale *
+        (0.94f + 0.06f * std::sin(phase * 1.7f));
+    const float flame_height = 24.0f * model_scale *
+        (0.96f + 0.04f * std::sin(phase * 1.3f + 0.7f));
+    const float sway = std::sin(phase) * 1.2f * model_scale;
+    anchor.x += billboard_right.x * sway;
+    anchor.y += 0.5f * model_scale;
+    anchor.z += billboard_right.z * sway;
+
+    const Vec3 world_up{0.0f, 1.0f, 0.0f};
+    const float half_width = flame_width * 0.5f;
+    const Vec3 corners[4]{
+        {anchor.x - billboard_right.x * half_width,
+         anchor.y - billboard_right.y * half_width,
+         anchor.z - billboard_right.z * half_width},
+        {anchor.x + billboard_right.x * half_width,
+         anchor.y + billboard_right.y * half_width,
+         anchor.z + billboard_right.z * half_width},
+        {anchor.x + billboard_right.x * half_width + world_up.x * flame_height,
+         anchor.y + billboard_right.y * half_width + world_up.y * flame_height,
+         anchor.z + billboard_right.z * half_width + world_up.z * flame_height},
+        {anchor.x - billboard_right.x * half_width + world_up.x * flame_height,
+         anchor.y - billboard_right.y * half_width + world_up.y * flame_height,
+         anchor.z - billboard_right.z * half_width + world_up.z * flame_height},
+    };
+
+    ProjectedHandVertex projected[4]{};
+    for (int corner = 0; corner < 4; ++corner) {
+        float ndc_x = 0.0f;
+        float ndc_y = 0.0f;
+        float depth = 0.0f;
+        if (!project_tracking_point_to_eye_ndc_raw(
+                eye, hmd, corners[corner], ndc_x, ndc_y, depth)) {
+            return;
+        }
+        projected[corner].x =
+            (ndc_x * 0.5f + 0.5f) * static_cast<float>(width);
+        projected[corner].y =
+            (ndc_y * 0.5f + 0.5f) * static_cast<float>(height);
+        projected[corner].depth = depth;
+        projected[corner].shade = 1.08f;
+    }
+
+    const int frame = static_cast<int>((GetTickCount64() / 90ull) % 4ull);
+    const float u0 = static_cast<float>(frame % 2) * 0.5f;
+    const float v0 = static_cast<float>(frame / 2) * 0.5f;
+    const float u1 = u0 + 0.5f;
+    const float v1 = v0 + 0.5f;
+    projected[0].u = u0;
+    projected[0].v = 1.0f - v1;
+    projected[1].u = u1;
+    projected[1].v = 1.0f - v1;
+    projected[2].u = u1;
+    projected[2].v = 1.0f - v0;
+    projected[3].u = u0;
+    projected[3].v = 1.0f - v0;
+
+    std::vector<ProjectedHandTriangle> triangles(2);
+    triangles[0].v[0] = projected[0];
+    triangles[0].v[1] = projected[1];
+    triangles[0].v[2] = projected[2];
+    triangles[1].v[0] = projected[0];
+    triangles[1].v[1] = projected[2];
+    triangles[1].v[2] = projected[3];
+    draw_projected_textured_triangles_gl(
+        triangles, width, height, eye, g_torch_flame_texture_gl,
+        controls.hand_depth_tolerance, true);
+}
+
+void draw_vr_item_models(int eye, int width, int height,
+                         const float hmd[12],
+                         const float controller_poses[2][12],
+                         const bool controller_valid[2],
+                         const VrCameraControls& controls) {
+    const HeldItemAtlasSnapshot snapshot = held_item_atlas_snapshot();
+    if (snapshot.valid) update_held_item_assets(snapshot);
+    const LONG presence_mask = held_item_presence_mask();
+    const ULONGLONG now = GetTickCount64();
+    const bool item_suppressed[2]{
+        now < g_held_item_suppressed_until[0].load(
+                  std::memory_order_relaxed),
+        now < g_held_item_suppressed_until[1].load(
+                  std::memory_order_relaxed)};
+    if (!g_right_trigger_pressed && !g_left_trigger_pressed &&
+        !item_suppressed[0] && !item_suppressed[1]) {
+        g_stable_held_item_presence_mask.store(
+            presence_mask, std::memory_order_relaxed);
+    }
+    const bool detection_held[2]{
+        now < g_held_item_detection_hold_until[0].load(
+                  std::memory_order_relaxed),
+        now < g_held_item_detection_hold_until[1].load(
+                  std::memory_order_relaxed)};
+    if (presence_mask == 0 && !detection_held[0] && !detection_held[1]) return;
+
+    const Vec3 eye_position{hmd[3], hmd[7], hmd[11]};
+    const Vec3 light{-0.25f, 0.55f, -0.80f};
+    static thread_local std::vector<ProjectedHandTriangle> triangles;
+    for (int hand = 0; hand < 2; ++hand) {
+        if (item_suppressed[hand]) {
+            continue;
+        }
+        if (!controller_valid[hand] ||
+            ((presence_mask & (1L << hand)) == 0 &&
+             !(detection_held[hand] && g_loaded_items[hand].asset_ready))) {
+            continue;
+        }
+        const LoadedVrItemState& state = g_loaded_items[hand];
+        if (!state.asset_ready || !state.key_valid || state.texture_gl == 0) {
+            continue;
+        }
+        if (hand == 0 &&
+            hytalevr::vr_item_id_is_shield(state.asset.definition.id)) {
+            const LoadedVrItemState& main_item = g_loaded_items[1];
+            const bool main_item_is_current =
+                !snapshot.valid ||
+                (snapshot.valid_mask & (1L << 1)) == 0 ||
+                (main_item.key_valid && main_item.key == snapshot.keys[1]);
+            const std::string_view main_item_id =
+                main_item.asset_ready && main_item_is_current
+                    ? std::string_view(main_item.asset.definition.id)
+                    : std::string_view();
+            if (!hytalevr::vr_item_shield_allowed_for_main_item(main_item_id)) {
+                continue;
+            }
+        }
+        const bool detection_pending =
+            g_pending_item_detections[hand].identity_valid;
+        if (snapshot.valid &&
+            (snapshot.valid_mask & (1L << hand)) != 0 &&
+            !(state.key == snapshot.keys[hand]) &&
+            !detection_held[hand] && !detection_pending) {
+            continue;
+        }
+
+        triangles.clear();
+        const size_t triangle_count = state.asset.vertices.size() / 3;
+        if (triangles.capacity() < triangle_count) {
+            triangles.reserve(triangle_count);
+        }
+        const float* controller = controller_poses[hand];
+        for (size_t index = 0;
+             index + 2 < state.asset.vertices.size();
+             index += 3) {
+            ProjectedHandTriangle triangle{};
+            bool valid = true;
+            Vec3 world_center{};
+            float shade_sum = 0.0f;
+            for (int corner = 0; corner < 3; ++corner) {
+                const hytalevr::VrItemVertex& source =
+                    state.asset.vertices[index + corner];
+                const Vec3 world = transform_item_vertex(
+                    source, controller, hand == 1, controls);
+                world_center.x += world.x;
+                world_center.y += world.y;
+                world_center.z += world.z;
+                float ndc_x = 0.0f;
+                float ndc_y = 0.0f;
+                float depth = 0.0f;
+                if (!project_tracking_point_to_eye_ndc_raw(
+                        eye, hmd, world, ndc_x, ndc_y, depth)) {
+                    valid = false;
+                    break;
+                }
+                const Vec3 normal = transform_item_normal(
+                    source, controller, hand == 1);
+                const float lit = std::clamp(
+                    normal.x * light.x + normal.y * light.y + normal.z * light.z,
+                    -1.0f, 1.0f);
+                const float shade =
+                    std::clamp(lit * 0.20f + 0.82f, 0.58f, 1.0f);
+                triangle.v[corner].x =
+                    (ndc_x * 0.5f + 0.5f) * static_cast<float>(width);
+                triangle.v[corner].y =
+                    (ndc_y * 0.5f + 0.5f) * static_cast<float>(height);
+                triangle.v[corner].depth = depth;
+                triangle.v[corner].shade = shade;
+                triangle.v[corner].u = source.u;
+                // The shared hand shader flips OBJ UVs. Cancel that flip for
+                // BlockyModel layouts, whose offsets use image-space Y.
+                triangle.v[corner].v = 1.0f - source.v;
+                shade_sum += shade;
+            }
+            if (!valid) continue;
+            const float area =
+                (triangle.v[1].x - triangle.v[0].x) *
+                    (triangle.v[2].y - triangle.v[0].y) -
+                (triangle.v[1].y - triangle.v[0].y) *
+                    (triangle.v[2].x - triangle.v[0].x);
+            if (!std::isfinite(area) || std::fabs(area) < 0.25f) continue;
+            world_center.x /= 3.0f;
+            world_center.y /= 3.0f;
+            world_center.z /= 3.0f;
+            const Vec3 eye_to_center{
+                world_center.x - eye_position.x,
+                world_center.y - eye_position.y,
+                world_center.z - eye_position.z};
+            triangle.depth =
+                eye_to_center.x * eye_to_center.x +
+                eye_to_center.y * eye_to_center.y +
+                eye_to_center.z * eye_to_center.z;
+            triangle.shade = shade_sum / 3.0f;
+            triangles.push_back(triangle);
+        }
+        std::sort(
+            triangles.begin(), triangles.end(),
+            [](const ProjectedHandTriangle& a, const ProjectedHandTriangle& b) {
+                return a.depth > b.depth;
+            });
+        draw_projected_textured_triangles_gl(
+            triangles, width, height, eye, state.texture_gl,
+            controls.hand_depth_tolerance);
+        draw_vr_torch_flame(
+            eye, width, height, hmd, controller, hand == 1,
+            controls, state.asset);
+    }
 }
 
 struct ModuleRange {
@@ -1895,6 +3610,88 @@ bool writable_memory_range(const void* address, size_t size) {
     return true;
 }
 
+bool matrix_is_finite_and_bounded(const Matrix4& matrix,
+                                  float absolute_limit = 100000000.0f) {
+    for (float value : matrix.value) {
+        if (!std::isfinite(value) || std::fabs(value) > absolute_limit) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool plausible_camera_view(const Matrix4& view) {
+    if (!matrix_is_finite_and_bounded(view) ||
+        std::fabs(view.value[15] - 1.0f) > 0.10f ||
+        std::fabs(view.value[3]) > 0.10f ||
+        std::fabs(view.value[7]) > 0.10f ||
+        std::fabs(view.value[11]) > 0.10f) {
+        return false;
+    }
+
+    const auto basis_length = [&](int offset) {
+        const float x = view.value[offset + 0];
+        const float y = view.value[offset + 1];
+        const float z = view.value[offset + 2];
+        return std::sqrt(x * x + y * y + z * z);
+    };
+    const float x_length = basis_length(0);
+    const float y_length = basis_length(4);
+    const float z_length = basis_length(8);
+    if (x_length < 0.50f || x_length > 1.50f ||
+        y_length < 0.50f || y_length > 1.50f ||
+        z_length < 0.50f || z_length > 1.50f) {
+        return false;
+    }
+
+    const auto normalized_dot = [&](int a, int b, float denominator) {
+        return (view.value[a + 0] * view.value[b + 0] +
+                view.value[a + 1] * view.value[b + 1] +
+                view.value[a + 2] * view.value[b + 2]) /
+               denominator;
+    };
+    return std::fabs(normalized_dot(0, 4, x_length * y_length)) < 0.25f &&
+           std::fabs(normalized_dot(0, 8, x_length * z_length)) < 0.25f &&
+           std::fabs(normalized_dot(4, 8, y_length * z_length)) < 0.25f;
+}
+
+bool plausible_camera_projection(const Matrix4& projection) {
+    if (!matrix_is_finite_and_bounded(projection, 100000.0f)) return false;
+    const float horizontal = std::fabs(projection.value[0]);
+    const float vertical = std::fabs(projection.value[5]);
+    const float perspective_term = std::fabs(projection.value[11]);
+    return horizontal >= 0.05f && horizontal <= 20.0f &&
+           vertical >= 0.05f && vertical <= 20.0f &&
+           perspective_term >= 0.50f && perspective_term <= 1.50f &&
+           std::fabs(projection.value[15]) <= 0.10f;
+}
+
+bool read_validated_camera_layout(unsigned char* camera,
+                                  Matrix4& view,
+                                  Matrix4& projection) {
+    if (!camera ||
+        !writable_memory_range(
+            camera + kCameraViewOffset, sizeof(Matrix4)) ||
+        !writable_memory_range(
+            camera + kCameraViewProjectionOffset, sizeof(Matrix4)) ||
+        !writable_memory_range(
+            camera + kCameraProjectionOffset, sizeof(Matrix4))) {
+        return false;
+    }
+
+    Matrix4 view_projection{};
+    std::memcpy(
+        &view, camera + kCameraViewOffset, sizeof(view));
+    std::memcpy(
+        &view_projection, camera + kCameraViewProjectionOffset,
+        sizeof(view_projection));
+    std::memcpy(
+        &projection, camera + kCameraProjectionOffset, sizeof(projection));
+    return plausible_camera_view(view) &&
+           plausible_camera_projection(projection) &&
+           matrix_is_finite_and_bounded(view_projection);
+}
+
 using HookSiteValidator = bool (*)(const unsigned char*);
 
 unsigned char* scan_unique_pattern(const ModuleRange& range, const char* name,
@@ -1994,6 +3791,8 @@ void reset_eye_capture_resources(const char* reason) {
     g_texture_height = 0;
     g_source_texture_width = 0;
     g_source_texture_height = 0;
+    InterlockedExchange(&g_engine_render_pass, 0);
+    InterlockedExchange(&g_engine_stereo_pair_ready, 0);
     InterlockedExchange(&g_render_eye, 0);
     AcquireSRWLockExclusive(&g_camera_lock);
     g_afw_camera_valid = false;
@@ -2011,10 +3810,13 @@ void reset_eye_capture_resources(const char* reason) {
 void emit8(unsigned char*& cursor, uint64_t value);
 bool restore_camera_hook();
 bool restore_interaction_hook();
+bool restore_engine_render_hook();
 bool restore_noesis_hooks();
 bool restore_swap_hook();
 bool restore_all_hooks(bool render_thread_cleanup);
 bool capture_eye(int eye, const VrCameraControls& controls, bool include_vr_overlays = true);
+bool capture_native_eye(int eye, const VrCameraControls& controls);
+bool apply_cached_engine_eye(int eye, const VrCameraControls& controls);
 
 class SuspendedProcessThreads {
 public:
@@ -2114,6 +3916,10 @@ bool read_controls(VrCameraControls& controls) {
         controls.hand_model_yaw_degrees = g_shared->hand_model_yaw_degrees;
         controls.hand_model_roll_degrees = g_shared->hand_model_roll_degrees;
         controls.hand_depth_tolerance = g_shared->hand_depth_tolerance;
+        controls.held_item_offset_x = g_shared->held_item_offset_x;
+        controls.held_item_offset_y = g_shared->held_item_offset_y;
+        controls.held_item_offset_z = g_shared->held_item_offset_z;
+        controls.held_item_scale = g_shared->held_item_scale;
         MemoryBarrier();
         const LONG after = InterlockedCompareExchange(
             reinterpret_cast<volatile LONG*>(&g_shared->control_sequence), 0, 0);
@@ -2145,7 +3951,7 @@ bool ensure_ui_scale_mapping() {
     if (g_ui_scale_shared) return true;
     g_ui_scale_mapping = CreateFileMappingW(
         INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, sizeof(UiScaleShared),
-        L"Local\\HytaleUIScaleSharedMemory");
+        hytalevr::kUiScaleMappingNameW);
     if (!g_ui_scale_mapping) return false;
     g_ui_scale_shared = static_cast<UiScaleShared*>(
         MapViewOfFile(g_ui_scale_mapping, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(UiScaleShared)));
@@ -2154,43 +3960,75 @@ bool ensure_ui_scale_mapping() {
         g_ui_scale_mapping = nullptr;
         return false;
     }
-    g_ui_scale_shared->uiScale = 1.0f;
-    g_ui_scale_shared->offsetX = 0.0f;
-    g_ui_scale_shared->offsetY = 0.0f;
-    g_ui_scale_shared->disableUboScaling = 0;
-    g_ui_scale_shared->disableShadows = 0;
-    g_ui_scale_shared->disableParticles = 0;
-    g_ui_scale_shared->disableDistortion = 0;
-    g_ui_scale_shared->hideFirstPerson = 0;
-    g_ui_scale_shared->menuVisibleCounter = 0;
-    g_ui_scale_shared->menuLargeDrawCounter = 0;
-    g_ui_scale_shared->menuTextureId = 0;
-    g_ui_scale_shared->menuTextureWidth = 0;
-    g_ui_scale_shared->menuTextureHeight = 0;
-    g_ui_scale_shared->menuTextureFrame = 0;
-    g_ui_scale_shared->menuCaptureError = 0;
-    g_ui_scale_shared->currentEye = 0;
-    g_ui_scale_shared->renderFrameSequence = 0;
-    g_ui_scale_shared->suppressMenuInGame = 0;
-    g_ui_scale_shared->menuIgnoreDrawThreshold = 1;
-    g_ui_scale_shared->firstPersonControllerReanchor = 0;
-    g_ui_scale_shared->firstPersonControllerPoseValid = 0;
-    g_ui_scale_shared->firstPersonHandNdcX = 0.0f;
-    g_ui_scale_shared->firstPersonHandNdcY = 0.0f;
-    g_ui_scale_shared->firstPersonHandDepth = 0.0f;
-    g_ui_scale_shared->firstPersonMatrixPatches = 0;
-    g_ui_scale_shared->sceneDepthTextureId = 0;
-    g_ui_scale_shared->sceneDepthTextureWidth = 0;
-    g_ui_scale_shared->sceneDepthTextureHeight = 0;
-    g_ui_scale_shared->sceneDepthTextureFrame = 0;
-    g_ui_scale_shared->sceneDepthFarClip = 1024.0f;
-    g_ui_scale_shared->distortionTextureId = 0;
-    g_ui_scale_shared->distortionTextureWidth = 0;
-    g_ui_scale_shared->distortionTextureHeight = 0;
-    g_ui_scale_shared->distortionTextureFrame = 0;
-    g_ui_scale_shared->vrSceneMatricesValid = 0;
-    g_ui_scale_shared->vrSceneMatrixSequence = 0;
+    if (!hytalevr::ui_scale_shared_data_compatible(*g_ui_scale_shared)) {
+        hytalevr::initialize_ui_scale_shared_data(*g_ui_scale_shared);
+    }
     return true;
+}
+
+void publish_held_item_poses(const VrCameraControls& controls) {
+    if (!g_ui_scale_shared) return;
+
+    const bool enabled = controls.enabled && controls.stereo_enabled &&
+                         controls.first_person_hand_hidden;
+    const float world_scale = validated_world_scale(controls);
+    float hmd[12]{};
+    float controllers[2][12]{};
+    bool hmd_valid = false;
+    bool controller_valid[2]{};
+    if (enabled) {
+        AcquireSRWLockShared(&g_pose_lock);
+        hmd_valid = g_hmd_current_valid;
+        if (hmd_valid) {
+            std::copy(std::begin(g_hmd_current_pose), std::end(g_hmd_current_pose),
+                      std::begin(hmd));
+            controller_valid[0] = g_left_controller_valid;
+            controller_valid[1] = g_right_controller_valid;
+            if (controller_valid[0]) {
+                std::copy(std::begin(g_left_controller_pose),
+                          std::end(g_left_controller_pose),
+                          std::begin(controllers[0]));
+            }
+            if (controller_valid[1]) {
+                std::copy(std::begin(g_right_controller_pose),
+                          std::end(g_right_controller_pose),
+                          std::begin(controllers[1]));
+            }
+        }
+        ReleaseSRWLockShared(&g_pose_lock);
+    }
+
+    float relative_poses[2][12]{};
+    LONG valid_mask = 0;
+    if (enabled && hmd_valid) {
+        for (int side = 0; side < 2; ++side) {
+            if (controller_valid[side] &&
+                hytalevr::controller_pose_relative_to_hmd(
+                    hmd, controllers[side], world_scale, relative_poses[side])) {
+                valid_mask |= 1L << side;
+            }
+        }
+    }
+
+    LONG sequence = InterlockedIncrement(&g_ui_scale_shared->heldItemPoseSequence);
+    if ((sequence & 1) == 0) {
+        InterlockedIncrement(&g_ui_scale_shared->heldItemPoseSequence);
+    }
+    g_ui_scale_shared->heldItemReanchorEnabled = enabled ? 1 : 0;
+    g_ui_scale_shared->heldItemWorldScale = world_scale;
+    g_ui_scale_shared->heldItemLocalOffset[0] =
+        std::clamp(controls.held_item_offset_x, -0.30f, 0.30f);
+    g_ui_scale_shared->heldItemLocalOffset[1] =
+        std::clamp(controls.held_item_offset_y, -0.30f, 0.30f);
+    g_ui_scale_shared->heldItemLocalOffset[2] =
+        std::clamp(controls.held_item_offset_z, -0.30f, 0.30f);
+    g_ui_scale_shared->heldItemVisualScale =
+        std::clamp(controls.held_item_scale, 0.10f, 2.0f);
+    std::memcpy(g_ui_scale_shared->heldItemControllerPoses, relative_poses,
+                sizeof(relative_poses));
+    InterlockedExchange(&g_ui_scale_shared->heldItemPoseValidMask, valid_mask);
+    MemoryBarrier();
+    InterlockedIncrement(&g_ui_scale_shared->heldItemPoseSequence);
 }
 
 void publish_ui_scale_for_eye(const VrCameraControls& controls, vr::EVREye eye) {
@@ -2218,9 +4056,10 @@ void publish_ui_scale_for_eye(const VrCameraControls& controls, vr::EVREye eye) 
     g_ui_scale_shared->suppressMenuInGame = menu_visible ? 1 : 0;
     g_ui_scale_shared->menuIgnoreDrawThreshold =
         static_cast<LONG>(std::clamp(controls.menu_ignore_draw_threshold, 0u, 20000u));
+    publish_held_item_poses(controls);
 
-    // Keep Hytale's camera-anchored first-person hand/item hidden in VR. The
-    // controller ray/actions remain active, but no replacement hand is drawn.
+    // Keep Hytale's camera-anchored first-person model hidden. The UI hook lets
+    // held-item draws through only after their model matrix was controller-anchored.
     g_ui_scale_shared->firstPersonControllerReanchor = 0;
     g_ui_scale_shared->firstPersonControllerPoseValid = 0;
     g_ui_scale_shared->firstPersonHandNdcX = 0.0f;
@@ -2255,6 +4094,7 @@ void publish_ui_scale_neutral() {
     g_ui_scale_shared->firstPersonHandNdcX = 0.0f;
     g_ui_scale_shared->firstPersonHandNdcY = 0.0f;
     g_ui_scale_shared->firstPersonHandDepth = 0.0f;
+    publish_held_item_poses(VrCameraControls{});
 }
 
 void publish_render_filters_only(const VrCameraControls& controls) {
@@ -2279,6 +4119,7 @@ void publish_render_filters_only(const VrCameraControls& controls) {
     g_ui_scale_shared->firstPersonHandNdcX = 0.0f;
     g_ui_scale_shared->firstPersonHandNdcY = 0.0f;
     g_ui_scale_shared->firstPersonHandDepth = 0.0f;
+    publish_held_item_poses(VrCameraControls{});
 }
 
 vr::EVREye current_camera_eye(const VrCameraControls& controls) {
@@ -2631,6 +4472,53 @@ void publish_vr_scene_matrices(const Matrix4& view,
     g_previous_vr_scene_view_projection_valid = true;
 }
 
+bool apply_cached_engine_eye(int eye, const VrCameraControls& controls) {
+    if (eye < 0 || eye > 1) return false;
+
+    void* camera_object = nullptr;
+    Matrix4 view{};
+    Matrix4 projection{};
+    bool valid = false;
+    AcquireSRWLockShared(&g_camera_lock);
+    camera_object = g_primary_camera;
+    valid = g_afw_camera_valid && camera_object != nullptr;
+    if (valid) {
+        view = g_afw_eye_view[eye];
+        projection = g_afw_eye_projection[eye];
+    }
+    ReleaseSRWLockShared(&g_camera_lock);
+    if (!valid) return false;
+
+    auto* camera = static_cast<unsigned char*>(camera_object);
+    Matrix4 observed_view{};
+    Matrix4 observed_projection{};
+    if (!read_validated_camera_layout(
+            camera, observed_view, observed_projection)) {
+        return false;
+    }
+
+    const Matrix4 view_projection = multiply(projection, view);
+    std::memcpy(
+        camera + kCameraViewOffset, &view, sizeof(view));
+    std::memcpy(
+        camera + kCameraViewProjectionOffset, &view_projection,
+        sizeof(view_projection));
+    std::memcpy(
+        camera + kCameraProjectionOffset, &projection, sizeof(projection));
+    publish_vr_scene_matrices(view, projection, view_projection);
+    publish_ui_scale_for_eye(
+        controls, eye == 0 ? vr::Eye_Left : vr::Eye_Right);
+
+    AcquireSRWLockExclusive(&g_camera_lock);
+    g_last_written_culling_view = view;
+    g_last_written_culling_object = camera_object;
+    g_last_written_culling_tick = GetTickCount64();
+    g_last_written_culling_view_valid = true;
+    ReleaseSRWLockExclusive(&g_camera_lock);
+    if (g_shared) g_shared->current_eye = static_cast<uint32_t>(eye);
+    return true;
+}
+
 void apply_vr_camera(void* object) {
     HookCallbackScope callback_scope;
     if (g_shared) {
@@ -2645,21 +4533,18 @@ void apply_vr_camera(void* object) {
     }
 
     auto* camera = static_cast<unsigned char*>(object);
-    constexpr size_t kMatrixSize = sizeof(Matrix4);
-    if (!writable_memory_range(camera + 0x2E0, kMatrixSize) ||
-        !writable_memory_range(camera + 0x320, kMatrixSize) ||
-        !writable_memory_range(camera + 0x4E0, kMatrixSize)) {
+    Matrix4 raw_view{};
+    Matrix4 projection{};
+    if (!read_validated_camera_layout(camera, raw_view, projection)) {
         const ULONGLONG now = GetTickCount64();
         if (now - g_last_camera_layout_error_tick >= 1000) {
-            render_log("camera hook rejected an object with an incompatible matrix layout");
+            render_log(
+                "camera hook rejected an object with an incompatible "
+                "or implausible matrix layout");
             g_last_camera_layout_error_tick = now;
         }
         return;
     }
-    Matrix4 raw_view{};
-    Matrix4 projection{};
-    std::memcpy(&raw_view, camera + 0x2E0, sizeof(raw_view));
-    std::memcpy(&projection, camera + 0x4E0, sizeof(projection));
 
     // Latch the primary gameplay camera while it still has a perspective
     // projection. Older builds used a very specific FOV value here, but that
@@ -2761,9 +4646,19 @@ void apply_vr_camera(void* object) {
     // absolute in SteamVR's Standing space, so the physical floor stays level.
     const Matrix4 center_view = multiply(delta, floor_aligned_view);
     const Matrix4 culling_view =
-        controls.hmd_culling_view_enabled ? hytalevr::horizontal_view(center_view) : floor_aligned_view;
+        controls.hmd_culling_view_enabled
+            ? hytalevr::roll_free_view(center_view)
+            : floor_aligned_view;
     const Matrix4 neutral_view_projection = multiply(projection, floor_aligned_view);
-    const Matrix4 culling_projection = projection;
+    // The culling view already follows headset yaw and pitch. Keep only a
+    // modest reserve for stereo edges and pose latency instead of asking
+    // Hytale to prepare several screens of invisible geometry every frame.
+    constexpr float kCullingHorizontalGuardBand = 1.50f;
+    constexpr float kCullingVerticalGuardBand = 1.65f;
+    const Matrix4 culling_projection =
+        hytalevr::expand_perspective_frustum(
+            projection, kCullingHorizontalGuardBand,
+            kCullingVerticalGuardBand);
     const Matrix4 culling_view_projection = multiply(culling_projection, culling_view);
     AcquireSRWLockExclusive(&g_camera_lock);
     g_neutral_view = floor_aligned_view;
@@ -2772,7 +4667,10 @@ void apply_vr_camera(void* object) {
     g_culling_view_valid = controls.hmd_culling_view_enabled != 0;
     g_center_view_projection = neutral_view_projection;
     g_center_view_projection_valid = true;
-    g_culling_projection = culling_projection;
+    // Keep +0x4E0 on Hytale's original projection between frames. Only the
+    // cached culling view-projection receives the guard band; otherwise the
+    // hook would read back and expand its own projection again next frame.
+    g_culling_projection = projection;
     g_culling_projection_valid = true;
     g_culling_view_projection = culling_view_projection;
     g_culling_view_projection_valid = true;
@@ -2786,6 +4684,8 @@ void apply_vr_camera(void* object) {
     }
     ReleaseSRWLockExclusive(&g_camera_lock);
 
+    const bool engine_native_stereo =
+        g_engine_render_hook_active && controls.stereo_enabled && g_vr_system;
     Matrix4 eye_view_matrix = center_view;
     if (controls.stereo_enabled && g_vr_system) {
         const auto left_eye = g_vr_system->GetEyeToHeadTransform(vr::Eye_Left);
@@ -2810,10 +4710,19 @@ void apply_vr_camera(void* object) {
         const Matrix4 right_projection = from_openvr(
             g_vr_system->GetProjectionMatrix(vr::Eye_Right, near_z, far_z));
 
-        // Render one real, centered camera with enough horizontal coverage for
-        // both eyes. The two headset views are reconstructed from this source.
-        eye_view_matrix = center_view;
-        projection = combined_stereo_source_projection(left_projection, right_projection);
+        if (engine_native_stereo) {
+            const int render_eye = InterlockedCompareExchange(&g_render_eye, 0, 0) == 0
+                ? 0
+                : 1;
+            eye_view_matrix = render_eye == 0 ? left_view : right_view;
+            projection = render_eye == 0 ? left_projection : right_projection;
+        } else {
+            // AFW renders one centered camera with enough horizontal coverage
+            // for both eyes, then reconstructs the headset views from it.
+            eye_view_matrix = center_view;
+            projection =
+                combined_stereo_source_projection(left_projection, right_projection);
+        }
         AcquireSRWLockExclusive(&g_camera_lock);
         g_afw_source_view = eye_view_matrix;
         g_afw_source_projection = projection;
@@ -2829,12 +4738,23 @@ void apply_vr_camera(void* object) {
     const Matrix4 view_projection = multiply(projection, eye_view_matrix);
     publish_vr_scene_matrices(eye_view_matrix, projection, view_projection);
     // Keep the final VR transform in +0x320. When HMD culling is enabled,
-    // +0x2E0 stays on flattened headset yaw so world loading/culling follows
-    // where the player looks, not only where Hytale's mouse camera points.
-    if (controls.hmd_culling_view_enabled) {
-        std::memcpy(camera + 0x2E0, &culling_view, sizeof(culling_view));
+    // +0x2E0 follows headset yaw and pitch without roll so world
+    // loading/culling also works above and below the player.
+    if (engine_native_stereo) {
+        std::memcpy(
+            camera + kCameraViewOffset, &eye_view_matrix,
+            sizeof(eye_view_matrix));
+        std::memcpy(
+            camera + kCameraProjectionOffset, &projection,
+            sizeof(projection));
+    } else if (controls.hmd_culling_view_enabled) {
+        std::memcpy(
+            camera + kCameraViewOffset, &culling_view,
+            sizeof(culling_view));
     }
-    std::memcpy(camera + 0x320, &view_projection, sizeof(view_projection));
+    std::memcpy(
+        camera + kCameraViewProjectionOffset, &view_projection,
+        sizeof(view_projection));
     const float native_view_delta =
         g_last_diag_valid ? matrix_max_delta(g_last_diag_view, view) : 0.0f;
     const float final_vp_delta =
@@ -2855,6 +4775,8 @@ void apply_vr_camera(void* object) {
             << " stereo=" << controls.stereo_enabled
             << " resolutionScale=" << controls.vr_resolution_scale
             << " hmdCull=" << controls.hmd_culling_view_enabled
+            << " cullGuard=" << kCullingHorizontalGuardBand
+            << "x" << kCullingVerticalGuardBand
             << " trackingSpace=standing"
             << " worldScale=" << world_scale
             << " floorHeightOffset=" << g_floor_height_offset
@@ -2867,6 +4789,8 @@ void apply_vr_camera(void* object) {
             << " aggressiveTotal=" << g_aggressive_suppressed_snaps
             << " nativeView " << matrix_summary(view)
             << " heldView " << matrix_summary(leveled_view)
+            << " cullView " << matrix_summary(culling_view)
+            << " cullProjection " << matrix_summary(culling_projection)
             << " projection " << matrix_summary(projection)
             << " hmdDelta " << matrix_summary(delta)
             << " finalVP " << matrix_summary(view_projection);
@@ -3363,6 +5287,8 @@ void update_vr_actions() {
         left_grip_active ? std::clamp(left_grip.x, 0.0f, 1.0f) : 0.0f;
     const float right_grip_value =
         right_grip_active ? std::clamp(right_grip.x, 0.0f, 1.0f) : 0.0f;
+    const bool right_trigger_was_pressed = g_right_trigger_pressed;
+    const bool left_trigger_was_pressed = g_left_trigger_pressed;
     if (g_right_trigger_pressed) {
         if (trigger_value < 0.45f) g_right_trigger_pressed = false;
     } else if (trigger_value > 0.65f) {
@@ -3372,6 +5298,78 @@ void update_vr_actions() {
         if (left_trigger_value < 0.45f) g_left_trigger_pressed = false;
     } else if (left_trigger_value > 0.65f) {
         g_left_trigger_pressed = true;
+    }
+    constexpr ULONGLONG kHeldItemActionHoldMs = 1000;
+    const ULONGLONG held_item_hold_until =
+        GetTickCount64() + kHeldItemActionHoldMs;
+    const LONG stable_presence =
+        g_stable_held_item_presence_mask.load(std::memory_order_relaxed);
+    if (g_right_trigger_pressed && !right_trigger_was_pressed) {
+        g_right_attack_suppresses_left_item =
+            !hytalevr::held_item_was_present_before_attack(
+                static_cast<uint32_t>(stable_presence),
+                hytalevr::kHeldItemLeft);
+        if (g_right_attack_suppresses_left_item) {
+            g_pending_item_detections[hytalevr::kHeldItemLeft] = {};
+        }
+    }
+    if (g_left_trigger_pressed && !left_trigger_was_pressed) {
+        g_left_attack_suppresses_right_item =
+            !hytalevr::held_item_was_present_before_attack(
+                static_cast<uint32_t>(stable_presence),
+                hytalevr::kHeldItemRight);
+        const LoadedVrItemState& right_item =
+            g_loaded_items[hytalevr::kHeldItemRight];
+        g_left_use_locks_placeable_to_right =
+            !g_left_attack_suppresses_right_item && right_item.asset_ready &&
+            hytalevr::vr_item_definition_is_block_or_decor(
+                right_item.asset.definition);
+        if (g_left_attack_suppresses_right_item) {
+            g_pending_item_detections[hytalevr::kHeldItemRight] = {};
+        }
+        if (g_left_use_locks_placeable_to_right) {
+            g_pending_item_detections[hytalevr::kHeldItemLeft] = {};
+        }
+    }
+    if (g_right_trigger_pressed) {
+        g_held_item_detection_hold_until[hytalevr::kHeldItemRight].store(
+            held_item_hold_until, std::memory_order_relaxed);
+        if (g_right_attack_suppresses_left_item) {
+            g_held_item_suppressed_until[hytalevr::kHeldItemLeft].store(
+                held_item_hold_until, std::memory_order_relaxed);
+        }
+    } else {
+        g_right_attack_suppresses_left_item = false;
+    }
+    if (g_left_trigger_pressed) {
+        // Left trigger injects Hytale's right mouse action. A block normally
+        // lives in the right hand, but some usable items can occupy the
+        // off-hand, so preserve every item that was visible when use started.
+        for (int side = hytalevr::kHeldItemLeft;
+             side <= hytalevr::kHeldItemRight; ++side) {
+            if (hytalevr::held_item_was_present_before_attack(
+                    static_cast<uint32_t>(stable_presence), side)) {
+                g_held_item_detection_hold_until[side].store(
+                    held_item_hold_until, std::memory_order_relaxed);
+            }
+        }
+        if (g_left_attack_suppresses_right_item) {
+            g_held_item_suppressed_until[hytalevr::kHeldItemRight].store(
+                held_item_hold_until, std::memory_order_relaxed);
+        }
+        if (g_left_use_locks_placeable_to_right &&
+            !hytalevr::held_item_was_present_before_attack(
+                static_cast<uint32_t>(stable_presence),
+                hytalevr::kHeldItemLeft)) {
+            // Hytale briefly submits a placed block as an off-hand draw.
+            // Ignore that transient only when the off-hand was empty before
+            // the action; a genuine torch/shield remains untouched.
+            g_held_item_suppressed_until[hytalevr::kHeldItemLeft].store(
+                held_item_hold_until, std::memory_order_relaxed);
+        }
+    } else {
+        g_left_attack_suppresses_right_item = false;
+        g_left_use_locks_placeable_to_right = false;
     }
     if (g_left_grip_pressed) {
         if (left_grip_value < 0.45f) g_left_grip_pressed = false;
@@ -3514,11 +5512,97 @@ bool initialize_stereo() {
     return true;
 }
 
+void restore_source_supersampling() {
+    if (g_supersampled_window && g_sdl_set_window_size &&
+        g_supersample_base_width > 0 && g_supersample_base_height > 0) {
+        g_sdl_set_window_size(g_supersampled_window,
+                              g_supersample_base_width,
+                              g_supersample_base_height);
+        if (g_sdl_sync_window) g_sdl_sync_window(g_supersampled_window);
+    }
+    g_supersampled_window = nullptr;
+    g_supersample_base_width = 0;
+    g_supersample_base_height = 0;
+    g_supersample_target_width = 0;
+    g_supersample_target_height = 0;
+    g_source_supersampling_active = false;
+}
+
+uint32_t effective_render_options(const VrCameraControls& controls) {
+    uint32_t options = controls.reserved_render_option;
+    if ((options & kVrEffectQualityControlsPresent) == 0u) {
+        // Older v122 dashboards did not publish the quality-option marker.
+        options |= kVrEffectProjectionCorrection;
+    }
+    return options;
+}
+
 bool prepare_render_resolution(void* window, const VrCameraControls& controls) {
-    (void)controls;
     if (!g_shared || !g_vr_system || !window) {
         if (g_shared) g_shared->resolution_error = 1;
         return false;
+    }
+
+    constexpr uint64_t kSdlWindowFullscreen = 0x0000000000000001ull;
+    constexpr uint64_t kSdlWindowMaximized = 0x0000000000000080ull;
+    const bool supersampling_enabled =
+        (effective_render_options(controls) & kVrEffectSupersampling) != 0u;
+    const float requested_scale =
+        std::clamp(controls.vr_resolution_scale, 1.0f, 2.0f);
+
+    if (!supersampling_enabled || requested_scale <= 1.001f) {
+        restore_source_supersampling();
+    } else if (g_sdl_get_window_size && g_sdl_set_window_size &&
+               g_sdl_get_window_flags) {
+        int logical_width = 0;
+        int logical_height = 0;
+        const uint64_t flags = g_sdl_get_window_flags(window);
+        const bool can_resize_source =
+            (flags & (kSdlWindowFullscreen | kSdlWindowMaximized)) == 0 &&
+            g_sdl_get_window_size(window, &logical_width, &logical_height) &&
+            logical_width > 0 && logical_height > 0;
+        if (can_resize_source) {
+            if (g_supersampled_window != window ||
+                g_supersample_base_width <= 0 || g_supersample_base_height <= 0) {
+                if (g_supersampled_window && g_supersampled_window != window) {
+                    restore_source_supersampling();
+                }
+                g_supersampled_window = window;
+                g_supersample_base_width = logical_width;
+                g_supersample_base_height = logical_height;
+            }
+            const int target_width = (std::max)(
+                1, static_cast<int>(std::lround(g_supersample_base_width *
+                                                requested_scale)));
+            const int target_height = (std::max)(
+                1, static_cast<int>(std::lround(g_supersample_base_height *
+                                                requested_scale)));
+            if (!g_source_supersampling_active ||
+                target_width != g_supersample_target_width ||
+                target_height != g_supersample_target_height) {
+                if (g_sdl_set_window_size(window, target_width, target_height)) {
+                    if (g_sdl_sync_window) g_sdl_sync_window(window);
+                    g_supersample_target_width = target_width;
+                    g_supersample_target_height = target_height;
+                    g_source_supersampling_active = true;
+                    std::ostringstream out;
+                    out << "source supersampling enabled logical="
+                        << g_supersample_base_width << "x"
+                        << g_supersample_base_height << " target="
+                        << target_width << "x" << target_height;
+                    render_log(out.str());
+                } else {
+                    g_source_supersampling_active = false;
+                    render_log("source supersampling resize failed; using output scaling");
+                }
+            }
+        } else {
+            // Fullscreen and maximized windows cannot be resized reliably at
+            // swap time. Keep the base size so windowed mode can resume it.
+            g_source_supersampling_active = false;
+        }
+    } else {
+        g_source_supersampling_active = false;
     }
 
     uint32_t recommended_width = 0;
@@ -3545,12 +5629,22 @@ bool prepare_render_resolution(void* window, const VrCameraControls& controls) {
         std::ostringstream out;
         out << "resolution recommendedSteamVR=" << recommended_width << "x"
             << recommended_height << " backbuffer=" << pixel_width << "x"
-            << pixel_height << " requestedScale=" << controls.vr_resolution_scale;
+            << pixel_height << " requestedScale=" << controls.vr_resolution_scale
+            << " sourceSupersampling=" << (g_source_supersampling_active ? 1 : 0);
         render_log(out.str());
         last_logged_width = pixel_width;
         last_logged_height = pixel_height;
     }
     return true;
+}
+
+float active_vr_output_scale(const VrCameraControls& controls) {
+    if ((effective_render_options(controls) & kVrEffectSupersampling) == 0u) {
+        return 1.0f;
+    }
+    return g_source_supersampling_active
+        ? 1.0f
+        : std::clamp(controls.vr_resolution_scale, 1.0f, 2.0f);
 }
 
 bool initialize_gl_capture() {
@@ -3575,7 +5669,8 @@ bool initialize_gl_capture() {
     return g_capture_fbo != 0;
 }
 
-bool ensure_ui_overlay(float width_meters = 1.50f, float distance_meters = 1.65f) {
+bool ensure_ui_overlay(float width_meters, float distance_meters,
+                       uint32_t recenter_sequence) {
     auto* overlay = vr::VROverlay();
     if (!overlay) {
         if (g_shared) g_shared->ui_overlay_error = 1;
@@ -3598,13 +5693,56 @@ bool ensure_ui_overlay(float width_meters = 1.50f, float distance_meters = 1.65f
     }
     overlay->SetOverlayWidthInMeters(g_ui_overlay, std::clamp(width_meters, 0.35f, 4.0f));
 
-    vr::HmdMatrix34_t transform{};
-    transform.m[0][0] = 1.0f;
-    transform.m[1][1] = 1.0f;
-    transform.m[2][2] = 1.0f;
-    transform.m[2][3] = -std::clamp(distance_meters, 0.35f, 6.0f);
-    overlay->SetOverlayTransformTrackedDeviceRelative(
-        g_ui_overlay, vr::k_unTrackedDeviceIndex_Hmd, &transform);
+    const float distance = std::clamp(distance_meters, 0.35f, 6.0f);
+    const bool needs_anchor =
+        !g_ui_overlay_world_transform_valid ||
+        g_ui_overlay_recenter_sequence != recenter_sequence ||
+        std::fabs(g_ui_overlay_anchor_distance - distance) > 0.001f;
+    if (!needs_anchor) return true;
+
+    float hmd[12]{};
+    bool hmd_valid = false;
+    AcquireSRWLockShared(&g_pose_lock);
+    hmd_valid = g_hmd_current_valid;
+    if (hmd_valid) {
+        std::copy(std::begin(g_hmd_current_pose), std::end(g_hmd_current_pose),
+                  std::begin(hmd));
+    }
+    ReleaseSRWLockShared(&g_pose_lock);
+    float absolute_pose[12]{};
+    if (!hmd_valid ||
+        !hytalevr::make_world_locked_ui_pose(hmd, distance, absolute_pose)) {
+        if (g_shared) g_shared->ui_overlay_error = -30;
+        return false;
+    }
+    for (int row = 0; row < 3; ++row) {
+        for (int column = 0; column < 4; ++column) {
+            g_ui_overlay_world_transform.m[row][column] =
+                absolute_pose[row * 4 + column];
+        }
+    }
+    const vr::EVROverlayError transform_error =
+        overlay->SetOverlayTransformAbsolute(
+            g_ui_overlay, vr::TrackingUniverseStanding,
+            &g_ui_overlay_world_transform);
+    if (transform_error != vr::VROverlayError_None) {
+        if (g_shared) {
+            g_shared->ui_overlay_error =
+                static_cast<int32_t>(transform_error);
+        }
+        return false;
+    }
+    g_ui_overlay_world_transform_valid = true;
+    g_ui_overlay_recenter_sequence = recenter_sequence;
+    g_ui_overlay_anchor_distance = distance;
+    if (render_logging_enabled()) {
+        std::ostringstream out;
+        out << "menu overlay anchored in Standing space seq="
+            << recenter_sequence << " distance=" << distance
+            << " position=" << absolute_pose[3] << ","
+            << absolute_pose[7] << "," << absolute_pose[11];
+        render_log(out.str());
+    }
     return true;
 }
 
@@ -3629,6 +5767,7 @@ void hide_ui_overlay(int32_t error_code) {
         g_shared->pointer_surface_width = 0;
         g_shared->pointer_surface_height = 0;
     }
+    g_ui_overlay_world_transform_valid = false;
 }
 
 bool menu_texture_fresh(LONG menu_frame, ULONGLONG now) {
@@ -3670,7 +5809,9 @@ void publish_menu_overlay_texture(GLuint texture_id, const VrCameraControls& con
         return;
     }
 
-    if (!ensure_ui_overlay(controls.ui_overlay_width, controls.ui_overlay_distance)) {
+    if (!ensure_ui_overlay(
+            controls.ui_overlay_width, controls.ui_overlay_distance,
+            controls.recenter_sequence)) {
         return;
     }
     vr::HmdVector2_t mouse_scale{};
@@ -4016,9 +6157,9 @@ bool project_tracking_point_to_eye_ndc(int eye, const float hmd[12],
     ndc_y = clip[1] / clip[3];
     depth = clip[3];
     return std::isfinite(ndc_x) && std::isfinite(ndc_y) &&
-           std::isfinite(depth) &&
-           ndc_x >= -1.3f && ndc_x <= 1.3f &&
-           ndc_y >= -1.3f && ndc_y <= 1.3f;
+           std::isfinite(depth) && depth > 0.001f &&
+           ndc_x >= -64.0f && ndc_x <= 64.0f &&
+           ndc_y >= -64.0f && ndc_y <= 64.0f;
 }
 
 bool controller_hand_ndc_for_eye(vr::EVREye eye, float& ndc_x,
@@ -4256,6 +6397,8 @@ void draw_vr_hand_model(int eye, int width, int height,
         }
     }
     const Vec3 eye_position{hmd[3], hmd[7], hmd[11]};
+    const bool shared_hand_item_depth =
+        hardware_hand_renderer && begin_hand_item_depth(width, height);
 
     static thread_local std::vector<ProjectedHandTriangle> triangles;
     triangles.clear();
@@ -4337,7 +6480,15 @@ void draw_vr_hand_model(int eye, int width, int height,
                   return a.depth > b.depth;
               });
     if (hardware_hand_renderer &&
-        draw_projected_hand_triangles_gl(triangles, width, height, eye, controls)) return;
+        draw_projected_textured_triangles_gl(
+            triangles, width, height, eye, g_hand_texture_gl,
+            controls.hand_depth_tolerance)) {
+        draw_vr_item_models(
+            eye, width, height, hmd, controller_poses, controller_valid,
+            controls);
+        if (shared_hand_item_depth) end_hand_item_depth();
+        return;
+    }
 
     if (hardware_hand_renderer) {
         for (ProjectedHandTriangle& triangle : triangles) {
@@ -4365,6 +6516,12 @@ void draw_vr_hand_model(int eye, int width, int height,
     glClearColor(old_clear[0], old_clear[1], old_clear[2], old_clear[3]);
     glScissor(old_scissor[0], old_scissor[1], old_scissor[2], old_scissor[3]);
     if (!scissor_enabled) glDisable(GL_SCISSOR_TEST);
+    if (hardware_hand_renderer) {
+        draw_vr_item_models(
+            eye, width, height, hmd, controller_poses, controller_valid,
+            controls);
+    }
+    if (shared_hand_item_depth) end_hand_item_depth();
 }
 
 void draw_controller_pointer(int eye, int width, int height, float distance,
@@ -4467,10 +6624,10 @@ bool capture_eye(int eye, const VrCameraControls& controls, bool include_vr_over
     }
     GLint max_texture_size = 4096;
     glGetIntegerv(GL_MAX_TEXTURE_SIZE, &max_texture_size);
+    const float output_scale = active_vr_output_scale(controls);
     const hytalevr::RenderResolution output_resolution =
         hytalevr::scaled_render_resolution(source_width, source_height,
-                                           controls.vr_resolution_scale,
-                                           max_texture_size);
+                                           output_scale, max_texture_size);
     if (output_resolution.width <= 0 || output_resolution.height <= 0) return false;
 
     if (source_width != g_source_texture_width ||
@@ -4558,7 +6715,7 @@ bool capture_eye(int eye, const VrCameraControls& controls, bool include_vr_over
         g_gl_blit_framebuffer(viewport[0], viewport[1], viewport[0] + source_width,
                               viewport[1] + source_height, 0, 0,
                               source_width, source_height,
-                              GL_COLOR_BUFFER_BIT, samples > 1 ? GL_NEAREST : GL_LINEAR);
+                              GL_COLOR_BUFFER_BIT, GL_NEAREST);
         if (include_vr_overlays) {
             draw_vr_eye_overlays(eye, source_width, source_height, controls,
                                  viewport[0], viewport[1],
@@ -4594,13 +6751,165 @@ bool capture_eye(int eye, const VrCameraControls& controls, bool include_vr_over
     return g_eye_valid[eye];
 }
 
+bool capture_native_eye(int eye, const VrCameraControls& controls) {
+    if (eye < 0 || eye > 1 || !initialize_gl_capture()) return false;
+
+    GLint viewport[4]{};
+    GLint samples = 0;
+    GLint max_texture_size = 4096;
+    glGetIntegerv(GL_VIEWPORT, viewport);
+    glGetIntegerv(GL_SAMPLES_VALUE, &samples);
+    glGetIntegerv(GL_MAX_TEXTURE_SIZE, &max_texture_size);
+    const int source_width = viewport[2];
+    const int source_height = viewport[3];
+    if (source_width <= 0 || source_height <= 0) return false;
+
+    const float output_scale = active_vr_output_scale(controls);
+    const hytalevr::RenderResolution output_resolution =
+        hytalevr::scaled_render_resolution(source_width, source_height,
+                                           output_scale, max_texture_size);
+    if (output_resolution.width <= 0 || output_resolution.height <= 0) return false;
+
+    if (source_width != g_source_texture_width ||
+        source_height != g_source_texture_height ||
+        output_resolution.width != g_texture_width ||
+        output_resolution.height != g_texture_height) {
+        if (g_eye_textures[0] || g_eye_textures[1]) {
+            glDeleteTextures(2, g_eye_textures);
+            g_eye_textures[0] = g_eye_textures[1] = 0;
+        }
+        g_eye_valid[0] = g_eye_valid[1] = false;
+        g_source_texture_width = source_width;
+        g_source_texture_height = source_height;
+        g_texture_width = output_resolution.width;
+        g_texture_height = output_resolution.height;
+    }
+
+    GLint previous_texture = 0;
+    GLint previous_read_fbo = 0;
+    GLint previous_draw_fbo = 0;
+    GLint previous_viewport[4]{};
+    glGetIntegerv(GL_TEXTURE_BINDING_2D, &previous_texture);
+    glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING_VALUE, &previous_read_fbo);
+    glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING_VALUE, &previous_draw_fbo);
+    glGetIntegerv(GL_VIEWPORT, previous_viewport);
+
+    if (!g_eye_textures[eye]) {
+        glGenTextures(1, &g_eye_textures[eye]);
+        glBindTexture(GL_TEXTURE_2D, g_eye_textures[eye]);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE_VALUE);
+        glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE_VALUE);
+        glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, g_texture_width, g_texture_height,
+                     0, GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+    }
+
+    g_gl_bind_framebuffer(GL_DRAW_FRAMEBUFFER_VALUE, g_capture_fbo);
+    g_gl_framebuffer_texture_2d(GL_DRAW_FRAMEBUFFER_VALUE, GL_COLOR_ATTACHMENT0_VALUE,
+                                GL_TEXTURE_2D, g_eye_textures[eye], 0);
+    bool success = g_gl_check_framebuffer_status(GL_DRAW_FRAMEBUFFER_VALUE) ==
+        GL_FRAMEBUFFER_COMPLETE_VALUE;
+    if (success) {
+        while (glGetError() != GL_NO_ERROR) {}
+        g_gl_bind_framebuffer(GL_READ_FRAMEBUFFER_VALUE,
+                              static_cast<GLuint>(previous_read_fbo));
+        g_gl_blit_framebuffer(
+            viewport[0], viewport[1], viewport[0] + source_width,
+            viewport[1] + source_height, 0, 0, g_texture_width, g_texture_height,
+            GL_COLOR_BUFFER_BIT, samples > 1 ? GL_NEAREST : GL_LINEAR);
+        glViewport(0, 0, g_texture_width, g_texture_height);
+        draw_vr_eye_overlays(eye, g_texture_width, g_texture_height, controls,
+                             viewport[0], viewport[1], source_width, source_height,
+                             samples > 1);
+        success = glGetError() == GL_NO_ERROR;
+    }
+
+    g_gl_bind_framebuffer(GL_READ_FRAMEBUFFER_VALUE,
+                          static_cast<GLuint>(previous_read_fbo));
+    g_gl_bind_framebuffer(GL_DRAW_FRAMEBUFFER_VALUE,
+                          static_cast<GLuint>(previous_draw_fbo));
+    glViewport(previous_viewport[0], previous_viewport[1],
+               previous_viewport[2], previous_viewport[3]);
+    glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(previous_texture));
+    g_eye_valid[eye] = success;
+    if (g_shared) {
+        g_shared->capture_width = source_width;
+        g_shared->capture_height = source_height;
+        g_shared->capture_error = success ? 0 : 7;
+    }
+    return success;
+}
+
+int engine_render_pass_complete(void*, int render_world) {
+    HookCallbackScope callback_scope;
+    VrCameraControls controls{};
+    if (!g_engine_render_hook_active ||
+        !g_runtime_active.load(std::memory_order_acquire) ||
+        !render_world ||
+        !read_controls(controls) || !controls.enabled ||
+        !controls.stereo_enabled || controls.non_vr_mode) {
+        InterlockedExchange(&g_engine_render_pass, 0);
+        InterlockedExchange(&g_render_eye, 0);
+        return 0;
+    }
+
+    const LONG pass = InterlockedCompareExchange(&g_engine_render_pass, 0, 0);
+    if (pass == 1) {
+        const bool right_captured = capture_native_eye(1, controls);
+        const bool pair_ready =
+            right_captured && g_eye_valid[0] && g_eye_valid[1];
+        InterlockedExchange(&g_engine_stereo_pair_ready, pair_ready ? 1 : 0);
+        InterlockedExchange(&g_engine_render_pass, 0);
+        InterlockedExchange(&g_render_eye, 0);
+        if (render_logging_enabled()) {
+            static ULONGLONG last_log_tick = 0;
+            const ULONGLONG now = GetTickCount64();
+            if (now - last_log_tick >= 1500) {
+                std::ostringstream out;
+                out << "engine stereo pair complete ready="
+                    << (pair_ready ? 1 : 0)
+                    << " source=" << g_source_texture_width << "x"
+                    << g_source_texture_height << " output="
+                    << g_texture_width << "x" << g_texture_height;
+                render_log(out.str());
+                last_log_tick = now;
+            }
+        }
+        return 0;
+    }
+    if (pass != 0) {
+        InterlockedExchange(&g_engine_render_pass, 0);
+        InterlockedExchange(&g_engine_stereo_pair_ready, 0);
+        InterlockedExchange(&g_render_eye, 0);
+        return 0;
+    }
+
+    InterlockedExchange(&g_engine_stereo_pair_ready, 0);
+    g_eye_valid[0] = g_eye_valid[1] = false;
+    if (!capture_native_eye(0, controls)) {
+        InterlockedExchange(&g_render_eye, 0);
+        return 0;
+    }
+    InterlockedExchange(&g_engine_render_pass, 1);
+    InterlockedExchange(&g_render_eye, 1);
+    if (!apply_cached_engine_eye(1, controls)) {
+        InterlockedExchange(&g_engine_render_pass, 0);
+        InterlockedExchange(&g_render_eye, 0);
+        g_eye_valid[0] = false;
+        return 0;
+    }
+    return 1;
+}
+
 bool preserve_afw_source_texture(int captured_eye) {
     return captured_eye >= 0 && captured_eye <= 1 && g_eye_valid[captured_eye] &&
            g_afw_source_texture != 0 && g_source_texture_width > 0 &&
            g_source_texture_height > 0;
 }
 
-bool warp_source_to_eye(GLuint source_texture, int target_eye) {
+bool warp_source_to_eye(GLuint source_texture, int target_eye,
+                        const VrCameraControls& controls) {
     if (!source_texture || target_eye < 0 || target_eye > 1 ||
         g_texture_width <= 0 || g_texture_height <= 0) {
         return false;
@@ -4613,6 +6922,8 @@ bool warp_source_to_eye(GLuint source_texture, int target_eye) {
     }
     const int source_width = g_source_texture_width;
     const int source_height = g_source_texture_height;
+    constexpr bool use_held_item_depth = false;
+    constexpr bool remove_held_item_background = false;
     const int depthToleranceX = (std::max)(8, source_width / 32);
     const int depthToleranceY = (std::max)(8, source_height / 32);
     if (std::abs(depth.width * 2 - source_width) > depthToleranceX ||
@@ -4630,6 +6941,7 @@ bool warp_source_to_eye(GLuint source_texture, int target_eye) {
     source_to_target_view = g_afw_source_to_eye_view[target_eye];
     ReleaseSRWLockShared(&g_camera_lock);
     if (!camera_valid) return false;
+    const uint32_t render_options = effective_render_options(controls);
 
     Matrix4 inverse_source_projection{};
     Matrix4 inverse_target_projection{};
@@ -4645,6 +6957,7 @@ bool warp_source_to_eye(GLuint source_texture, int target_eye) {
     GLint previous_texture_0 = 0;
     GLint previous_texture_1 = 0;
     GLint previous_texture_2 = 0;
+    GLint previous_texture_3 = 0;
     GLint previous_read_fbo = 0;
     GLint previous_draw_fbo = 0;
     GLint previous_viewport[4]{};
@@ -4667,6 +6980,8 @@ bool warp_source_to_eye(GLuint source_texture, int target_eye) {
     glGetIntegerv(GL_TEXTURE_BINDING_2D, &previous_texture_1);
     g_gl_active_texture(GL_TEXTURE2_VALUE);
     glGetIntegerv(GL_TEXTURE_BINDING_2D, &previous_texture_2);
+    g_gl_active_texture(GL_TEXTURE3_VALUE);
+    glGetIntegerv(GL_TEXTURE_BINDING_2D, &previous_texture_3);
 
     g_gl_active_texture(GL_TEXTURE0_VALUE);
     if (!g_eye_textures[target_eye]) {
@@ -4711,7 +7026,24 @@ bool warp_source_to_eye(GLuint source_texture, int target_eye) {
         g_gl_uniform_1i(g_afw_source_color_uniform, 0);
         g_gl_uniform_1i(g_afw_source_depth_uniform, 1);
         g_gl_uniform_1i(g_afw_distortion_field_uniform, 2);
+        g_gl_uniform_1i(g_afw_held_item_depth_uniform, 3);
+        g_gl_uniform_1i(g_afw_use_held_item_depth_uniform,
+                        use_held_item_depth ? 1 : 0);
+        g_gl_uniform_1i(g_afw_remove_held_item_background_uniform,
+                        remove_held_item_background ? 1 : 0);
+        g_gl_uniform_2f(g_afw_source_texel_size_uniform,
+                        1.0f / static_cast<float>(source_width),
+                        1.0f / static_cast<float>(source_height));
+        g_gl_uniform_1i(g_afw_composite_held_item_uniform, 0);
         g_gl_uniform_1i(g_afw_apply_distortion_uniform, distortion.valid ? 1 : 0);
+        g_gl_uniform_1i(
+            g_afw_sharpen_enabled_uniform,
+            (render_options & kVrEffectSharpening) != 0u ? 1 : 0);
+        g_gl_uniform_1f(g_afw_sharpen_strength_uniform,
+                        std::clamp(controls.reserved_render_value, 0.0f, 1.0f));
+        g_gl_uniform_1i(
+            g_afw_edge_aa_enabled_uniform,
+            (render_options & kVrEffectEdgeAa) != 0u ? 1 : 0);
         g_gl_uniform_matrix_4fv(g_afw_inverse_source_projection_uniform, 1, GL_FALSE,
                                 inverse_source_projection.value);
         g_gl_uniform_matrix_4fv(g_afw_source_projection_uniform, 1, GL_FALSE,
@@ -4723,7 +7055,9 @@ bool warp_source_to_eye(GLuint source_texture, int target_eye) {
         g_gl_uniform_matrix_4fv(g_afw_target_projection_uniform, 1, GL_FALSE,
                                 target_projection.value);
         g_gl_uniform_1f(g_afw_depth_far_clip_uniform, depth.far_clip);
-        g_gl_uniform_1i(g_afw_enable_warp_uniform, 2);
+        g_gl_uniform_1i(
+            g_afw_enable_warp_uniform,
+            (render_options & kVrEffectProjectionCorrection) != 0u ? 2 : 0);
         g_gl_uniform_1i(g_afw_output_depth_uniform, 0);
         g_gl_active_texture(GL_TEXTURE0_VALUE);
         glBindTexture(GL_TEXTURE_2D, source_texture);
@@ -4731,6 +7065,8 @@ bool warp_source_to_eye(GLuint source_texture, int target_eye) {
         glBindTexture(GL_TEXTURE_2D, depth.texture);
         g_gl_active_texture(GL_TEXTURE2_VALUE);
         glBindTexture(GL_TEXTURE_2D, distortion.valid ? distortion.texture : 0);
+        g_gl_active_texture(GL_TEXTURE3_VALUE);
+        glBindTexture(GL_TEXTURE_2D, 0);
         glDrawArrays(GL_TRIANGLES, 0, 3);
         success = glGetError() == GL_NO_ERROR;
         if (success) {
@@ -4750,6 +7086,8 @@ bool warp_source_to_eye(GLuint source_texture, int target_eye) {
         }
     }
 
+    g_gl_active_texture(GL_TEXTURE3_VALUE);
+    glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(previous_texture_3));
     g_gl_active_texture(GL_TEXTURE2_VALUE);
     glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(previous_texture_2));
     g_gl_active_texture(GL_TEXTURE1_VALUE);
@@ -4782,11 +7120,227 @@ bool warp_source_to_eye(GLuint source_texture, int target_eye) {
                 << " depth=" << depth.width << "x" << depth.height
                 << " depthFrame=" << depth.frame
                 << " distortion=" << (distortion.valid ? 1 : 0)
-                << " distortionFrame=" << distortion.frame;
+                << " distortionFrame=" << distortion.frame
+                << " itemMask=" << (remove_held_item_background ? 1 : 0);
             render_log(out.str());
         }
     }
     return success;
+}
+
+bool project_view_position_to_uv(const Matrix4& projection,
+                                 const float position[3],
+                                 float uv[2]) {
+    float clip[4]{};
+    const float point[4]{position[0], position[1], position[2], 1.0f};
+    for (int row = 0; row < 4; ++row) {
+        for (int column = 0; column < 4; ++column) {
+            clip[row] += projection.value[column * 4 + row] * point[column];
+        }
+    }
+    if (!std::isfinite(clip[3]) || clip[3] <= 0.0001f) return false;
+    uv[0] = clip[0] / clip[3] * 0.5f + 0.5f;
+    uv[1] = clip[1] / clip[3] * 0.5f + 0.5f;
+    return std::isfinite(uv[0]) && std::isfinite(uv[1]);
+}
+
+bool composite_held_item_to_eye(int eye,
+                                const VrCameraControls& controls) {
+    if (eye < 0 || eye > 1 || !g_eye_valid[eye] ||
+        !g_eye_depth_valid[eye] || !g_eye_textures[eye] ||
+        !g_eye_depth_textures[eye] || !g_afw_source_texture ||
+        !initialize_gl_capture() ||
+        !ensure_afw_gl_renderer()) {
+        return false;
+    }
+    const HeldItemDepthTextureSnapshot layer = held_item_depth_texture_snapshot();
+    if (!layer.valid ||
+        std::abs(layer.width - g_source_texture_width) > 8 ||
+        std::abs(layer.height - g_source_texture_height) > 8) {
+        return false;
+    }
+
+    Matrix4 source_projection{};
+    Matrix4 source_to_target_view{};
+    Matrix4 target_projection{};
+    AcquireSRWLockShared(&g_camera_lock);
+    const bool camera_valid = g_afw_camera_valid;
+    source_projection = g_afw_source_projection;
+    source_to_target_view = g_afw_source_to_eye_view[eye];
+    target_projection = g_afw_eye_projection[eye];
+    ReleaseSRWLockShared(&g_camera_lock);
+    if (!camera_valid) return false;
+
+    Matrix4 inverse_source_projection{};
+    if (!hytalevr::inverse(source_projection, inverse_source_projection)) return false;
+    const SceneDepthTextureSnapshot scene_depth = scene_depth_texture_snapshot();
+    const DistortionTextureSnapshot distortion = distortion_texture_snapshot();
+    const float far_clip = scene_depth.valid ? scene_depth.far_clip : 1024.0f;
+
+    GLint previous_program = 0;
+    GLint previous_vao = 0;
+    GLint previous_array_buffer = 0;
+    GLint previous_active_texture = 0;
+    GLint previous_texture_0 = 0;
+    GLint previous_texture_2 = 0;
+    GLint previous_texture_3 = 0;
+    GLint previous_texture_4 = 0;
+    GLint previous_texture_5 = 0;
+    GLint previous_read_fbo = 0;
+    GLint previous_draw_fbo = 0;
+    GLint previous_viewport[4]{};
+    GLint previous_blend_src = GL_ONE;
+    GLint previous_blend_dst = GL_ZERO;
+    GLboolean previous_color_mask[4]{};
+    glGetIntegerv(GL_CURRENT_PROGRAM_VALUE, &previous_program);
+    glGetIntegerv(GL_VERTEX_ARRAY_BINDING_VALUE, &previous_vao);
+    glGetIntegerv(GL_ARRAY_BUFFER_BINDING_VALUE, &previous_array_buffer);
+    glGetIntegerv(GL_ACTIVE_TEXTURE_VALUE, &previous_active_texture);
+    glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING_VALUE, &previous_read_fbo);
+    glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING_VALUE, &previous_draw_fbo);
+    glGetIntegerv(GL_VIEWPORT, previous_viewport);
+    glGetIntegerv(GL_BLEND_SRC, &previous_blend_src);
+    glGetIntegerv(GL_BLEND_DST, &previous_blend_dst);
+    glGetBooleanv(GL_COLOR_WRITEMASK, previous_color_mask);
+    const GLboolean blend_enabled = glIsEnabled(GL_BLEND);
+    const GLboolean depth_enabled = glIsEnabled(GL_DEPTH_TEST);
+    const GLboolean scissor_enabled = glIsEnabled(GL_SCISSOR_TEST);
+    const GLboolean cull_enabled = glIsEnabled(GL_CULL_FACE);
+    g_gl_active_texture(GL_TEXTURE0_VALUE);
+    glGetIntegerv(GL_TEXTURE_BINDING_2D, &previous_texture_0);
+    g_gl_active_texture(GL_TEXTURE2_VALUE);
+    glGetIntegerv(GL_TEXTURE_BINDING_2D, &previous_texture_2);
+    g_gl_active_texture(GL_TEXTURE3_VALUE);
+    glGetIntegerv(GL_TEXTURE_BINDING_2D, &previous_texture_3);
+    g_gl_active_texture(GL_TEXTURE4_VALUE);
+    glGetIntegerv(GL_TEXTURE_BINDING_2D, &previous_texture_4);
+    g_gl_active_texture(GL_TEXTURE5_VALUE);
+    glGetIntegerv(GL_TEXTURE_BINDING_2D, &previous_texture_5);
+
+    g_gl_bind_framebuffer(GL_DRAW_FRAMEBUFFER_VALUE, g_capture_fbo);
+    g_gl_framebuffer_texture_2d(GL_DRAW_FRAMEBUFFER_VALUE,
+                                GL_COLOR_ATTACHMENT0_VALUE,
+                                GL_TEXTURE_2D, g_eye_textures[eye], 0);
+    bool success = g_gl_check_framebuffer_status(GL_DRAW_FRAMEBUFFER_VALUE) ==
+        GL_FRAMEBUFFER_COMPLETE_VALUE;
+    bool drew_item = false;
+    if (success) {
+        while (glGetError() != GL_NO_ERROR) {}
+        glViewport(0, 0, g_texture_width, g_texture_height);
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+        glDisable(GL_DEPTH_TEST);
+        glDisable(GL_SCISSOR_TEST);
+        glDisable(GL_CULL_FACE);
+        glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+        g_gl_use_program(g_afw_program);
+        g_gl_bind_vertex_array(g_afw_vao);
+        g_gl_uniform_1i(g_afw_source_color_uniform, 0);
+        g_gl_uniform_1i(g_afw_distortion_field_uniform, 2);
+        g_gl_uniform_1i(g_afw_held_item_depth_uniform, 3);
+        g_gl_uniform_1i(g_afw_eye_scene_depth_uniform, 4);
+        g_gl_uniform_1i(g_afw_held_item_color_uniform, 5);
+        g_gl_uniform_1i(g_afw_composite_held_item_uniform, 1);
+        g_gl_uniform_1i(g_afw_use_held_item_depth_uniform, 0);
+        g_gl_uniform_1i(g_afw_remove_held_item_background_uniform, 0);
+        g_gl_uniform_2f(g_afw_source_texel_size_uniform,
+                        1.0f / static_cast<float>(g_source_texture_width),
+                        1.0f / static_cast<float>(g_source_texture_height));
+        g_gl_uniform_1i(g_afw_apply_distortion_uniform,
+                        distortion.valid ? 1 : 0);
+        g_gl_uniform_1i(g_afw_output_depth_uniform, 0);
+        g_gl_uniform_1f(g_afw_depth_far_clip_uniform, far_clip);
+        g_gl_uniform_1f(g_afw_held_item_depth_bias_uniform,
+                        std::clamp(controls.hand_depth_tolerance, 0.0f, 1.0f));
+        g_gl_uniform_matrix_4fv(g_afw_inverse_source_projection_uniform, 1,
+                                GL_FALSE, inverse_source_projection.value);
+        g_gl_uniform_matrix_4fv(g_afw_source_to_target_view_uniform, 1,
+                                GL_FALSE, source_to_target_view.value);
+        g_gl_uniform_matrix_4fv(g_afw_target_projection_uniform, 1,
+                                GL_FALSE, target_projection.value);
+        g_gl_active_texture(GL_TEXTURE0_VALUE);
+        glBindTexture(GL_TEXTURE_2D, g_afw_source_texture);
+        g_gl_active_texture(GL_TEXTURE2_VALUE);
+        glBindTexture(GL_TEXTURE_2D, distortion.valid ? distortion.texture : 0);
+        g_gl_active_texture(GL_TEXTURE3_VALUE);
+        glBindTexture(GL_TEXTURE_2D, layer.depth_texture);
+        g_gl_active_texture(GL_TEXTURE4_VALUE);
+        glBindTexture(GL_TEXTURE_2D, g_eye_depth_textures[eye]);
+        g_gl_active_texture(GL_TEXTURE5_VALUE);
+        glBindTexture(GL_TEXTURE_2D, layer.color_texture);
+
+        for (int side = 0; side < 2; ++side) {
+            if ((layer.visible_mask & (1L << side)) == 0 ||
+                !hytalevr::finite_values(layer.view_positions[side], 3)) {
+                continue;
+            }
+            float source_uv[2]{};
+            if (!project_view_position_to_uv(source_projection,
+                                             layer.view_positions[side], source_uv)) {
+                continue;
+            }
+            float target_position[3]{
+                source_to_target_view.value[12],
+                source_to_target_view.value[13],
+                source_to_target_view.value[14],
+            };
+            for (int row = 0; row < 3; ++row) {
+                for (int column = 0; column < 3; ++column) {
+                    target_position[row] +=
+                        source_to_target_view.value[column * 4 + row] *
+                        layer.view_positions[side][column];
+                }
+            }
+            float target_uv[2]{};
+            if (!project_view_position_to_uv(target_projection,
+                                             target_position, target_uv)) {
+                continue;
+            }
+            const float radius = std::clamp(
+                0.24f / std::max(-layer.view_positions[side][2], 0.35f),
+                0.20f, 0.45f);
+            g_gl_uniform_2f(g_afw_held_item_uv_shift_uniform,
+                            target_uv[0] - source_uv[0],
+                            target_uv[1] - source_uv[1]);
+            g_gl_uniform_2f(g_afw_held_item_source_center_uniform,
+                            source_uv[0], source_uv[1]);
+            g_gl_uniform_1f(g_afw_held_item_radius_uniform, radius);
+            glDrawArrays(GL_TRIANGLES, 0, 3);
+            drew_item = true;
+        }
+        success = glGetError() == GL_NO_ERROR;
+        g_gl_uniform_1i(g_afw_composite_held_item_uniform, 0);
+    }
+
+    g_gl_active_texture(GL_TEXTURE5_VALUE);
+    glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(previous_texture_5));
+    g_gl_active_texture(GL_TEXTURE4_VALUE);
+    glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(previous_texture_4));
+    g_gl_active_texture(GL_TEXTURE3_VALUE);
+    glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(previous_texture_3));
+    g_gl_active_texture(GL_TEXTURE2_VALUE);
+    glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(previous_texture_2));
+    g_gl_active_texture(GL_TEXTURE0_VALUE);
+    glBindTexture(GL_TEXTURE_2D, static_cast<GLuint>(previous_texture_0));
+    g_gl_active_texture(static_cast<GLenum>(previous_active_texture));
+    g_gl_bind_vertex_array(static_cast<GLuint>(previous_vao));
+    g_gl_bind_buffer(GL_ARRAY_BUFFER_VALUE, static_cast<GLuint>(previous_array_buffer));
+    g_gl_use_program(static_cast<GLuint>(previous_program));
+    g_gl_bind_framebuffer(GL_READ_FRAMEBUFFER_VALUE,
+                          static_cast<GLuint>(previous_read_fbo));
+    g_gl_bind_framebuffer(GL_DRAW_FRAMEBUFFER_VALUE,
+                          static_cast<GLuint>(previous_draw_fbo));
+    glViewport(previous_viewport[0], previous_viewport[1],
+               previous_viewport[2], previous_viewport[3]);
+    glColorMask(previous_color_mask[0], previous_color_mask[1],
+                previous_color_mask[2], previous_color_mask[3]);
+    glBlendFunc(static_cast<GLenum>(previous_blend_src),
+                static_cast<GLenum>(previous_blend_dst));
+    if (blend_enabled) glEnable(GL_BLEND); else glDisable(GL_BLEND);
+    if (depth_enabled) glEnable(GL_DEPTH_TEST); else glDisable(GL_DEPTH_TEST);
+    if (scissor_enabled) glEnable(GL_SCISSOR_TEST); else glDisable(GL_SCISSOR_TEST);
+    if (cull_enabled) glEnable(GL_CULL_FACE); else glDisable(GL_CULL_FACE);
+    return success && drew_item;
 }
 
 bool draw_overlays_to_eye_texture(int eye, const VrCameraControls& controls) {
@@ -4943,44 +7497,50 @@ void restore_neutral_camera(bool force_view = true) {
     AcquireSRWLockExclusive(&g_camera_lock);
     constexpr ULONGLONG kBetweenFrameRestoreMaxAgeMs = 250;
     const ULONGLONG now = GetTickCount64();
-    MEMORY_BASIC_INFORMATION memory{};
-    const bool camera_is_writable = g_primary_camera &&
-        VirtualQuery(static_cast<unsigned char*>(g_primary_camera) + 0x2E0,
-                     &memory, sizeof(memory)) == sizeof(memory) &&
-        memory.State == MEM_COMMIT && (memory.Protect & (PAGE_GUARD | PAGE_NOACCESS)) == 0;
-    const DWORD camera_protection = memory.Protect & 0xff;
-    const bool protection_is_writable = camera_protection == PAGE_READWRITE ||
-        camera_protection == PAGE_WRITECOPY || camera_protection == PAGE_EXECUTE_READWRITE ||
-        camera_protection == PAGE_EXECUTE_WRITECOPY;
-    if (camera_is_writable && protection_is_writable && g_center_view_projection_valid &&
+    auto* camera = static_cast<unsigned char*>(g_primary_camera);
+    Matrix4 observed_view{};
+    Matrix4 observed_projection{};
+    const bool camera_layout_valid =
+        read_validated_camera_layout(
+            camera, observed_view, observed_projection);
+    if (camera_layout_valid && g_center_view_projection_valid &&
         now - g_last_primary_camera_tick < kBetweenFrameRestoreMaxAgeMs) {
         if (g_culling_view_valid) {
-            std::memcpy(static_cast<unsigned char*>(g_primary_camera) + 0x2E0,
-                        &g_culling_view, sizeof(g_culling_view));
+            std::memcpy(
+                camera + kCameraViewOffset, &g_culling_view,
+                sizeof(g_culling_view));
             g_last_written_culling_view = g_culling_view;
             g_last_written_culling_object = g_primary_camera;
             g_last_written_culling_tick = now;
             g_last_written_culling_view_valid = true;
         } else if (g_neutral_view_valid) {
-            std::memcpy(static_cast<unsigned char*>(g_primary_camera) + 0x2E0,
-                        &g_neutral_view, sizeof(g_neutral_view));
+            std::memcpy(
+                camera + kCameraViewOffset, &g_neutral_view,
+                sizeof(g_neutral_view));
         }
         const Matrix4& between_frame_view_projection =
             g_culling_view_projection_valid ? g_culling_view_projection : g_center_view_projection;
         if (g_culling_projection_valid) {
-            std::memcpy(static_cast<unsigned char*>(g_primary_camera) + 0x4E0,
-                        &g_culling_projection, sizeof(g_culling_projection));
+            std::memcpy(
+                camera + kCameraProjectionOffset, &g_culling_projection,
+                sizeof(g_culling_projection));
         }
-        std::memcpy(static_cast<unsigned char*>(g_primary_camera) + 0x320,
-                    &between_frame_view_projection, sizeof(between_frame_view_projection));
+        std::memcpy(
+            camera + kCameraViewProjectionOffset,
+            &between_frame_view_projection,
+            sizeof(between_frame_view_projection));
     }
     ReleaseSRWLockExclusive(&g_camera_lock);
 }
 
 void shutdown_stereo() {
+    restore_source_supersampling();
     if (g_ui_overlay != vr::k_ulOverlayHandleInvalid) {
         if (auto* overlay = vr::VROverlay()) overlay->HideOverlay(g_ui_overlay);
     }
+    g_ui_overlay_world_transform_valid = false;
+    g_ui_overlay_recenter_sequence = ~0u;
+    g_ui_overlay_anchor_distance = 0.0f;
     if (g_ui_texture) {
         glDeleteTextures(1, &g_ui_texture);
         g_ui_texture = 0;
@@ -5016,6 +7576,39 @@ void shutdown_stereo() {
     g_consecutive_submit_failures = 0;
     g_last_successful_submit_tick = 0;
     g_last_swap_recenter_sequence = 0;
+    if (g_hand_item_depth_texture) {
+        glDeleteTextures(1, &g_hand_item_depth_texture);
+        g_hand_item_depth_texture = 0;
+    }
+    if (g_torch_flame_texture_gl) {
+        glDeleteTextures(1, &g_torch_flame_texture_gl);
+        g_torch_flame_texture_gl = 0;
+    }
+    g_torch_flame_texture_width = 0;
+    g_torch_flame_texture_height = 0;
+    g_torch_flame_texture_attempted = false;
+    g_hand_item_depth_width = 0;
+    g_hand_item_depth_height = 0;
+    g_hand_item_depth_active = false;
+    for (LoadedVrItemState& state : g_loaded_items) {
+        if (state.texture_gl) glDeleteTextures(1, &state.texture_gl);
+        state = {};
+    }
+    for (PendingHeldItemDetection& pending : g_pending_item_detections) {
+        pending = {};
+    }
+    g_held_item_asset_cache.clear();
+    g_held_item_cache_sequence = 0;
+    g_last_item_detection_frame = -1;
+    for (int side = 0; side < 2; ++side) {
+        g_held_item_detection_hold_until[side].store(
+            0, std::memory_order_relaxed);
+        g_held_item_suppressed_until[side].store(
+            0, std::memory_order_relaxed);
+    }
+    g_stable_held_item_presence_mask.store(0, std::memory_order_relaxed);
+    InterlockedExchange(&g_engine_render_pass, 0);
+    InterlockedExchange(&g_engine_stereo_pair_ready, 0);
     InterlockedExchange(&g_render_eye, 0);
     if (g_vr_system) {
         vr::VR_Shutdown();
@@ -5051,7 +7644,7 @@ void shutdown_stereo() {
     g_last_observed_native_yaw_valid = false;
     g_aggressive_suppressed_snaps = 0;
     g_last_aggressive_native_delta = 0.0f;
-    g_runtime_active = false;
+    g_runtime_active.store(false, std::memory_order_release);
     g_actions_ready = false;
     g_action_set = vr::k_ulInvalidActionSetHandle;
     g_action_move = vr::k_ulInvalidActionHandle;
@@ -5070,6 +7663,9 @@ void shutdown_stereo() {
     g_action_right_stick_click = vr::k_ulInvalidActionHandle;
     g_right_trigger_pressed = false;
     g_left_trigger_pressed = false;
+    g_right_attack_suppresses_left_item = false;
+    g_left_attack_suppresses_right_item = false;
+    g_left_use_locks_placeable_to_right = false;
     g_left_grip_pressed = false;
     g_right_grip_pressed = false;
     AcquireSRWLockExclusive(&g_game_ray_lock);
@@ -5126,7 +7722,8 @@ void __cdecl hook_sdl_gl_swap_window(void* window) {
         out << "swap controls=" << (have_controls ? 1 : 0)
             << " enabled=" << (have_controls ? controls.enabled : 0)
             << " stereo=" << (have_controls ? controls.stereo_enabled : 0)
-            << " runtime=" << (g_runtime_active ? 1 : 0)
+            << " runtime="
+            << (g_runtime_active.load(std::memory_order_acquire) ? 1 : 0)
             << " renderEye=" << InterlockedCompareExchange(&g_render_eye, 0, 0)
             << " swapCalls=" << (g_shared ? g_shared->swap_calls : 0)
             << " stereoFrames=" << (g_shared ? g_shared->stereo_frames : 0)
@@ -5165,10 +7762,10 @@ void __cdecl hook_sdl_gl_swap_window(void* window) {
     if (have_controls && (!controls.enabled || controls.shutdown_requested)) {
         publish_ui_scale_neutral();
         restore_neutral_camera(true);
-        if (g_runtime_active) shutdown_stereo();
+        if (g_runtime_active.load(std::memory_order_acquire)) shutdown_stereo();
     } else if (have_controls && controls.enabled && controls.non_vr_mode) {
         publish_render_filters_only(controls);
-        if (g_runtime_active) shutdown_stereo();
+        if (g_runtime_active.load(std::memory_order_acquire)) shutdown_stereo();
         if (g_shared) {
             g_shared->stereo_active = 0;
             g_shared->stereo_error = 0;
@@ -5176,7 +7773,7 @@ void __cdecl hook_sdl_gl_swap_window(void* window) {
         if (g_swap_trampoline) g_swap_trampoline(window);
         return;
     } else if (have_controls && controls.enabled && initialize_stereo()) {
-        g_runtime_active = true;
+        g_runtime_active.store(true, std::memory_order_release);
         update_vr_actions();
         if (!controls.stereo_enabled) {
             synchronize_openvr(controls);
@@ -5193,41 +7790,58 @@ void __cdecl hook_sdl_gl_swap_window(void* window) {
             g_consecutive_submit_failures = 0;
             g_last_successful_submit_tick = now;
         }
-        InterlockedExchange(&g_render_eye, 0);
-        g_shared->current_eye = 0;
-        constexpr int source_eye = 0;
         if (!prepare_render_resolution(window, controls)) {
             restore_neutral_camera();
             if (g_swap_trampoline) g_swap_trampoline(window);
             return;
         }
-        const bool captured = g_pre_ui_captured[source_eye] ||
-                              capture_eye(source_eye, controls, false);
-        g_pre_ui_captured[source_eye] = false;
+        const bool engine_pair_ready =
+            g_engine_render_hook_active &&
+            InterlockedExchange(&g_engine_stereo_pair_ready, 0) != 0 &&
+            g_eye_valid[0] && g_eye_valid[1];
+        InterlockedExchange(&g_render_eye, 0);
+        g_shared->current_eye = 0;
         restore_neutral_camera();
-        if (captured && preserve_afw_source_texture(source_eye)) {
-            const bool left_warped = warp_source_to_eye(g_afw_source_texture, 0);
-            const bool right_warped = warp_source_to_eye(g_afw_source_texture, 1);
-            if (left_warped && right_warped) {
-                draw_overlays_to_eye_texture(0, controls);
-                draw_overlays_to_eye_texture(1, controls);
-                submit_menu_overlay_texture(g_eye_textures[0], controls);
-            }
-            if (left_warped && right_warped && submit_eye_pair()) {
+        if (engine_pair_ready) {
+            submit_menu_overlay_texture(g_eye_textures[0], controls);
+            if (submit_eye_pair()) {
                 synchronize_openvr(controls);
                 InterlockedIncrement(
                     reinterpret_cast<volatile LONG*>(&g_shared->completed_pairs));
             } else {
-                g_eye_valid[0] = g_eye_valid[1] = false;
-                g_eye_depth_valid[0] = g_eye_depth_valid[1] = false;
                 synchronize_openvr(controls);
             }
         } else {
-            g_eye_valid[0] = false;
-            g_eye_valid[1] = false;
-            g_eye_depth_valid[0] = g_eye_depth_valid[1] = false;
-            g_pre_ui_captured[0] = g_pre_ui_captured[1] = false;
-            synchronize_openvr(controls);
+            constexpr int source_eye = 0;
+            const bool captured = g_pre_ui_captured[source_eye] ||
+                                  capture_eye(source_eye, controls, false);
+            g_pre_ui_captured[source_eye] = false;
+            if (captured && preserve_afw_source_texture(source_eye)) {
+                const bool left_warped =
+                    warp_source_to_eye(g_afw_source_texture, 0, controls);
+                const bool right_warped =
+                    warp_source_to_eye(g_afw_source_texture, 1, controls);
+                if (left_warped && right_warped) {
+                    draw_overlays_to_eye_texture(0, controls);
+                    draw_overlays_to_eye_texture(1, controls);
+                    submit_menu_overlay_texture(g_eye_textures[0], controls);
+                }
+                if (left_warped && right_warped && submit_eye_pair()) {
+                    synchronize_openvr(controls);
+                    InterlockedIncrement(
+                        reinterpret_cast<volatile LONG*>(&g_shared->completed_pairs));
+                } else {
+                    g_eye_valid[0] = g_eye_valid[1] = false;
+                    g_eye_depth_valid[0] = g_eye_depth_valid[1] = false;
+                    synchronize_openvr(controls);
+                }
+            } else {
+                g_eye_valid[0] = false;
+                g_eye_valid[1] = false;
+                g_eye_depth_valid[0] = g_eye_depth_valid[1] = false;
+                g_pre_ui_captured[0] = g_pre_ui_captured[1] = false;
+                synchronize_openvr(controls);
+            }
         }
     } else if (g_shared) {
         g_shared->stereo_active = 0;
@@ -5242,6 +7856,14 @@ bool install_swap_hook() {
     if (!g_swap_target) return false;
     g_sdl_get_window_size_in_pixels = reinterpret_cast<SdlGetWindowSizeFn>(
         GetProcAddress(sdl, "SDL_GetWindowSizeInPixels"));
+    g_sdl_get_window_size = reinterpret_cast<SdlGetWindowSizeFn>(
+        GetProcAddress(sdl, "SDL_GetWindowSize"));
+    g_sdl_set_window_size = reinterpret_cast<SdlSetWindowSizeFn>(
+        GetProcAddress(sdl, "SDL_SetWindowSize"));
+    g_sdl_get_window_flags = reinterpret_cast<SdlGetWindowFlagsFn>(
+        GetProcAddress(sdl, "SDL_GetWindowFlags"));
+    g_sdl_sync_window = reinterpret_cast<SdlSyncWindowFn>(
+        GetProcAddress(sdl, "SDL_SyncWindow"));
 
     // SDL3's exported wrapper is: mov rax,[rip+disp32]; jmp [rip+disp32].
     if (g_swap_target[0] != 0x48 || g_swap_target[1] != 0x8B || g_swap_target[2] != 0x05 ||
@@ -5403,6 +8025,327 @@ void emit8(unsigned char*& cursor, uint64_t value) {
     cursor += sizeof(value);
 }
 
+void* allocate_executable_near(void* target, size_t size) {
+    SYSTEM_INFO info{};
+    GetSystemInfo(&info);
+    const uintptr_t granularity = info.dwAllocationGranularity;
+    const uintptr_t center =
+        reinterpret_cast<uintptr_t>(target) & ~(granularity - 1);
+    constexpr uintptr_t kMaximumDistance = 0x70000000ull;
+    const uintptr_t minimum = reinterpret_cast<uintptr_t>(
+        info.lpMinimumApplicationAddress);
+    const uintptr_t maximum = reinterpret_cast<uintptr_t>(
+        info.lpMaximumApplicationAddress);
+
+    for (uintptr_t distance = 0; distance <= kMaximumDistance;
+         distance += granularity) {
+        const uintptr_t candidates[2]{
+            center >= distance ? center - distance : 0,
+            center <= maximum - distance ? center + distance : 0,
+        };
+        for (const uintptr_t candidate : candidates) {
+            if (candidate < minimum || candidate > maximum - size) continue;
+            if (void* memory = VirtualAlloc(
+                    reinterpret_cast<void*>(candidate), size,
+                    MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE)) {
+                const intptr_t delta =
+                    reinterpret_cast<unsigned char*>(memory) -
+                    (static_cast<unsigned char*>(target) + 5);
+                if (delta >= INT32_MIN && delta <= INT32_MAX) return memory;
+                VirtualFree(memory, 0, MEM_RELEASE);
+            }
+        }
+    }
+    return nullptr;
+}
+
+bool engine_render_patch_matches() {
+    if (!g_engine_render_hook_target || !g_engine_render_hook_memory ||
+        !g_engine_render_final_stage_target ||
+        !g_engine_render_final_stage_stub) {
+        return false;
+    }
+    if (g_engine_render_hook_target[0] != 0xE9 ||
+        g_engine_render_hook_target[5] != 0x90 ||
+        g_engine_render_hook_target[6] != 0x90) {
+        return false;
+    }
+    int32_t displacement = 0;
+    std::memcpy(&displacement, g_engine_render_hook_target + 1,
+                sizeof(displacement));
+    if (g_engine_render_hook_target + 5 + displacement !=
+        g_engine_render_hook_memory) {
+        return false;
+    }
+    if (g_engine_render_final_stage_target[0] != 0xE9) return false;
+    std::memcpy(&displacement, g_engine_render_final_stage_target + 1,
+                sizeof(displacement));
+    return g_engine_render_final_stage_target + 5 + displacement ==
+        g_engine_render_final_stage_stub;
+}
+
+void clear_engine_render_hook_sites() {
+    g_engine_render_hook_target = nullptr;
+    g_engine_render_loop_target = nullptr;
+    g_engine_render_final_stage_target = nullptr;
+    g_engine_render_final_stage_stub = nullptr;
+}
+
+bool install_engine_render_hook() {
+    if (g_engine_render_hook_target) {
+        const bool installed = engine_render_patch_matches();
+        g_engine_render_hook_active = installed;
+        return installed;
+    }
+    constexpr const char* completion_patterns[] = {
+        "C6 83 CE 02 00 00 01 48 8B 4B 28 39 09 E8 ?? ?? ?? ?? 90",
+        "C6 83 ?? ?? 00 00 01 48 8B 4B 28 39 09 E8 ?? ?? ?? ?? 90",
+    };
+    constexpr const char* loop_patterns[] = {
+        "48 8B 4B 20 48 8B 49 38 BA 0E 00 00 00 39 09 "
+        "E8 ?? ?? ?? ?? 48 8B CB E8 ?? ?? ?? ??",
+    };
+    g_engine_render_hook_target = find_hook_target_by_patterns(
+        "engine render completion", 0x3E65F4, completion_patterns,
+        sizeof(completion_patterns) / sizeof(completion_patterns[0]), nullptr);
+    g_engine_render_loop_target = find_hook_target_by_patterns(
+        "engine render loop", 0x3E6548, loop_patterns,
+        sizeof(loop_patterns) / sizeof(loop_patterns[0]), nullptr);
+    if (!g_engine_render_hook_target || !g_engine_render_loop_target) {
+        clear_engine_render_hook_sites();
+        return false;
+    }
+    g_engine_render_final_stage_target = g_engine_render_hook_target - 0x3D;
+
+    const unsigned char expected_original[7]{
+        0xC6, 0x83, 0xCE, 0x02, 0x00, 0x00, 0x01};
+    if (std::memcmp(g_engine_render_hook_target, expected_original,
+                    sizeof(expected_original)) != 0) {
+        render_log("engine render hook rejected unexpected completion bytes");
+        clear_engine_render_hook_sites();
+        return false;
+    }
+    const unsigned char expected_final_stage_branch[5]{
+        0x40, 0x84, 0xF6, 0x74, 0x4A,
+    };
+    if (std::memcmp(g_engine_render_final_stage_target,
+                    expected_final_stage_branch,
+                    sizeof(expected_final_stage_branch)) != 0) {
+        render_log("engine render hook rejected unexpected final-stage branch");
+        clear_engine_render_hook_sites();
+        return false;
+    }
+    const unsigned char expected_epilogue[15]{
+        0x90,
+        0x0F, 0x28, 0x74, 0x24, 0x40,
+        0x48, 0x83, 0xC4, 0x58,
+        0x5B, 0x5D, 0x5E, 0x5F, 0xC3,
+    };
+    if (std::memcmp(g_engine_render_hook_target + 0x12,
+                    expected_epilogue, sizeof(expected_epilogue)) != 0) {
+        render_log("engine render hook rejected unexpected stack layout");
+        clear_engine_render_hook_sites();
+        return false;
+    }
+    std::memcpy(g_engine_render_original.data(), g_engine_render_hook_target,
+                g_engine_render_original.size());
+    std::memcpy(g_engine_render_final_stage_original.data(),
+                g_engine_render_final_stage_target,
+                g_engine_render_final_stage_original.size());
+
+    auto* code = static_cast<unsigned char*>(g_engine_render_hook_memory);
+    if (!code) {
+        code = static_cast<unsigned char*>(
+            allocate_executable_near(g_engine_render_hook_target, 512));
+        if (!code) {
+            render_log("engine render hook could not allocate a near trampoline");
+            clear_engine_render_hook_sites();
+            return false;
+        }
+        g_engine_render_hook_memory = code;
+    }
+
+    const auto emit_relative_jump =
+        [](unsigned char*& cursor, const unsigned char* target) {
+            unsigned char* instruction = cursor;
+            *cursor++ = 0xE9;
+            const intptr_t delta = target - (instruction + 5);
+            const int32_t delta32 = static_cast<int32_t>(delta);
+            std::memcpy(cursor, &delta32, sizeof(delta32));
+            cursor += sizeof(delta32);
+        };
+
+    unsigned char* p = code;
+    const unsigned char save_prefix[] = {
+        0x9C, 0x50, 0x51, 0x52, 0x41, 0x50, 0x41, 0x51, 0x41, 0x52, 0x41, 0x53,
+        0x48, 0x81, 0xEC, 0x80, 0x00, 0x00, 0x00,
+        0xF3, 0x0F, 0x7F, 0x44, 0x24, 0x20,
+        0xF3, 0x0F, 0x7F, 0x4C, 0x24, 0x30,
+        0xF3, 0x0F, 0x7F, 0x54, 0x24, 0x40,
+        0xF3, 0x0F, 0x7F, 0x5C, 0x24, 0x50,
+        0xF3, 0x0F, 0x7F, 0x64, 0x24, 0x60,
+        0xF3, 0x0F, 0x7F, 0x6C, 0x24, 0x70,
+        0x48, 0x8B, 0xCB,
+        0x8B, 0xD6,
+        0x48, 0xB8,
+    };
+    std::memcpy(p, save_prefix, sizeof(save_prefix));
+    p += sizeof(save_prefix);
+    emit8(p, reinterpret_cast<uint64_t>(&engine_render_pass_complete));
+    const unsigned char call_and_restore[] = {
+        0xFF, 0xD0,
+        0xF3, 0x0F, 0x6F, 0x44, 0x24, 0x20,
+        0xF3, 0x0F, 0x6F, 0x4C, 0x24, 0x30,
+        0xF3, 0x0F, 0x6F, 0x54, 0x24, 0x40,
+        0xF3, 0x0F, 0x6F, 0x5C, 0x24, 0x50,
+        0xF3, 0x0F, 0x6F, 0x64, 0x24, 0x60,
+        0xF3, 0x0F, 0x6F, 0x6C, 0x24, 0x70,
+        0x48, 0x81, 0xC4, 0x80, 0x00, 0x00, 0x00,
+        0x85, 0xC0, 0x0F, 0x85,
+    };
+    std::memcpy(p, call_and_restore, sizeof(call_and_restore));
+    p += sizeof(call_and_restore);
+    unsigned char* loop_branch_displacement = p;
+    p += sizeof(int32_t);
+
+    const unsigned char restore_registers[] = {
+        0x41, 0x5B, 0x41, 0x5A, 0x41, 0x59, 0x41, 0x58,
+        0x5A, 0x59, 0x58, 0x9D,
+    };
+    std::memcpy(p, restore_registers, sizeof(restore_registers));
+    p += sizeof(restore_registers);
+    std::memcpy(p, g_engine_render_original.data(),
+                g_engine_render_original.size());
+    p += g_engine_render_original.size();
+    emit_relative_jump(p, g_engine_render_hook_target + 7);
+
+    unsigned char* loop_path = p;
+    std::memcpy(p, restore_registers, sizeof(restore_registers));
+    p += sizeof(restore_registers);
+    emit_relative_jump(p, g_engine_render_loop_target);
+
+    g_engine_render_final_stage_stub = p;
+    const unsigned char final_stage_prefix[] = {
+        0x9C,
+        0x50,
+        0x48, 0xB8,
+    };
+    std::memcpy(p, final_stage_prefix, sizeof(final_stage_prefix));
+    p += sizeof(final_stage_prefix);
+    emit8(p, reinterpret_cast<uint64_t>(&g_engine_render_pass));
+    const unsigned char compare_second_pass[] = {
+        0x83, 0x38, 0x01,
+        0x0F, 0x84,
+    };
+    std::memcpy(p, compare_second_pass, sizeof(compare_second_pass));
+    p += sizeof(compare_second_pass);
+    unsigned char* second_pass_displacement = p;
+    p += sizeof(int32_t);
+    const unsigned char restore_and_test_world[] = {
+        0x58,
+        0x9D,
+        0x40, 0x84, 0xF6,
+        0x0F, 0x84,
+    };
+    std::memcpy(p, restore_and_test_world, sizeof(restore_and_test_world));
+    p += sizeof(restore_and_test_world);
+    unsigned char* skip_world_displacement = p;
+    p += sizeof(int32_t);
+    emit_relative_jump(p, g_engine_render_final_stage_target + 5);
+
+    unsigned char* second_pass_path = p;
+    *p++ = 0x58;
+    *p++ = 0x9D;
+    emit_relative_jump(p, g_engine_render_hook_target);
+
+    unsigned char* skip_world_path = p;
+    emit_relative_jump(p, g_engine_render_hook_target + 0x12);
+
+    const intptr_t second_pass_delta =
+        second_pass_path -
+        (second_pass_displacement + sizeof(int32_t));
+    const int32_t second_pass_delta32 =
+        static_cast<int32_t>(second_pass_delta);
+    std::memcpy(second_pass_displacement, &second_pass_delta32,
+                sizeof(second_pass_delta32));
+    const intptr_t skip_world_delta =
+        skip_world_path -
+        (skip_world_displacement + sizeof(int32_t));
+    const int32_t skip_world_delta32 =
+        static_cast<int32_t>(skip_world_delta);
+    std::memcpy(skip_world_displacement, &skip_world_delta32,
+                sizeof(skip_world_delta32));
+
+    const intptr_t loop_delta =
+        loop_path - (loop_branch_displacement + sizeof(int32_t));
+    const int32_t loop_delta32 = static_cast<int32_t>(loop_delta);
+    std::memcpy(loop_branch_displacement, &loop_delta32,
+                sizeof(loop_delta32));
+    if (static_cast<size_t>(p - code) > 512) {
+        render_log("engine render hook trampoline overflow");
+        clear_engine_render_hook_sites();
+        return false;
+    }
+    FlushInstructionCache(GetCurrentProcess(), code,
+                          static_cast<SIZE_T>(p - code));
+
+    const intptr_t patch_delta =
+        code - (g_engine_render_hook_target + 5);
+    const intptr_t final_stage_patch_delta =
+        g_engine_render_final_stage_stub -
+        (g_engine_render_final_stage_target + 5);
+    if (patch_delta < INT32_MIN || patch_delta > INT32_MAX ||
+        final_stage_patch_delta < INT32_MIN ||
+        final_stage_patch_delta > INT32_MAX) {
+        render_log("engine render hook trampoline is outside rel32 range");
+        clear_engine_render_hook_sites();
+        return false;
+    }
+    const int32_t patch_delta32 = static_cast<int32_t>(patch_delta);
+    const int32_t final_stage_patch_delta32 =
+        static_cast<int32_t>(final_stage_patch_delta);
+    unsigned char* patch_start = g_engine_render_final_stage_target;
+    const size_t patch_size = static_cast<size_t>(
+        g_engine_render_hook_target +
+        g_engine_render_original.size() - patch_start);
+    DWORD old_protect = 0;
+    SuspendedProcessThreads suspended_threads;
+    if (!VirtualProtect(patch_start, patch_size,
+                        PAGE_EXECUTE_READWRITE, &old_protect)) {
+        clear_engine_render_hook_sites();
+        return false;
+    }
+    if (std::memcmp(g_engine_render_hook_target,
+                    g_engine_render_original.data(),
+                    g_engine_render_original.size()) != 0 ||
+        std::memcmp(g_engine_render_final_stage_target,
+                    g_engine_render_final_stage_original.data(),
+                    g_engine_render_final_stage_original.size()) != 0) {
+        DWORD unused = 0;
+        VirtualProtect(patch_start, patch_size, old_protect, &unused);
+        render_log("engine render hook sites changed before patching");
+        clear_engine_render_hook_sites();
+        return false;
+    }
+    g_engine_render_final_stage_target[0] = 0xE9;
+    std::memcpy(g_engine_render_final_stage_target + 1,
+                &final_stage_patch_delta32,
+                sizeof(final_stage_patch_delta32));
+    g_engine_render_hook_target[0] = 0xE9;
+    std::memcpy(g_engine_render_hook_target + 1, &patch_delta32,
+                sizeof(patch_delta32));
+    g_engine_render_hook_target[5] = 0x90;
+    g_engine_render_hook_target[6] = 0x90;
+    DWORD unused = 0;
+    VirtualProtect(patch_start, patch_size, old_protect, &unused);
+    FlushInstructionCache(GetCurrentProcess(), patch_start, patch_size);
+    InterlockedExchange(&g_engine_render_pass, 0);
+    InterlockedExchange(&g_engine_stereo_pair_ready, 0);
+    g_engine_render_hook_active = true;
+    render_log("engine render hook installed: two-pass stereo active");
+    return true;
+}
+
 bool install_interaction_hook() {
     constexpr const char* patterns[] = {
         "0F 29 BD 20 FE FF FF 44 0F 29 85 10 FE FF FF "
@@ -5534,8 +8477,10 @@ bool install_hook() {
         "44 0F 28 94 24 40 03 00 00 44 0F 28 9C 24 30 03 00 00 "
         "44 0F 28 A4 24 20 03 00 00 44 0F 28 AC 24 10 03 00 00 "
         "48 81 C4 90 03 00 00 5B 5D 5E 5F 41 5D 41 5E 41 5F C3",
-        "0F 28 B4 24 80 03 00 00 0F 28 BC 24 70 03 00 00",
-        "0F 28 B4 24 ?? ?? ?? ?? 0F 28 BC 24 ?? ?? ?? ??",
+        "0F 28 B4 24 80 03 00 00 0F 28 BC 24 70 03 00 00 "
+        "44 0F 28 84 24 60 03 00 00 44 0F 28 8C 24 50 03 00 00",
+        "0F 28 B4 24 ?? ?? ?? ?? 0F 28 BC 24 ?? ?? ?? ?? "
+        "44 0F 28 84 24 ?? ?? ?? ?? 44 0F 28 8C 24 ?? ?? ?? ??",
     };
     g_hook_target = find_hook_target_by_patterns(
         "camera hook", 0x5EC7F3, patterns,
@@ -5716,6 +8661,57 @@ bool restore_interaction_hook() {
     return true;
 }
 
+bool restore_engine_render_hook() {
+    if (!g_engine_render_hook_target) {
+        clear_engine_render_hook_sites();
+        g_engine_render_hook_active = false;
+        InterlockedExchange(&g_engine_render_pass, 0);
+        InterlockedExchange(&g_engine_stereo_pair_ready, 0);
+        InterlockedExchange(&g_render_eye, 0);
+        return true;
+    }
+    if (!engine_render_patch_matches()) {
+        render_log("engine render hook restore refused: patch ownership was lost");
+        return false;
+    }
+
+    unsigned char* patch_start = g_engine_render_final_stage_target;
+    const size_t patch_size = static_cast<size_t>(
+        g_engine_render_hook_target +
+        g_engine_render_original.size() - patch_start);
+    DWORD old_protect = 0;
+    SuspendedProcessThreads suspended_threads;
+    if (!VirtualProtect(patch_start, patch_size,
+                        PAGE_EXECUTE_READWRITE, &old_protect)) {
+        return false;
+    }
+    if (!engine_render_patch_matches()) {
+        DWORD unused = 0;
+        VirtualProtect(patch_start, patch_size, old_protect, &unused);
+        render_log(
+            "engine render hook restore refused: patch changed while suspending threads");
+        return false;
+    }
+
+    std::memcpy(g_engine_render_final_stage_target,
+                g_engine_render_final_stage_original.data(),
+                g_engine_render_final_stage_original.size());
+    std::memcpy(g_engine_render_hook_target, g_engine_render_original.data(),
+                g_engine_render_original.size());
+    DWORD unused = 0;
+    VirtualProtect(patch_start, patch_size, old_protect, &unused);
+    FlushInstructionCache(GetCurrentProcess(), patch_start, patch_size);
+    clear_engine_render_hook_sites();
+    g_engine_render_hook_active = false;
+    InterlockedExchange(&g_engine_render_pass, 0);
+    InterlockedExchange(&g_engine_stereo_pair_ready, 0);
+    InterlockedExchange(&g_render_eye, 0);
+    render_log("engine render hook restored");
+    // Keep the trampoline allocated because a thread that entered immediately
+    // before restoration can still be returning through it.
+    return true;
+}
+
 bool restore_noesis_hooks() {
     bool ok = true;
     if (g_noesis_renderer_target) {
@@ -5806,18 +8802,33 @@ bool restore_swap_hook() {
 
 bool restore_all_hooks(bool render_thread_cleanup) {
     AcquireSRWLockExclusive(&g_hook_lifecycle_lock);
+    if (!render_thread_cleanup &&
+        g_runtime_active.load(std::memory_order_acquire)) {
+        // OpenGL resources and source supersampling must be restored by the
+        // swap/render thread while its context is current. Keep every hook in
+        // place so the next swap can finish the unload safely.
+        ReleaseSRWLockExclusive(&g_hook_lifecycle_lock);
+        return false;
+    }
     publish_ui_scale_neutral();
     restore_neutral_camera(true);
-    if (render_thread_cleanup && g_runtime_active) shutdown_stereo();
+    if (render_thread_cleanup &&
+        g_runtime_active.load(std::memory_order_acquire)) {
+        shutdown_stereo();
+    }
 
-    const bool noesis_restored = restore_noesis_hooks();
-    const bool interaction_restored = noesis_restored && restore_interaction_hook();
+    const bool engine_render_restored = restore_engine_render_hook();
+    const bool noesis_restored =
+        engine_render_restored && restore_noesis_hooks();
+    const bool interaction_restored =
+        noesis_restored && restore_interaction_hook();
     const bool camera_restored = interaction_restored && restore_camera_hook();
     // Keep the swap callback installed when another hook could not be restored;
     // it gives the render thread a safe place to retry without unloading code.
     const bool swap_restored = camera_restored && restore_swap_hook();
-    const bool restored = noesis_restored && interaction_restored &&
-                          camera_restored && swap_restored;
+    const bool restored = engine_render_restored && noesis_restored &&
+                          interaction_restored && camera_restored &&
+                          swap_restored;
     if (g_shared) {
         g_shared->swap_hook_active = swap_restored ? 0u : 1u;
         g_shared->hook_active = restored ? 0u : 1u;
@@ -5863,6 +8874,7 @@ void close_worker_resources() {
 }
 
 [[noreturn]] void unload_worker_module() {
+    join_item_catalog_loader();
     if (g_vr_system) {
         vr::VR_Shutdown();
         g_vr_system = nullptr;
@@ -5879,6 +8891,14 @@ void close_worker_resources() {
 }
 
 DWORD WINAPI worker(void*) {
+    if (render_logging_enabled()) {
+        std::lock_guard<std::mutex> lock(g_render_log_mutex);
+        std::ofstream clear_log(render_log_path(), std::ios_base::trunc);
+        if (clear_log.is_open()) {
+            clear_log << GetTickCount64()
+                      << " worker start v122 floor aligned\n";
+        }
+    }
     render_log("worker start: opening shared mapping");
     g_mapping = OpenFileMappingW(FILE_MAP_ALL_ACCESS, FALSE, kVrCameraMappingName);
     if (!g_mapping) {
@@ -5914,9 +8934,18 @@ DWORD WINAPI worker(void*) {
         // The renderer export hook only forwarded the call and depended on an
         // unvalidated Noesis prologue. UI handling is owned by HytaleUIScaleHook.
         g_noesis_hooks_active = false;
+        // Replaying Hytale's render stages consumes internal frame queues and
+        // either crashes or skips the final colour/UI composition. Keep the
+        // experimental hook dormant until those queues can be cloned safely.
+        g_engine_render_hook_active = false;
+        InterlockedExchange(&g_engine_render_pass, 0);
+        InterlockedExchange(&g_engine_stereo_pair_ready, 0);
         if (!install_swap_hook()) {
-            restore_noesis_hooks();
-            const bool interaction_restored = restore_interaction_hook();
+            const bool engine_render_restored = restore_engine_render_hook();
+            const bool noesis_restored =
+                engine_render_restored && restore_noesis_hooks();
+            const bool interaction_restored =
+                noesis_restored && restore_interaction_hook();
             const bool camera_restored = interaction_restored && restore_camera_hook();
             g_shared->hook_active = camera_restored ? 0u : 1u;
             g_shared->hook_error = camera_restored ? 2 : 3;
@@ -5932,6 +8961,7 @@ DWORD WINAPI worker(void*) {
 
     uint32_t observed_install_sequence = g_shared->install_sequence;
     ULONGLONG unload_requested_at = 0;
+    ensure_item_catalog_loading();
     install_all_hooks();
     for (;;) {
         VrCameraControls controls{};
@@ -5978,13 +9008,6 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID) {
     if (reason == DLL_PROCESS_ATTACH) {
         g_module = module;
         DisableThreadLibraryCalls(module);
-        if (render_logging_enabled()) {
-            std::lock_guard<std::mutex> lock(g_render_log_mutex);
-            std::ofstream clear_log(render_log_path(), std::ios_base::trunc);
-            if (clear_log.is_open()) {
-                clear_log << GetTickCount64() << " DLL_PROCESS_ATTACH v122 floor aligned\n";
-            }
-        }
         HANDLE thread = CreateThread(nullptr, 0, worker, nullptr, 0, nullptr);
         if (thread) CloseHandle(thread);
     }

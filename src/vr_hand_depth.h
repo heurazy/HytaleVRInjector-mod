@@ -35,7 +35,7 @@ uniform int uUseSceneDepth;
 uniform vec2 uViewportSize;
 uniform float uDepthFarClip;
 uniform float uDepthBias;
-in vec2 vUv;
+in vec2 vUvOverDepth;
 in float vShade;
 in float vInverseDepth;
 out vec4 fragColor;
@@ -48,8 +48,16 @@ void main() {
             discard;
         }
     }
-    vec3 color = texture(uTexture, vUv).rgb * clamp(vShade, 0.35, 1.08);
-    fragColor = vec4(color, 1.0);
+    vec2 perspectiveUv =
+        vUvOverDepth / max(vInverseDepth, 0.0001);
+    vec4 texel = texture(uTexture, perspectiveUv);
+    if (texel.a < 0.01) {
+        discard;
+    }
+    float overlayDepth = 1.0 / max(vInverseDepth, 0.0001);
+    gl_FragDepth = clamp(overlayDepth / 16.0, 0.0, 0.999999);
+    vec3 color = texel.rgb * clamp(vShade, 0.35, 1.08);
+    fragColor = vec4(color, texel.a);
 }
 )GLSL";
 

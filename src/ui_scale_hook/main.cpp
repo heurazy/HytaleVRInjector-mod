@@ -6,12 +6,18 @@
 #include <mutex>
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstdint>
+#include <cstring>
 #include <initializer_list>
+#include <limits>
+#include <unordered_map>
 #include <unordered_set>
 #include <MinHook.h>
 
 #include "../ui_scene_depth_policy.h"
+#include "../ui_scale_shared.h"
+#include "../vr_held_item.h"
 
 // Basic OpenGL Type Definitions
 typedef unsigned int GLenum;
@@ -36,6 +42,13 @@ typedef void (WINAPI *glDrawElements_t)(GLenum mode, GLsizei count, GLenum type,
 typedef void (WINAPI *glUniformMatrix4fv_t)(GLint location, GLsizei count, GLboolean transpose, const GLfloat *value);
 typedef void (WINAPI *glProgramUniformMatrix4fv_t)(GLuint program, GLint location, GLsizei count, GLboolean transpose, const GLfloat *value);
 typedef GLint (WINAPI *glGetUniformLocation_t)(GLuint program, const GLchar *name);
+typedef void (WINAPI *glGetUniformiv_t)(GLuint program, GLint location, GLint *params);
+typedef void (WINAPI *glGetUniformfv_t)(GLuint program, GLint location, GLfloat *params);
+typedef GLint (WINAPI *glGetAttribLocation_t)(GLuint program, const GLchar *name);
+typedef void (WINAPI *glGetVertexAttribiv_t)(GLuint index, GLenum pname, GLint *params);
+typedef void (WINAPI *glGetVertexAttribPointerv_t)(GLuint index, GLenum pname, void **pointer);
+typedef void (WINAPI *glGetNamedBufferSubData_t)(GLuint buffer, GLintptr offset, GLsizeiptr size, void *data);
+typedef void (WINAPI *glGetNamedBufferParameteriv_t)(GLuint buffer, GLenum pname, GLint *params);
 typedef void (WINAPI *glViewport_t)(GLint x, GLint y, GLsizei width, GLsizei height);
 typedef GLboolean (WINAPI *glIsProgram_t)(GLuint program);
 typedef void (WINAPI *glGetObjectLabel_t)(GLenum identifier, GLuint name, GLsizei bufSize, GLsizei *length, GLchar *label);
@@ -53,6 +66,16 @@ typedef void (WINAPI *glBindFramebuffer_t)(GLenum target, GLuint framebuffer);
 typedef void (WINAPI *glGenFramebuffers_t)(GLsizei n, GLuint *framebuffers);
 typedef void (WINAPI *glFramebufferTexture2D_t)(GLenum target, GLenum attachment, GLenum textarget, GLuint texture, GLint level);
 typedef GLenum (WINAPI *glCheckFramebufferStatus_t)(GLenum target);
+typedef void (WINAPI *glDrawBuffer_t)(GLenum mode);
+typedef void (WINAPI *glReadBuffer_t)(GLenum mode);
+typedef void (WINAPI *glDepthMask_t)(GLboolean flag);
+typedef void (WINAPI *glColorMask_t)(GLboolean red, GLboolean green, GLboolean blue, GLboolean alpha);
+typedef void (WINAPI *glEnable_t)(GLenum cap);
+typedef void (WINAPI *glDisable_t)(GLenum cap);
+typedef void (WINAPI *glClearDepth_t)(double depth);
+typedef void (WINAPI *glDepthFunc_t)(GLenum function);
+typedef void (WINAPI *glGetBooleanv_t)(GLenum pname, GLboolean *data);
+typedef GLboolean (WINAPI *glIsEnabled_t)(GLenum cap);
 typedef BOOL (WINAPI *GetCursorPos_t)(LPPOINT lpPoint);
 typedef BOOL (WINAPI *GetClientRect_t)(HWND hWnd, LPRECT lpRect);
 typedef BOOL (WINAPI *SetCursorPos_t)(int X, int Y);
@@ -87,6 +110,13 @@ glDrawElements_t real_glDrawElements = nullptr;
 glUniformMatrix4fv_t real_glUniformMatrix4fv = nullptr;
 glProgramUniformMatrix4fv_t real_glProgramUniformMatrix4fv = nullptr;
 glGetUniformLocation_t real_glGetUniformLocation = nullptr;
+glGetUniformiv_t real_glGetUniformiv = nullptr;
+glGetUniformfv_t real_glGetUniformfv = nullptr;
+glGetAttribLocation_t real_glGetAttribLocation = nullptr;
+glGetVertexAttribiv_t real_glGetVertexAttribiv = nullptr;
+glGetVertexAttribPointerv_t real_glGetVertexAttribPointerv = nullptr;
+glGetNamedBufferSubData_t real_glGetNamedBufferSubData = nullptr;
+glGetNamedBufferParameteriv_t real_glGetNamedBufferParameteriv = nullptr;
 glViewport_t real_glViewport = nullptr;
 glIsProgram_t real_glIsProgram = nullptr;
 glGetObjectLabel_t real_glGetObjectLabel = nullptr;
@@ -104,6 +134,16 @@ glBindFramebuffer_t real_glBindFramebuffer = nullptr;
 glGenFramebuffers_t real_glGenFramebuffers = nullptr;
 glFramebufferTexture2D_t real_glFramebufferTexture2D = nullptr;
 glCheckFramebufferStatus_t real_glCheckFramebufferStatus = nullptr;
+glDrawBuffer_t raw_glDrawBuffer = nullptr;
+glReadBuffer_t raw_glReadBuffer = nullptr;
+glDepthMask_t raw_glDepthMask = nullptr;
+glColorMask_t raw_glColorMask = nullptr;
+glEnable_t raw_glEnable = nullptr;
+glDisable_t raw_glDisable = nullptr;
+glClearDepth_t raw_glClearDepth = nullptr;
+glDepthFunc_t raw_glDepthFunc = nullptr;
+glGetBooleanv_t raw_glGetBooleanv = nullptr;
+glIsEnabled_t raw_glIsEnabled = nullptr;
 GetCursorPos_t real_GetCursorPos = nullptr;
 GetClientRect_t real_GetClientRect = nullptr;
 SetCursorPos_t real_SetCursorPos = nullptr;
@@ -132,64 +172,123 @@ struct MappedBufferState {
     void* ptr;
     GLintptr offset;
     GLsizeiptr length;
+    bool readable;
+    bool writable;
 };
 thread_local std::vector<MappedBufferState> g_mappedBuffers;
+thread_local std::vector<unsigned char> g_bufferUploadScratch;
 thread_local GLuint g_sceneDataBuffer = 0;
 thread_local GLintptr g_sceneDataBufferOffset = 0;
 thread_local unsigned long long g_programUseSerial = 0;
 thread_local unsigned long long g_lastScenePatchProgramUseSerial = 0;
 
 // Shared Memory Structure
-struct SharedData {
-    float uiScale;
-    float offsetX;
-    float offsetY;
-    int disableUboScaling;
-    int disableShadows;
-    int disableParticles;
-    int disableDistortion;
-    int hideFirstPerson;
-    volatile LONG menuVisibleCounter;
-    volatile LONG menuLargeDrawCounter;
-    volatile LONG menuTextureId;
-    volatile LONG menuTextureWidth;
-    volatile LONG menuTextureHeight;
-    volatile LONG menuTextureFrame;
-    volatile LONG menuCaptureError;
-    volatile LONG currentEye;
-    volatile LONG renderFrameSequence;
-    volatile LONG suppressMenuInGame;
-    volatile LONG menuIgnoreDrawThreshold;
-    int firstPersonControllerReanchor;
-    int firstPersonControllerPoseValid;
-    float firstPersonHandNdcX;
-    float firstPersonHandNdcY;
-    float firstPersonHandDepth;
-    volatile LONG firstPersonMatrixPatches;
-    volatile LONG sceneDepthTextureId;
-    volatile LONG sceneDepthTextureWidth;
-    volatile LONG sceneDepthTextureHeight;
-    volatile LONG sceneDepthTextureFrame;
-    float sceneDepthFarClip;
-    volatile LONG distortionTextureId;
-    volatile LONG distortionTextureWidth;
-    volatile LONG distortionTextureHeight;
-    volatile LONG distortionTextureFrame;
-    volatile LONG vrSceneMatricesValid;
-    volatile LONG vrSceneMatrixSequence;
-    float vrSceneView[16];
-    float vrSceneProjection[16];
-    float vrSceneViewProjection[16];
-    float vrSceneInvView[16];
-    float vrSceneInvViewProjection[16];
-    float vrSceneReprojection[16];
-    float vrSceneProjectionInfo[4];
-};
+using SharedData = hytalevr::UiScaleSharedData;
 SharedData* g_sharedData = nullptr;
 HANDLE g_hMapFile = NULL;
-thread_local int g_firstPersonMatrixUniformSerial = 0;
+thread_local bool g_heldItemMatrixReadyForDraw = false;
+thread_local int g_currentHeldItemSide = -1;
+thread_local bool g_pendingHeldItemMatrixReady = false;
+thread_local GLuint g_pendingHeldItemProgram = 0;
+thread_local int g_pendingHeldItemSide = -1;
 
-std::atomic<bool> g_hooksInitialized{false};
+struct HeldItemDrawDescriptor {
+    bool indexed = false;
+    GLenum mode = 0;
+    GLint first = 0;
+    GLsizei count = 0;
+    GLenum indexType = 0;
+    uintptr_t indicesOffset = 0;
+};
+
+struct HeldItemUvCacheKey {
+    GLuint program = 0;
+    GLuint vertexArray = 0;
+    GLuint vertexBuffer = 0;
+    GLuint elementBuffer = 0;
+    uint64_t vertexBufferRevision = 0;
+    uint64_t elementBufferRevision = 0;
+    GLenum mode = 0;
+    GLint first = 0;
+    GLsizei count = 0;
+    GLenum indexType = 0;
+    uintptr_t indicesOffset = 0;
+    bool indexed = false;
+
+    bool operator==(const HeldItemUvCacheKey& other) const {
+        return program == other.program &&
+               vertexArray == other.vertexArray &&
+               vertexBuffer == other.vertexBuffer &&
+               elementBuffer == other.elementBuffer &&
+               vertexBufferRevision == other.vertexBufferRevision &&
+               elementBufferRevision == other.elementBufferRevision &&
+               mode == other.mode &&
+               first == other.first &&
+               count == other.count &&
+               indexType == other.indexType &&
+               indicesOffset == other.indicesOffset &&
+               indexed == other.indexed;
+    }
+};
+
+struct HeldItemUvCacheKeyHash {
+    size_t operator()(const HeldItemUvCacheKey& key) const {
+        size_t value = static_cast<size_t>(key.program);
+        const auto mix = [&](size_t component) {
+            value ^= component + static_cast<size_t>(0x9e3779b9u) +
+                     (value << 6u) + (value >> 2u);
+        };
+        mix(static_cast<size_t>(key.vertexArray));
+        mix(static_cast<size_t>(key.vertexBuffer));
+        mix(static_cast<size_t>(key.elementBuffer));
+        mix(static_cast<size_t>(key.vertexBufferRevision));
+        mix(static_cast<size_t>(key.vertexBufferRevision >> 32u));
+        mix(static_cast<size_t>(key.elementBufferRevision));
+        mix(static_cast<size_t>(key.elementBufferRevision >> 32u));
+        mix(static_cast<size_t>(key.mode));
+        mix(static_cast<size_t>(key.first));
+        mix(static_cast<size_t>(key.count));
+        mix(static_cast<size_t>(key.indexType));
+        mix(static_cast<size_t>(key.indicesOffset));
+        mix(static_cast<size_t>(key.indexed));
+        return value;
+    }
+};
+
+thread_local std::unordered_map<HeldItemUvCacheKey,
+                                hytalevr::HeldItemUvBounds,
+                                HeldItemUvCacheKeyHash>
+    g_heldItemUvCache;
+thread_local std::unordered_map<GLuint, uint64_t> g_heldItemBufferRevisions;
+thread_local uint64_t g_heldItemBufferRevisionSequence = 0;
+
+uint64_t HeldItemBufferRevision(GLuint buffer) {
+    if (buffer == 0) return 0;
+    const auto found = g_heldItemBufferRevisions.find(buffer);
+    return found == g_heldItemBufferRevisions.end() ? 0 : found->second;
+}
+
+void NoteHeldItemBufferMutation(GLenum target, GLuint buffer) {
+    constexpr GLenum kArrayBuffer = 0x8892;
+    constexpr GLenum kElementArrayBuffer = 0x8893;
+    if ((target != kArrayBuffer && target != kElementArrayBuffer) || buffer == 0) {
+        return;
+    }
+    if (g_heldItemBufferRevisions.size() >= 4096) {
+        g_heldItemBufferRevisions.clear();
+        g_heldItemUvCache.clear();
+    }
+    g_heldItemBufferRevisions[buffer] = ++g_heldItemBufferRevisionSequence;
+}
+
+enum class HookInitializationState : int {
+    Uninitialized = 0,
+    Initializing = 1,
+    Initialized = 2,
+};
+std::atomic<int> g_hookInitializationState{
+    static_cast<int>(HookInitializationState::Uninitialized)};
+std::atomic<ULONGLONG> g_nextHookInitializationRetryTick{0};
 std::mutex g_logMutex;
 
 bool DebugLoggingEnabled() {
@@ -222,6 +321,60 @@ void LogMessage(const std::string& message) {
     OutputDebugStringA(message.c_str());
 }
 
+void LogHeldItemRenderStackOnce() {
+    static std::atomic<bool> logged{false};
+    if (logged.exchange(true, std::memory_order_relaxed)) return;
+
+    void* frames[32]{};
+    const USHORT frameCount = CaptureStackBackTrace(1, 32, frames, nullptr);
+    std::string message = "HytaleUIScaleHook: held-item render stack";
+    for (USHORT index = 0; index < frameCount; ++index) {
+        HMODULE module = nullptr;
+        char modulePath[MAX_PATH]{};
+        if (GetModuleHandleExA(
+                GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                    GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                reinterpret_cast<LPCSTR>(frames[index]), &module) &&
+            GetModuleFileNameA(module, modulePath, MAX_PATH) != 0) {
+            const char* name = std::strrchr(modulePath, '\\');
+            if (!name) name = std::strrchr(modulePath, '/');
+            name = name ? name + 1 : modulePath;
+            char line[192]{};
+            sprintf_s(line, "\n  #%u %s+0x%llX", static_cast<unsigned>(index),
+                      name,
+                      static_cast<unsigned long long>(
+                          reinterpret_cast<uintptr_t>(frames[index]) -
+                          reinterpret_cast<uintptr_t>(module)));
+            message += line;
+        } else {
+            char line[96]{};
+            sprintf_s(line, "\n  #%u 0x%llX", static_cast<unsigned>(index),
+                      static_cast<unsigned long long>(
+                          reinterpret_cast<uintptr_t>(frames[index])));
+            message += line;
+        }
+    }
+
+    // This diagnostic is deliberately written once even when verbose logging is off.
+    std::lock_guard<std::mutex> lock(g_logMutex);
+    std::ofstream logFile(DebugLogPath(), std::ios_base::app);
+    if (logFile.is_open()) logFile << message << std::endl;
+    OutputDebugStringA(message.c_str());
+}
+
+void LogHeldItemDiagnosticOnce(uint32_t bit, const std::string& message) {
+    static std::atomic<uint32_t> loggedBits{0};
+    const uint32_t previous = loggedBits.fetch_or(bit, std::memory_order_relaxed);
+    if ((previous & bit) != 0) return;
+    std::lock_guard<std::mutex> lock(g_logMutex);
+    std::ofstream logFile(DebugLogPath(), std::ios_base::app);
+    if (logFile.is_open()) {
+        logFile << "HytaleUIScaleHook: held-item diagnostic: "
+                << message << std::endl;
+    }
+    OutputDebugStringA(message.c_str());
+}
+
 // UI Programs and Buffers Tracking
 struct UIProgram {
     GLuint id;
@@ -247,6 +400,7 @@ struct ProgramMatrixUniform {
     GLint location = -1;
 };
 std::vector<ProgramMatrixUniform> g_ssaoReprojectionUniforms;
+std::vector<ProgramMatrixUniform> g_heldItemModelUniforms;
 std::vector<GLuint> g_uiBufferIDs;
 std::unordered_set<GLuint> g_scannedPrograms;
 std::mutex g_programsMutex;
@@ -266,6 +420,8 @@ struct CurrentProgramFlags {
     bool sky = false;
     bool hizReproject = false;
     bool possibleFirstPerson = false;
+    bool heldItem = false;
+    GLint heldItemModelLocation = -1;
 };
 CurrentProgramFlags g_currentProgramFlags;
 GLuint g_neutralDistortionTexture = 0;
@@ -289,11 +445,13 @@ constexpr GLenum GL_TEXTURE0_VALUE = 0x84C0;
 constexpr GLenum GL_TEXTURE8_VALUE = 0x84C8;
 constexpr GLenum GL_ACTIVE_TEXTURE_VALUE = 0x84E0;
 constexpr GLenum GL_TEXTURE_BINDING_2D_VALUE = 0x8069;
+constexpr GLenum GL_VERTEX_ARRAY_BINDING_VALUE = 0x85B5;
 constexpr GLenum GL_TEXTURE_MIN_FILTER_VALUE = 0x2801;
 constexpr GLenum GL_TEXTURE_MAG_FILTER_VALUE = 0x2800;
 constexpr GLenum GL_TEXTURE_WRAP_S_VALUE = 0x2802;
 constexpr GLenum GL_TEXTURE_WRAP_T_VALUE = 0x2803;
 constexpr GLenum GL_NEAREST_VALUE = 0x2600;
+constexpr GLenum GL_LINEAR_VALUE = 0x2601;
 constexpr GLenum GL_CLAMP_TO_EDGE_VALUE = 0x812F;
 constexpr GLenum GL_RGBA8_VALUE = 0x8058;
 constexpr GLenum GL_RGBA_VALUE = 0x1908;
@@ -307,13 +465,41 @@ constexpr GLenum GL_COLOR_CLEAR_VALUE = 0x0C22;
 constexpr GLenum GL_TEXTURE_WIDTH_VALUE = 0x1000;
 constexpr GLenum GL_TEXTURE_HEIGHT_VALUE = 0x1001;
 constexpr GLenum GL_TEXTURE_INTERNAL_FORMAT_VALUE = 0x1003;
+constexpr GLenum GL_BUFFER_SIZE_VALUE = 0x8764;
+constexpr GLenum GL_READ_ONLY_VALUE = 0x88B8;
+constexpr GLenum GL_READ_WRITE_VALUE = 0x88BA;
+constexpr GLbitfield GL_MAP_READ_BIT_VALUE = 0x0001;
+constexpr GLbitfield GL_MAP_WRITE_BIT_VALUE = 0x0002;
 constexpr GLenum GL_TRIANGLES_VALUE = 0x0004;
 constexpr GLbitfield GL_COLOR_BUFFER_BIT_VALUE = 0x00004000;
+constexpr GLbitfield GL_DEPTH_BUFFER_BIT_VALUE = 0x00000100;
+constexpr GLenum GL_FRAMEBUFFER_VALUE = 0x8D40;
+constexpr GLenum GL_DEPTH_ATTACHMENT_VALUE = 0x8D00;
+constexpr GLenum GL_DEPTH_COMPONENT32F_VALUE = 0x8CAC;
+constexpr GLenum GL_DEPTH_COMPONENT_VALUE = 0x1902;
+constexpr GLenum GL_TEXTURE_COMPARE_MODE_VALUE = 0x884C;
+constexpr GLenum GL_NONE_VALUE = 0;
+constexpr GLenum GL_DRAW_BUFFER_VALUE = 0x0C01;
+constexpr GLenum GL_READ_BUFFER_VALUE = 0x0C02;
+constexpr GLenum GL_COLOR_WRITEMASK_VALUE = 0x0C23;
+constexpr GLenum GL_DEPTH_WRITEMASK_VALUE = 0x0B72;
+constexpr GLenum GL_DEPTH_CLEAR_VALUE = 0x0B73;
+constexpr GLenum GL_DEPTH_FUNC_VALUE = 0x0B74;
+constexpr GLenum GL_DEPTH_TEST_VALUE = 0x0B71;
+constexpr GLenum GL_LEQUAL_VALUE = 0x0203;
 DWORD g_lastSkyProgramUseTick = 0;
 GLuint g_cachedSceneDepthTexture = 0;
 GLsizei g_cachedSceneDepthWidth = 0;
 GLsizei g_cachedSceneDepthHeight = 0;
 int g_cachedSceneDepthScore = 0;
+GLuint g_heldItemDepthFbo = 0;
+GLuint g_heldItemColorTexture = 0;
+GLuint g_heldItemDepthTexture = 0;
+int g_heldItemDepthWidth = 0;
+int g_heldItemDepthHeight = 0;
+LONG g_heldItemDepthClearedFrame = -1;
+LONG g_heldItemLayerPositionFrame = -1;
+LONG g_heldItemAtlasPublishFrame = -1;
 
 std::vector<GLuint> g_loggedBufferIDs;
 std::mutex g_loggedBuffersMutex;
@@ -346,6 +532,13 @@ void RefreshCurrentProgramFlags(GLuint program) {
         flags.sky = ProgramListContains(g_skyPrograms, program);
         flags.hizReproject = ProgramListContains(g_hizReprojectPrograms, program);
         flags.possibleFirstPerson = ProgramListContains(g_possibleFirstPersonPrograms, program);
+        for (const ProgramMatrixUniform& uniform : g_heldItemModelUniforms) {
+            if (uniform.program == program) {
+                flags.heldItem = true;
+                flags.heldItemModelLocation = uniform.location;
+                break;
+            }
+        }
     }
     g_currentProgramFlags = flags;
 }
@@ -630,12 +823,17 @@ bool IsMapChunkAlphaProgram(GLuint program) {
            g_mapChunkAlphaPrograms.end();
 }
 
-bool IsPossibleFirstPersonProgram(GLuint program) {
-    if (program == g_currentProgram) return g_currentProgramFlags.possibleFirstPerson;
+GLint HeldItemModelMatrixLocation(GLuint program) {
+    if (program == g_currentProgram) {
+        return g_currentProgramFlags.heldItem
+            ? g_currentProgramFlags.heldItemModelLocation
+            : -1;
+    }
     std::lock_guard<std::mutex> lock(g_programsMutex);
-    return std::find(g_possibleFirstPersonPrograms.begin(),
-                     g_possibleFirstPersonPrograms.end(), program) !=
-           g_possibleFirstPersonPrograms.end();
+    for (const ProgramMatrixUniform& uniform : g_heldItemModelUniforms) {
+        if (uniform.program == program) return uniform.location;
+    }
+    return -1;
 }
 
 bool IsCelestialBillboardProgram(GLuint program) {
@@ -797,76 +995,475 @@ void NotePossibleFirstPersonProgram(GLuint program, const std::string& label) {
         label.find("Arm") != std::string::npos;
     if (!looks_first_person) return;
 
+    // Clipping/Distortion variants only build masks. Reanchoring those passes
+    // creates an invisible silhouette around the visible held item.
+    const bool looks_held_item =
+        hytalevr::is_held_item_visual_program_label(label);
+    const GLint model_matrix_location = looks_held_item && real_glGetUniformLocation
+        ? real_glGetUniformLocation(program, "uModelMatrix")
+        : -1;
+
     std::lock_guard<std::mutex> lock(g_programsMutex);
-    if (std::find(g_possibleFirstPersonPrograms.begin(),
-                  g_possibleFirstPersonPrograms.end(),
-                  program) != g_possibleFirstPersonPrograms.end()) {
-        return;
+    const bool already_first_person =
+        std::find(g_possibleFirstPersonPrograms.begin(),
+                  g_possibleFirstPersonPrograms.end(), program) !=
+        g_possibleFirstPersonPrograms.end();
+    if (!already_first_person) {
+        g_possibleFirstPersonPrograms.push_back(program);
+        LogMessage("HytaleUIScaleHook: possible first-person/viewmodel program ID: " +
+                   std::to_string(program) + ", Label: " + label);
     }
-    g_possibleFirstPersonPrograms.push_back(program);
-    LogMessage("HytaleUIScaleHook: possible first-person/viewmodel program ID: " +
-               std::to_string(program) + ", Label: " + label);
+    if (model_matrix_location >= 0) {
+        const bool already_held_item = std::any_of(
+            g_heldItemModelUniforms.begin(), g_heldItemModelUniforms.end(),
+            [&](const ProgramMatrixUniform& uniform) {
+                return uniform.program == program;
+            });
+        if (!already_held_item) {
+            g_heldItemModelUniforms.push_back({program, model_matrix_location});
+            LogMessage("HytaleUIScaleHook: held-item program ID: " +
+                       std::to_string(program) + ", uModelMatrix=" +
+                       std::to_string(model_matrix_location) + ", Label: " + label);
+        }
+    }
 }
 
 bool ShouldSkipFirstPersonDraw() {
-    return g_sharedData != nullptr &&
-           g_sharedData->hideFirstPerson != 0 &&
-           g_currentProgram != 0 &&
-           IsPossibleFirstPersonProgram(g_currentProgram);
-}
-
-bool ShouldReanchorFirstPersonProgram(GLuint program) {
-    return g_sharedData != nullptr &&
-           g_sharedData->firstPersonControllerReanchor != 0 &&
-           g_sharedData->firstPersonControllerPoseValid != 0 &&
-           program != 0 &&
-           IsPossibleFirstPersonProgram(program);
-}
-
-bool TryPatchFirstPersonMatrix(GLuint program,
-                               GLsizei count,
-                               const GLfloat* value,
-                               GLfloat (&modified)[16]) {
-    if (!ShouldReanchorFirstPersonProgram(program) || count != 1 || value == nullptr) {
+    if (!g_sharedData || g_sharedData->hideFirstPerson == 0 ||
+        g_currentProgram == 0 || !g_currentProgramFlags.possibleFirstPerson) {
         return false;
     }
-    memcpy(modified, value, sizeof(modified));
-    for (float element : modified) {
-        if (!std::isfinite(element)) return false;
+    if (g_currentProgramFlags.heldItem) {
+        return !g_heldItemMatrixReadyForDraw;
     }
-    if (std::fabs(modified[15] - 1.0f) > 0.25f) {
+    return true;
+}
+
+struct HeldItemPoseSnapshot {
+    LONG validMask = 0;
+    float worldScale = 1.0f;
+    float localOffset[3]{0.0f, 0.0f, -0.10f};
+    float visualScale = 0.30f;
+    float controllerPoses[2][12]{};
+};
+
+bool ReadHeldItemPoseSnapshot(HeldItemPoseSnapshot& snapshot) {
+    if (!g_sharedData || g_sharedData->heldItemReanchorEnabled == 0) return false;
+    for (int attempt = 0; attempt < 4; ++attempt) {
+        const LONG begin = InterlockedCompareExchange(
+            &g_sharedData->heldItemPoseSequence, 0, 0);
+        if ((begin & 1) != 0) continue;
+        snapshot.validMask = InterlockedCompareExchange(
+            &g_sharedData->heldItemPoseValidMask, 0, 0);
+        snapshot.worldScale = g_sharedData->heldItemWorldScale;
+        std::memcpy(snapshot.localOffset, g_sharedData->heldItemLocalOffset,
+                    sizeof(snapshot.localOffset));
+        snapshot.visualScale = g_sharedData->heldItemVisualScale;
+        std::memcpy(snapshot.controllerPoses,
+                    g_sharedData->heldItemControllerPoses,
+                    sizeof(snapshot.controllerPoses));
+        MemoryBarrier();
+        const LONG end = InterlockedCompareExchange(
+            &g_sharedData->heldItemPoseSequence, 0, 0);
+        if (begin == end && (end & 1) == 0) {
+            return snapshot.validMask != 0 &&
+                   std::isfinite(snapshot.worldScale) &&
+                   hytalevr::finite_values(snapshot.localOffset, 3) &&
+                   std::isfinite(snapshot.visualScale);
+        }
+    }
+    return false;
+}
+
+bool TryPatchHeldItemModelMatrix(GLuint program,
+                                 GLint location,
+                                 GLsizei count,
+                                 GLboolean transpose,
+                                 const GLfloat* value,
+                                 GLfloat (&modified)[16]) {
+    const GLint model_location = HeldItemModelMatrixLocation(program);
+    if (model_location < 0 || location != model_location) return false;
+    if (program == g_currentProgram) {
+        g_heldItemMatrixReadyForDraw = false;
+        g_currentHeldItemSide = -1;
+    } else if (program == g_pendingHeldItemProgram) {
+        g_pendingHeldItemMatrixReady = false;
+        g_pendingHeldItemSide = -1;
+    }
+    if (count != 1 || transpose != 0 || value == nullptr) {
+        return false;
+    }
+    if (!hytalevr::held_item_model_matrix_has_anchor(value)) return false;
+
+    HeldItemPoseSnapshot snapshot{};
+    if (!ReadHeldItemPoseSnapshot(snapshot)) return false;
+    const int side = hytalevr::held_item_side_from_model_matrix(value);
+    if ((snapshot.validMask & (1L << side)) == 0) return false;
+    if (!hytalevr::compose_held_item_model_matrix(
+            value, snapshot.controllerPoses[side], snapshot.worldScale,
+            snapshot.localOffset, snapshot.visualScale, modified)) {
         return false;
     }
 
-    const float ndcX = std::clamp(g_sharedData->firstPersonHandNdcX, -1.05f, 1.05f);
-    const float ndcY = std::clamp(g_sharedData->firstPersonHandNdcY, -0.95f, 0.95f);
-    const float depth = std::clamp(g_sharedData->firstPersonHandDepth, 0.25f, 1.25f);
-    const float handPlane = depth > 0.35f ? depth : 0.35f;
+    const LONG frame = InterlockedCompareExchange(
+        &g_sharedData->renderFrameSequence, 0, 0);
+    if (frame != g_heldItemLayerPositionFrame) {
+        g_heldItemLayerPositionFrame = frame;
+        InterlockedExchange(&g_sharedData->heldItemLayerVisibleMask, 0);
+    }
+    g_sharedData->heldItemLayerViewPositions[side][0] = modified[12];
+    g_sharedData->heldItemLayerViewPositions[side][1] = modified[13];
+    g_sharedData->heldItemLayerViewPositions[side][2] = modified[14];
+    MemoryBarrier();
+    InterlockedOr(&g_sharedData->heldItemLayerVisibleMask, 1L << side);
+    InterlockedExchange(&g_sharedData->heldItemMatrixFrame, frame);
 
-    // The vanilla first-person model is re-authored each frame around the
-    // player's body. Adding an offset leaves that body anchor in control; write
-    // the hand translation directly so the controller pose becomes the anchor.
-    // Hytale's current projection is close to 0.90/0.84 on X/Y, so convert
-    // projected controller coordinates back to a small eye-space placement.
-    modified[12] = ndcX * handPlane * 1.11f;
-    modified[13] = ndcY * handPlane * 1.20f;
-    modified[14] = -handPlane;
+    if (program == g_currentProgram) {
+        g_heldItemMatrixReadyForDraw = true;
+        g_currentHeldItemSide = side;
+    } else {
+        g_pendingHeldItemMatrixReady = true;
+        g_pendingHeldItemProgram = program;
+        g_pendingHeldItemSide = side;
+    }
     InterlockedIncrement(&g_sharedData->firstPersonMatrixPatches);
+    InterlockedIncrement(&g_sharedData->heldItemMatrixPatches);
 
     static DWORD lastLogTick = 0;
-    const DWORD now = GetTickCount();
-    if (now - lastLogTick > 1000) {
-        LogMessage("HytaleUIScaleHook: first-person native hand reanchor program=" +
+    const DWORD now = DebugLoggingEnabled() ? GetTickCount() : 0;
+    if (now != 0 && now - lastLogTick > 1000) {
+        LogMessage("HytaleUIScaleHook: held item reanchored program=" +
                    std::to_string(program) +
-                   " uniformSerial=" + std::to_string(g_firstPersonMatrixUniformSerial) +
-                   " ndc=(" + std::to_string(ndcX) + "," +
-                   std::to_string(ndcY) + ") depth=" +
-                   std::to_string(depth) + " z=" +
-                   std::to_string(modified[14]) + " mode=xyz");
+                   " side=" + (side == hytalevr::kHeldItemLeft ? "left" : "right") +
+                   " source=(" + std::to_string(value[12]) + "," +
+                   std::to_string(value[13]) + "," + std::to_string(value[14]) +
+                   ") tracked=(" + std::to_string(modified[12]) + "," +
+                   std::to_string(modified[13]) + "," +
+                   std::to_string(modified[14]) + ")");
         lastLogTick = now;
     }
-    ++g_firstPersonMatrixUniformSerial;
     return true;
+}
+
+bool ReadNamedBufferRange(GLuint buffer,
+                          size_t offset,
+                          size_t size,
+                          std::vector<uint8_t>& bytes) {
+    if (buffer == 0 || size == 0 || !real_glGetNamedBufferSubData ||
+        !real_glGetNamedBufferParameteriv ||
+        offset > static_cast<size_t>((std::numeric_limits<GLint>::max)()) ||
+        size > static_cast<size_t>((std::numeric_limits<GLint>::max)())) {
+        return false;
+    }
+    GLint buffer_size = 0;
+    real_glGetNamedBufferParameteriv(buffer, 0x8764, &buffer_size); // GL_BUFFER_SIZE
+    if (buffer_size <= 0 || offset > static_cast<size_t>(buffer_size) ||
+        size > static_cast<size_t>(buffer_size) - offset) {
+        return false;
+    }
+    bytes.resize(size);
+    real_glGetNamedBufferSubData(
+        buffer, static_cast<GLintptr>(offset), static_cast<GLsizeiptr>(size),
+        bytes.data());
+    return true;
+}
+
+bool DecodeHeldItemIndices(const HeldItemDrawDescriptor& draw,
+                           GLuint element_buffer,
+                           std::vector<uint32_t>& indices,
+                           uint32_t& min_index,
+                           uint32_t& max_index) {
+    if (draw.count <= 0) return false;
+    indices.clear();
+    indices.reserve(static_cast<size_t>(draw.count));
+    min_index = (std::numeric_limits<uint32_t>::max)();
+    max_index = 0;
+    if (!draw.indexed) {
+        if (draw.first < 0) return false;
+        const uint64_t last = static_cast<uint64_t>(draw.first) +
+                              static_cast<uint64_t>(draw.count) - 1u;
+        if (last > (std::numeric_limits<uint32_t>::max)()) return false;
+        min_index = static_cast<uint32_t>(draw.first);
+        max_index = static_cast<uint32_t>(last);
+        return true;
+    }
+
+    size_t index_size = 0;
+    if (draw.indexType == 0x1401) index_size = 1;      // GL_UNSIGNED_BYTE
+    else if (draw.indexType == 0x1403) index_size = 2; // GL_UNSIGNED_SHORT
+    else if (draw.indexType == 0x1405) index_size = 4; // GL_UNSIGNED_INT
+    else return false;
+
+    const size_t count = static_cast<size_t>(draw.count);
+    if (count > (std::numeric_limits<size_t>::max)() / index_size) return false;
+    std::vector<uint8_t> raw;
+    if (!ReadNamedBufferRange(
+            element_buffer, draw.indicesOffset, count * index_size, raw)) {
+        return false;
+    }
+    for (size_t index = 0; index < count; ++index) {
+        uint32_t value = 0;
+        if (index_size == 1) {
+            value = raw[index];
+        } else if (index_size == 2) {
+            uint16_t packed = 0;
+            std::memcpy(&packed, raw.data() + index * index_size, sizeof(packed));
+            value = packed;
+        } else {
+            std::memcpy(&value, raw.data() + index * index_size, sizeof(value));
+        }
+        indices.push_back(value);
+        min_index = (std::min)(min_index, value);
+        max_index = (std::max)(max_index, value);
+    }
+    return !indices.empty();
+}
+
+bool ResolveHeldItemUvBounds(const HeldItemDrawDescriptor& draw,
+                             GLuint vertex_array,
+                             hytalevr::HeldItemUvBounds& bounds) {
+    if (g_currentProgram == 0 || vertex_array == 0 || draw.count <= 0 ||
+        !real_glGetAttribLocation || !real_glGetVertexAttribiv ||
+        !real_glGetVertexAttribPointerv || !real_glGetIntegerv) {
+        return false;
+    }
+    const GLint location =
+        real_glGetAttribLocation(g_currentProgram, "vertTexCoords");
+    if (location < 0) return false;
+    GLint enabled = 0;
+    GLint size = 0;
+    GLint type = 0;
+    GLint stride = 0;
+    GLint integer_attribute = 0;
+    GLint vertex_buffer = 0;
+    real_glGetVertexAttribiv(
+        static_cast<GLuint>(location), 0x8622, &enabled);
+    real_glGetVertexAttribiv(
+        static_cast<GLuint>(location), 0x8623, &size);
+    real_glGetVertexAttribiv(
+        static_cast<GLuint>(location), 0x8625, &type);
+    real_glGetVertexAttribiv(
+        static_cast<GLuint>(location), 0x8624, &stride);
+    real_glGetVertexAttribiv(
+        static_cast<GLuint>(location), 0x88FD, &integer_attribute);
+    real_glGetVertexAttribiv(
+        static_cast<GLuint>(location), 0x889F, &vertex_buffer);
+    void* pointer = nullptr;
+    real_glGetVertexAttribPointerv(
+        static_cast<GLuint>(location), 0x8645, &pointer);
+    if (enabled == 0 || size != 1 || type != 0x1405 ||
+        integer_attribute == 0 || stride <= 0 || vertex_buffer <= 0) {
+        return false;
+    }
+
+    GLint element_buffer = 0;
+    if (draw.indexed) {
+        real_glGetIntegerv(0x8895, &element_buffer);
+        if (element_buffer <= 0) return false;
+    }
+    const HeldItemUvCacheKey cache_key{
+        g_currentProgram,
+        vertex_array,
+        static_cast<GLuint>(vertex_buffer),
+        static_cast<GLuint>((std::max)(0, element_buffer)),
+        HeldItemBufferRevision(static_cast<GLuint>(vertex_buffer)),
+        HeldItemBufferRevision(static_cast<GLuint>((std::max)(0, element_buffer))),
+        draw.mode,
+        draw.first,
+        draw.count,
+        draw.indexType,
+        draw.indicesOffset,
+        draw.indexed};
+    const auto cached = g_heldItemUvCache.find(cache_key);
+    if (cached != g_heldItemUvCache.end()) {
+        bounds = cached->second;
+        return bounds.valid;
+    }
+
+    std::vector<uint32_t> indices;
+    uint32_t min_index = 0;
+    uint32_t max_index = 0;
+    if (!DecodeHeldItemIndices(
+            draw, static_cast<GLuint>(element_buffer), indices,
+            min_index, max_index)) {
+        return false;
+    }
+
+    const size_t attribute_offset = reinterpret_cast<uintptr_t>(pointer);
+    const size_t vertex_stride = static_cast<size_t>(stride);
+    if (max_index > ((std::numeric_limits<size_t>::max)() - attribute_offset) /
+                        vertex_stride) {
+        return false;
+    }
+    const size_t first_offset =
+        attribute_offset + static_cast<size_t>(min_index) * vertex_stride;
+    const size_t span =
+        static_cast<size_t>(max_index - min_index) * vertex_stride +
+        sizeof(uint32_t);
+    std::vector<uint8_t> vertex_data;
+    if (!ReadNamedBufferRange(
+            static_cast<GLuint>(vertex_buffer), first_offset, span,
+            vertex_data)) {
+        return false;
+    }
+
+    bounds = {};
+    const auto include_index = [&](uint32_t vertex_index) {
+        const size_t local =
+            static_cast<size_t>(vertex_index - min_index) * vertex_stride;
+        if (local + sizeof(uint32_t) > vertex_data.size()) return false;
+        uint32_t packed = 0;
+        std::memcpy(&packed, vertex_data.data() + local, sizeof(packed));
+        hytalevr::include_held_item_packed_uv(packed, bounds);
+        return true;
+    };
+    if (draw.indexed) {
+        for (uint32_t vertex_index : indices) {
+            if (!include_index(vertex_index)) return false;
+        }
+    } else {
+        for (uint32_t vertex_index = min_index; vertex_index <= max_index;
+             ++vertex_index) {
+            if (!include_index(vertex_index)) return false;
+            if (vertex_index == (std::numeric_limits<uint32_t>::max)()) break;
+        }
+    }
+    if (!bounds.valid) return false;
+    if (g_heldItemUvCache.size() >= 2048) g_heldItemUvCache.clear();
+    g_heldItemUvCache.emplace(cache_key, bounds);
+    return true;
+}
+
+void PublishHeldItemAtlasState(const HeldItemDrawDescriptor& draw) {
+    if (!g_sharedData || g_currentProgram == 0 ||
+        g_currentHeldItemSide < hytalevr::kHeldItemLeft ||
+        g_currentHeldItemSide > hytalevr::kHeldItemRight ||
+        !real_glGetUniformLocation || !real_glGetUniformiv ||
+        !real_glGetUniformfv || !real_glActiveTexture ||
+        !real_glGetIntegerv || !real_glGetTexLevelParameteriv) {
+        LogHeldItemDiagnosticOnce(
+            1u, "atlas publish prerequisites are unavailable");
+        return;
+    }
+
+    const GLint offset_location =
+        real_glGetUniformLocation(g_currentProgram, "uGlobalOffset");
+    const GLint inverse_size_location =
+        real_glGetUniformLocation(g_currentProgram, "uAtlasSizeInv");
+    const GLint atlas_index_location =
+        real_glGetUniformLocation(g_currentProgram, "uAtlasIndex");
+    if (offset_location < 0 || inverse_size_location < 0 ||
+        atlas_index_location < 0) {
+        LogHeldItemDiagnosticOnce(
+            2u, "item program is missing atlas uniforms");
+        return;
+    }
+
+    GLint offset[2]{};
+    GLfloat inverse_size[2]{};
+    GLint atlas_index = 0;
+    real_glGetUniformiv(g_currentProgram, offset_location, offset);
+    real_glGetUniformfv(g_currentProgram, inverse_size_location, inverse_size);
+    real_glGetUniformiv(g_currentProgram, atlas_index_location, &atlas_index);
+    if (atlas_index < 0 || atlas_index > 2 ||
+        inverse_size[0] <= 0.0f || inverse_size[1] <= 0.0f) {
+        LogHeldItemDiagnosticOnce(
+            4u, "item atlas index or inverse size is invalid");
+        return;
+    }
+
+    const char* sampler_names[3] = {"uTexture0", "uTexture1", "uTexture2"};
+    const GLint sampler_location =
+        real_glGetUniformLocation(g_currentProgram, sampler_names[atlas_index]);
+    GLint texture_unit = atlas_index;
+    if (sampler_location >= 0) {
+        real_glGetUniformiv(g_currentProgram, sampler_location, &texture_unit);
+    }
+    if (texture_unit < 0 || texture_unit > 31) return;
+
+    GLint previous_active_texture = GL_TEXTURE0_VALUE;
+    GLint texture = 0;
+    GLint texture_width = 0;
+    GLint texture_height = 0;
+    GLint vertex_array = 0;
+    real_glGetIntegerv(GL_ACTIVE_TEXTURE_VALUE, &previous_active_texture);
+    real_glActiveTexture(GL_TEXTURE0_VALUE + static_cast<GLenum>(texture_unit));
+    real_glGetIntegerv(GL_TEXTURE_BINDING_2D_VALUE, &texture);
+    if (texture > 0) {
+        real_glGetTexLevelParameteriv(
+            GL_TEXTURE_2D_VALUE, 0, GL_TEXTURE_WIDTH_VALUE, &texture_width);
+        real_glGetTexLevelParameteriv(
+            GL_TEXTURE_2D_VALUE, 0, GL_TEXTURE_HEIGHT_VALUE, &texture_height);
+    }
+    real_glActiveTexture(static_cast<GLenum>(previous_active_texture));
+    real_glGetIntegerv(GL_VERTEX_ARRAY_BINDING_VALUE, &vertex_array);
+
+    hytalevr::HeldItemUvBounds uv_bounds{};
+    if (ResolveHeldItemUvBounds(
+            draw, static_cast<GLuint>(vertex_array), uv_bounds)) {
+        if (uv_bounds.min_u <=
+                static_cast<uint32_t>((std::numeric_limits<int>::max)()) &&
+            uv_bounds.min_v <=
+                static_cast<uint32_t>((std::numeric_limits<int>::max)())) {
+            offset[0] += static_cast<int>(uv_bounds.min_u);
+            offset[1] += static_cast<int>(uv_bounds.min_v);
+            LogHeldItemDiagnosticOnce(
+                32u, "resolved packed item UV origin=" +
+                         std::to_string(uv_bounds.min_u) + "," +
+                         std::to_string(uv_bounds.min_v) +
+                         " span=" +
+                         std::to_string(uv_bounds.max_u - uv_bounds.min_u) +
+                         "x" +
+                         std::to_string(uv_bounds.max_v - uv_bounds.min_v));
+        }
+    } else {
+        LogHeldItemDiagnosticOnce(
+            64u, "could not resolve packed item UV coordinates");
+    }
+    if (texture <= 0 || texture_width <= 0 || texture_height <= 0 ||
+        offset[0] < 0 || offset[1] < 0 ||
+        offset[0] >= texture_width || offset[1] >= texture_height) {
+        LogHeldItemDiagnosticOnce(
+            8u, "item atlas texture binding or offset is invalid");
+        return;
+    }
+
+    const int side = g_currentHeldItemSide;
+    const LONG frame = InterlockedCompareExchange(
+        &g_sharedData->renderFrameSequence, 0, 0);
+    InterlockedIncrement(&g_sharedData->heldItemAtlasSequence);
+    if (frame != g_heldItemAtlasPublishFrame) {
+        g_heldItemAtlasPublishFrame = frame;
+        InterlockedExchange(&g_sharedData->heldItemAtlasValidMask, 0);
+    }
+    g_sharedData->heldItemAtlasTextureIds[side] = texture;
+    g_sharedData->heldItemAtlasOffsets[side][0] = offset[0];
+    g_sharedData->heldItemAtlasOffsets[side][1] = offset[1];
+    g_sharedData->heldItemAtlasSizes[side][0] = texture_width;
+    g_sharedData->heldItemAtlasSizes[side][1] = texture_height;
+    g_sharedData->heldItemVertexArrayIds[side] = vertex_array;
+    g_sharedData->heldItemIndexCounts[side] = draw.count;
+    g_sharedData->heldItemUvBounds[side][0] =
+        uv_bounds.valid ? static_cast<LONG>(uv_bounds.min_u) : 0;
+    g_sharedData->heldItemUvBounds[side][1] =
+        uv_bounds.valid ? static_cast<LONG>(uv_bounds.min_v) : 0;
+    g_sharedData->heldItemUvBounds[side][2] =
+        uv_bounds.valid ? static_cast<LONG>(uv_bounds.max_u) : 0;
+    g_sharedData->heldItemUvBounds[side][3] =
+        uv_bounds.valid ? static_cast<LONG>(uv_bounds.max_v) : 0;
+    g_sharedData->heldItemAtlasFrame = frame;
+    MemoryBarrier();
+    InterlockedOr(&g_sharedData->heldItemAtlasValidMask, 1L << side);
+    InterlockedIncrement(&g_sharedData->heldItemAtlasSequence);
+    LogHeldItemDiagnosticOnce(
+        16u, "atlas publication succeeded program=" +
+                 std::to_string(g_currentProgram) +
+                 " texture=" + std::to_string(texture) +
+                 " offset=" + std::to_string(offset[0]) + "," +
+                 std::to_string(offset[1]) +
+                 " size=" + std::to_string(texture_width) + "x" +
+                 std::to_string(texture_height) +
+                 " side=" + std::to_string(side));
 }
 
 void RegisterProgramIfUI(GLuint program) {
@@ -1168,9 +1765,12 @@ void HookWndProc() {
 
 // Shared Memory Functions
 void InitializeSharedMemory() {
-    g_hMapFile = OpenFileMappingA(FILE_MAP_ALL_ACCESS, FALSE, "Local\\HytaleUIScaleSharedMemory");
+    g_hMapFile = OpenFileMappingA(
+        FILE_MAP_ALL_ACCESS, FALSE, hytalevr::kUiScaleMappingNameA);
     if (g_hMapFile == NULL) {
-        g_hMapFile = CreateFileMappingA(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, 0, sizeof(SharedData), "Local\\HytaleUIScaleSharedMemory");
+        g_hMapFile = CreateFileMappingA(
+            INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, 0, sizeof(SharedData),
+            hytalevr::kUiScaleMappingNameA);
         LogMessage("HytaleUIScaleHook: Shared memory mapping created.");
         if (g_hMapFile != NULL) {
             g_sharedData = (SharedData*)MapViewOfFile(g_hMapFile, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(SharedData));
@@ -1181,45 +1781,11 @@ void InitializeSharedMemory() {
     }
     
     if (g_hMapFile != NULL && g_sharedData != nullptr) {
-        if (g_sharedData->uiScale == 0.0f) {
-            g_sharedData->uiScale = 1.0f;
-            g_sharedData->offsetX = 0.0f;
-            g_sharedData->offsetY = 0.0f;
-            g_sharedData->disableUboScaling = 0;
-            g_sharedData->disableShadows = 0;
-            g_sharedData->disableParticles = 0;
-            g_sharedData->disableDistortion = 0;
-            g_sharedData->hideFirstPerson = 0;
-            g_sharedData->menuVisibleCounter = 0;
-            g_sharedData->menuLargeDrawCounter = 0;
-            g_sharedData->menuTextureId = 0;
-            g_sharedData->menuTextureWidth = 0;
-            g_sharedData->menuTextureHeight = 0;
-            g_sharedData->menuTextureFrame = 0;
-            g_sharedData->menuCaptureError = 0;
-            g_sharedData->currentEye = 0;
-            g_sharedData->renderFrameSequence = 0;
-            g_sharedData->suppressMenuInGame = 0;
-            g_sharedData->menuIgnoreDrawThreshold = 1;
-            g_sharedData->firstPersonControllerReanchor = 0;
-            g_sharedData->firstPersonControllerPoseValid = 0;
-            g_sharedData->firstPersonHandNdcX = 0.0f;
-            g_sharedData->firstPersonHandNdcY = 0.0f;
-            g_sharedData->firstPersonHandDepth = 0.0f;
-            g_sharedData->firstPersonMatrixPatches = 0;
-            g_sharedData->sceneDepthTextureId = 0;
-            g_sharedData->sceneDepthTextureWidth = 0;
-            g_sharedData->sceneDepthTextureHeight = 0;
-            g_sharedData->sceneDepthTextureFrame = 0;
-            g_sharedData->sceneDepthFarClip = 1024.0f;
-            g_sharedData->distortionTextureId = 0;
-            g_sharedData->distortionTextureWidth = 0;
-            g_sharedData->distortionTextureHeight = 0;
-            g_sharedData->distortionTextureFrame = 0;
-            g_sharedData->vrSceneMatricesValid = 0;
-            g_sharedData->vrSceneMatrixSequence = 0;
+        if (!hytalevr::ui_scale_shared_data_compatible(*g_sharedData)) {
+            hytalevr::initialize_ui_scale_shared_data(*g_sharedData);
         }
         g_sharedData->firstPersonMatrixPatches = 0;
+        g_sharedData->heldItemMatrixPatches = 0;
         if (g_sharedData->sceneDepthFarClip <= 0.0f) {
             g_sharedData->sceneDepthFarClip = 1024.0f;
         }
@@ -1291,9 +1857,17 @@ void WINAPI hook_glLinkProgram(GLuint program) {
 }
 
 void WINAPI hook_glUseProgram(GLuint program) {
+    const bool pending =
+        g_pendingHeldItemMatrixReady && g_pendingHeldItemProgram == program;
     g_currentProgram = program;
     ++g_programUseSerial;
-    g_firstPersonMatrixUniformSerial = 0;
+    g_heldItemMatrixReadyForDraw = pending;
+    g_currentHeldItemSide = pending ? g_pendingHeldItemSide : -1;
+    if (pending) {
+        g_pendingHeldItemMatrixReady = false;
+        g_pendingHeldItemProgram = 0;
+        g_pendingHeldItemSide = -1;
+    }
     real_glUseProgram(program);
     RegisterProgramIfUI(program);
     RefreshCurrentProgramFlags(program);
@@ -1760,6 +2334,168 @@ void PatchVrSceneDataForCurrentProgram() {
     }
 }
 
+bool EnsureHeldItemDepthTarget(int width, int height) {
+    if (width <= 0 || height <= 0 || !real_glGetIntegerv || !real_glGenTextures ||
+        !real_glBindTexture || !real_glTexImage2D || !real_glTexParameteri ||
+        !real_glGenFramebuffers || !real_glBindFramebuffer ||
+        !real_glFramebufferTexture2D || !real_glCheckFramebufferStatus ||
+        !raw_glDrawBuffer || !raw_glReadBuffer) {
+        return false;
+    }
+    if (g_heldItemColorTexture != 0 && g_heldItemDepthTexture != 0 &&
+        g_heldItemDepthFbo != 0 &&
+        g_heldItemDepthWidth == width && g_heldItemDepthHeight == height) {
+        return true;
+    }
+
+    GLint previous_texture = 0;
+    GLint previous_read_fbo = 0;
+    GLint previous_draw_fbo = 0;
+    GLint previous_read_buffer = 0;
+    GLint previous_draw_buffer = 0;
+    real_glGetIntegerv(GL_TEXTURE_BINDING_2D_VALUE, &previous_texture);
+    real_glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &previous_read_fbo);
+    real_glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &previous_draw_fbo);
+    real_glGetIntegerv(GL_READ_BUFFER_VALUE, &previous_read_buffer);
+    real_glGetIntegerv(GL_DRAW_BUFFER_VALUE, &previous_draw_buffer);
+
+    if (g_heldItemColorTexture == 0) {
+        real_glGenTextures(1, &g_heldItemColorTexture);
+    }
+    if (g_heldItemDepthTexture == 0) {
+        real_glGenTextures(1, &g_heldItemDepthTexture);
+    }
+    if (g_heldItemDepthFbo == 0) {
+        real_glGenFramebuffers(1, &g_heldItemDepthFbo);
+    }
+    if (g_heldItemColorTexture == 0 || g_heldItemDepthTexture == 0 ||
+        g_heldItemDepthFbo == 0) {
+        return false;
+    }
+
+    real_glBindTexture(GL_TEXTURE_2D_VALUE, g_heldItemColorTexture);
+    real_glTexParameteri(GL_TEXTURE_2D_VALUE, GL_TEXTURE_MIN_FILTER_VALUE, GL_LINEAR_VALUE);
+    real_glTexParameteri(GL_TEXTURE_2D_VALUE, GL_TEXTURE_MAG_FILTER_VALUE, GL_LINEAR_VALUE);
+    real_glTexParameteri(GL_TEXTURE_2D_VALUE, GL_TEXTURE_WRAP_S_VALUE, GL_CLAMP_TO_EDGE_VALUE);
+    real_glTexParameteri(GL_TEXTURE_2D_VALUE, GL_TEXTURE_WRAP_T_VALUE, GL_CLAMP_TO_EDGE_VALUE);
+    real_glTexImage2D(GL_TEXTURE_2D_VALUE, 0, GL_RGBA8_VALUE,
+                      width, height, 0, GL_RGBA_VALUE,
+                      GL_UNSIGNED_BYTE_VALUE, nullptr);
+
+    real_glBindTexture(GL_TEXTURE_2D_VALUE, g_heldItemDepthTexture);
+    real_glTexParameteri(GL_TEXTURE_2D_VALUE, GL_TEXTURE_MIN_FILTER_VALUE, GL_NEAREST_VALUE);
+    real_glTexParameteri(GL_TEXTURE_2D_VALUE, GL_TEXTURE_MAG_FILTER_VALUE, GL_NEAREST_VALUE);
+    real_glTexParameteri(GL_TEXTURE_2D_VALUE, GL_TEXTURE_WRAP_S_VALUE, GL_CLAMP_TO_EDGE_VALUE);
+    real_glTexParameteri(GL_TEXTURE_2D_VALUE, GL_TEXTURE_WRAP_T_VALUE, GL_CLAMP_TO_EDGE_VALUE);
+    real_glTexParameteri(GL_TEXTURE_2D_VALUE, GL_TEXTURE_COMPARE_MODE_VALUE, GL_NONE_VALUE);
+    real_glTexImage2D(GL_TEXTURE_2D_VALUE, 0, GL_DEPTH_COMPONENT32F_VALUE,
+                      width, height, 0, GL_DEPTH_COMPONENT_VALUE,
+                      GL_FLOAT_VALUE, nullptr);
+
+    real_glBindFramebuffer(GL_FRAMEBUFFER_VALUE, g_heldItemDepthFbo);
+    real_glFramebufferTexture2D(GL_FRAMEBUFFER_VALUE, GL_COLOR_ATTACHMENT0,
+                                GL_TEXTURE_2D_VALUE, g_heldItemColorTexture, 0);
+    real_glFramebufferTexture2D(GL_FRAMEBUFFER_VALUE, GL_DEPTH_ATTACHMENT_VALUE,
+                                GL_TEXTURE_2D_VALUE, g_heldItemDepthTexture, 0);
+    raw_glDrawBuffer(GL_COLOR_ATTACHMENT0);
+    raw_glReadBuffer(GL_COLOR_ATTACHMENT0);
+    const bool complete =
+        real_glCheckFramebufferStatus(GL_FRAMEBUFFER_VALUE) == GL_FRAMEBUFFER_COMPLETE;
+
+    real_glBindFramebuffer(GL_READ_FRAMEBUFFER, static_cast<GLuint>(previous_read_fbo));
+    real_glBindFramebuffer(GL_DRAW_FRAMEBUFFER, static_cast<GLuint>(previous_draw_fbo));
+    raw_glReadBuffer(static_cast<GLenum>(previous_read_buffer));
+    raw_glDrawBuffer(static_cast<GLenum>(previous_draw_buffer));
+    real_glBindTexture(GL_TEXTURE_2D_VALUE, static_cast<GLuint>(previous_texture));
+    if (!complete) return false;
+
+    g_heldItemDepthWidth = width;
+    g_heldItemDepthHeight = height;
+    g_heldItemDepthClearedFrame = -1;
+    return true;
+}
+
+template <typename DrawCall>
+bool CaptureHeldItemDepth(DrawCall&& draw_call) {
+    if (!g_sharedData || !g_currentProgramFlags.heldItem ||
+        !g_heldItemMatrixReadyForDraw || !real_glViewport || !real_glClear ||
+        !real_glGetFloatv || !real_glClearColor ||
+        !raw_glDepthMask || !raw_glColorMask || !raw_glEnable ||
+        !raw_glDisable || !raw_glClearDepth || !raw_glDepthFunc ||
+        !raw_glGetBooleanv || !raw_glIsEnabled) {
+        return false;
+    }
+
+    GLint viewport[4]{};
+    real_glGetIntegerv(GL_VIEWPORT, viewport);
+    if (!EnsureHeldItemDepthTarget(viewport[2], viewport[3])) return false;
+
+    GLint previous_read_fbo = 0;
+    GLint previous_draw_fbo = 0;
+    GLint previous_read_buffer = 0;
+    GLint previous_draw_buffer = 0;
+    GLint previous_depth_func = 0;
+    GLboolean previous_color_mask[4]{};
+    GLboolean previous_depth_mask = 0;
+    GLfloat previous_clear_depth = 1.0f;
+    GLfloat previous_clear_color[4]{};
+    real_glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &previous_read_fbo);
+    real_glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &previous_draw_fbo);
+    real_glGetIntegerv(GL_READ_BUFFER_VALUE, &previous_read_buffer);
+    real_glGetIntegerv(GL_DRAW_BUFFER_VALUE, &previous_draw_buffer);
+    real_glGetIntegerv(GL_DEPTH_FUNC_VALUE, &previous_depth_func);
+    raw_glGetBooleanv(GL_COLOR_WRITEMASK_VALUE, previous_color_mask);
+    raw_glGetBooleanv(GL_DEPTH_WRITEMASK_VALUE, &previous_depth_mask);
+    real_glGetFloatv(GL_DEPTH_CLEAR_VALUE, &previous_clear_depth);
+    real_glGetFloatv(GL_COLOR_CLEAR_VALUE, previous_clear_color);
+    const GLboolean depth_test_enabled = raw_glIsEnabled(GL_DEPTH_TEST_VALUE);
+
+    real_glBindFramebuffer(GL_FRAMEBUFFER_VALUE, g_heldItemDepthFbo);
+    raw_glDrawBuffer(GL_COLOR_ATTACHMENT0);
+    raw_glReadBuffer(GL_COLOR_ATTACHMENT0);
+    real_glViewport(0, 0, g_heldItemDepthWidth, g_heldItemDepthHeight);
+    raw_glColorMask(1, 1, 1, 1);
+    raw_glDepthMask(1);
+    raw_glEnable(GL_DEPTH_TEST_VALUE);
+    raw_glDepthFunc(GL_LEQUAL_VALUE);
+
+    const LONG frame = InterlockedCompareExchange(
+        &g_sharedData->renderFrameSequence, 0, 0);
+    if (frame != g_heldItemDepthClearedFrame) {
+        real_glClearColor(0.0f, 0.0f, 0.0f, 0.0f);
+        raw_glClearDepth(1.0);
+        real_glClear(GL_COLOR_BUFFER_BIT_VALUE | GL_DEPTH_BUFFER_BIT_VALUE);
+        g_heldItemDepthClearedFrame = frame;
+    }
+    draw_call();
+
+    InterlockedExchange(&g_sharedData->heldItemLayerTextureId,
+                        static_cast<LONG>(g_heldItemColorTexture));
+    InterlockedExchange(&g_sharedData->heldItemDepthTextureId,
+                        static_cast<LONG>(g_heldItemDepthTexture));
+    InterlockedExchange(&g_sharedData->heldItemDepthTextureWidth,
+                        g_heldItemDepthWidth);
+    InterlockedExchange(&g_sharedData->heldItemDepthTextureHeight,
+                        g_heldItemDepthHeight);
+    InterlockedExchange(&g_sharedData->heldItemDepthTextureFrame, frame);
+
+    real_glBindFramebuffer(GL_READ_FRAMEBUFFER, static_cast<GLuint>(previous_read_fbo));
+    real_glBindFramebuffer(GL_DRAW_FRAMEBUFFER, static_cast<GLuint>(previous_draw_fbo));
+    raw_glReadBuffer(static_cast<GLenum>(previous_read_buffer));
+    raw_glDrawBuffer(static_cast<GLenum>(previous_draw_buffer));
+    real_glViewport(viewport[0], viewport[1], viewport[2], viewport[3]);
+    raw_glColorMask(previous_color_mask[0], previous_color_mask[1],
+                    previous_color_mask[2], previous_color_mask[3]);
+    raw_glDepthMask(previous_depth_mask);
+    raw_glDepthFunc(static_cast<GLenum>(previous_depth_func));
+    raw_glClearDepth(previous_clear_depth);
+    real_glClearColor(previous_clear_color[0], previous_clear_color[1],
+                      previous_clear_color[2], previous_clear_color[3]);
+    if (depth_test_enabled) raw_glEnable(GL_DEPTH_TEST_VALUE);
+    else raw_glDisable(GL_DEPTH_TEST_VALUE);
+    return true;
+}
+
 void WINAPI hook_glDrawArrays(GLenum mode, GLint first, GLsizei count) {
     if (ShouldSkipFirstPersonDraw()) {
         static bool logged = false;
@@ -1807,6 +2543,12 @@ void WINAPI hook_glDrawArrays(GLenum mode, GLint first, GLsizei count) {
             LogMessage("HytaleUIScaleHook: skipping particle glDrawArrays while rain/effects are disabled.");
             logged = true;
         }
+        return;
+    }
+    if (g_currentProgramFlags.heldItem && g_heldItemMatrixReadyForDraw) {
+        LogHeldItemRenderStackOnce();
+        PublishHeldItemAtlasState(
+            {false, mode, first, count, 0, 0});
         return;
     }
     DrawWithOptionalNeutralWaterEffects([&]() {
@@ -1867,6 +2609,12 @@ void WINAPI hook_glDrawElements(GLenum mode, GLsizei count, GLenum type, const v
         }
         return;
     }
+    if (g_currentProgramFlags.heldItem && g_heldItemMatrixReadyForDraw) {
+        LogHeldItemRenderStackOnce();
+        PublishHeldItemAtlasState(
+            {true, mode, 0, count, type, reinterpret_cast<uintptr_t>(indices)});
+        return;
+    }
     DrawWithOptionalNeutralWaterEffects([&]() {
         real_glDrawElements(mode, count, type, indices);
     });
@@ -1909,9 +2657,10 @@ void WINAPI hook_glUniformMatrix4fv(GLint location, GLsizei count, GLboolean tra
         return;
     }
 
-    GLfloat firstPersonModified[16];
-    if (TryPatchFirstPersonMatrix(g_currentProgram, count, value, firstPersonModified)) {
-        real_glUniformMatrix4fv(location, count, transpose, firstPersonModified);
+    GLfloat heldItemModified[16];
+    if (TryPatchHeldItemModelMatrix(g_currentProgram, location, count, transpose,
+                                    value, heldItemModified)) {
+        real_glUniformMatrix4fv(location, count, transpose, heldItemModified);
         return;
     }
     
@@ -1963,9 +2712,11 @@ void WINAPI hook_glProgramUniformMatrix4fv(GLuint program, GLint location, GLsiz
         return;
     }
 
-    GLfloat firstPersonModified[16];
-    if (TryPatchFirstPersonMatrix(program, count, value, firstPersonModified)) {
-        real_glProgramUniformMatrix4fv(program, location, count, transpose, firstPersonModified);
+    GLfloat heldItemModified[16];
+    if (TryPatchHeldItemModelMatrix(program, location, count, transpose,
+                                    value, heldItemModified)) {
+        real_glProgramUniformMatrix4fv(program, location, count, transpose,
+                                       heldItemModified);
         return;
     }
     
@@ -2116,6 +2867,38 @@ bool ShouldModifyBatcher2DVertices() {
            g_currentProgram != 0 &&
            IsBatcher2DProgram(g_currentProgram) &&
            g_sharedData->disableUboScaling != 0;
+}
+
+bool ShouldModifyUboUpload() {
+    if (!g_sharedData || g_sharedData->disableUboScaling != 0) return false;
+    return g_sharedData->uiScale != 1.0f ||
+           g_sharedData->offsetX != 0.0f ||
+           g_sharedData->offsetY != 0.0f;
+}
+
+bool PrepareBufferUploadCopy(const void* data, GLsizeiptr size) {
+    if (!data || size <= 0) return false;
+    constexpr size_t kMaxPatchedUploadBytes = 16u * 1024u * 1024u;
+    const size_t byte_count = static_cast<size_t>(size);
+    if (static_cast<GLsizeiptr>(byte_count) != size ||
+        byte_count > kMaxPatchedUploadBytes) {
+        return false;
+    }
+    try {
+        g_bufferUploadScratch.resize(byte_count);
+    } catch (...) {
+        return false;
+    }
+    std::memcpy(g_bufferUploadScratch.data(), data, byte_count);
+    return true;
+}
+
+GLsizeiptr BoundBufferSize(GLuint buffer) {
+    if (buffer == 0 || !real_glGetNamedBufferParameteriv) return 0;
+    GLint buffer_size = 0;
+    real_glGetNamedBufferParameteriv(
+        buffer, GL_BUFFER_SIZE_VALUE, &buffer_size);
+    return buffer_size > 0 ? static_cast<GLsizeiptr>(buffer_size) : 0;
 }
 
 void ObserveBatcher2DMenuVertices(const void* data, GLsizeiptr size, const std::string& source, GLuint bufferID) {
@@ -2340,74 +3123,117 @@ void ModifyBatcher2DVertices(void* data, GLsizeiptr size, const std::string& sou
 }
 
 void WINAPI hook_glBufferSubData(GLenum target, GLintptr offset, GLsizeiptr size, const void *data) {
-    if (target == 0x8892 && data != nullptr && size >= 64) { // GL_ARRAY_BUFFER
+    if (target == 0x8892 && data != nullptr && size >= 64 &&
+        ShouldModifyBatcher2DVertices()) { // GL_ARRAY_BUFFER
         GLuint bufID = GetBoundBufferID(target);
-        std::vector<unsigned char> tempBuffer(size);
-        memcpy(tempBuffer.data(), data, size);
-        ModifyBatcher2DVertices(tempBuffer.data(), size, "glBufferSubData", bufID, offset);
-        real_glBufferSubData(target, offset, size, tempBuffer.data());
+        const void* upload_data = data;
+        if (PrepareBufferUploadCopy(data, size)) {
+            ModifyBatcher2DVertices(
+                g_bufferUploadScratch.data(), size, "glBufferSubData", bufID,
+                offset);
+            upload_data = g_bufferUploadScratch.data();
+        }
+        real_glBufferSubData(target, offset, size, upload_data);
+        NoteHeldItemBufferMutation(target, bufID);
         return;
     }
-    if (target == 0x8A11 && data != nullptr && size >= 64) { // GL_UNIFORM_BUFFER
+    if (target == 0x8A11 && data != nullptr && size >= 64 &&
+        ShouldModifyUboUpload()) { // GL_UNIFORM_BUFFER
         GLuint bufID = GetBoundBufferID(target);
-        std::vector<unsigned char> tempBuffer(size);
-        memcpy(tempBuffer.data(), data, size);
-        
-        ScanAndModifyMatrix(tempBuffer.data(), size, "glBufferSubData", bufID, offset);
-        real_glBufferSubData(target, offset, size, tempBuffer.data());
+        const void* upload_data = data;
+        if (PrepareBufferUploadCopy(data, size)) {
+            ScanAndModifyMatrix(
+                g_bufferUploadScratch.data(), size, "glBufferSubData", bufID,
+                offset);
+            upload_data = g_bufferUploadScratch.data();
+        }
+        real_glBufferSubData(target, offset, size, upload_data);
         return;
     }
+    const GLuint buffer =
+        (target == 0x8892 || target == 0x8893) ? GetBoundBufferID(target) : 0;
     real_glBufferSubData(target, offset, size, data);
+    NoteHeldItemBufferMutation(target, buffer);
 }
 
 void WINAPI hook_glBufferData(GLenum target, GLsizeiptr size, const void *data, GLenum usage) {
-    if (target == 0x8892 && data != nullptr && size >= 64) { // GL_ARRAY_BUFFER
+    if (target == 0x8892 && data != nullptr && size >= 64 &&
+        ShouldModifyBatcher2DVertices()) { // GL_ARRAY_BUFFER
         GLuint bufID = GetBoundBufferID(target);
-        std::vector<unsigned char> tempBuffer(size);
-        memcpy(tempBuffer.data(), data, size);
-        ModifyBatcher2DVertices(tempBuffer.data(), size, "glBufferData", bufID, 0);
-        real_glBufferData(target, size, tempBuffer.data(), usage);
+        const void* upload_data = data;
+        if (PrepareBufferUploadCopy(data, size)) {
+            ModifyBatcher2DVertices(
+                g_bufferUploadScratch.data(), size, "glBufferData", bufID, 0);
+            upload_data = g_bufferUploadScratch.data();
+        }
+        real_glBufferData(target, size, upload_data, usage);
+        NoteHeldItemBufferMutation(target, bufID);
         return;
     }
-    if (target == 0x8A11 && data != nullptr && size >= 64) { // GL_UNIFORM_BUFFER
+    if (target == 0x8A11 && data != nullptr && size >= 64 &&
+        ShouldModifyUboUpload()) { // GL_UNIFORM_BUFFER
         GLuint bufID = GetBoundBufferID(target);
-        std::vector<unsigned char> tempBuffer(size);
-        memcpy(tempBuffer.data(), data, size);
-        
-        ScanAndModifyMatrix(tempBuffer.data(), size, "glBufferData", bufID, 0);
-        real_glBufferData(target, size, tempBuffer.data(), usage);
+        const void* upload_data = data;
+        if (PrepareBufferUploadCopy(data, size)) {
+            ScanAndModifyMatrix(
+                g_bufferUploadScratch.data(), size, "glBufferData", bufID, 0);
+            upload_data = g_bufferUploadScratch.data();
+        }
+        real_glBufferData(target, size, upload_data, usage);
         return;
     }
+    const GLuint buffer =
+        (target == 0x8892 || target == 0x8893) ? GetBoundBufferID(target) : 0;
     real_glBufferData(target, size, data, usage);
+    NoteHeldItemBufferMutation(target, buffer);
 }
 
 void WINAPI hook_glBufferStorage(GLenum target, GLsizeiptr size, const void *data, GLbitfield flags) {
-    if (target == 0x8892 && data != nullptr && size >= 64) { // GL_ARRAY_BUFFER
+    if (target == 0x8892 && data != nullptr && size >= 64 &&
+        ShouldModifyBatcher2DVertices()) { // GL_ARRAY_BUFFER
         GLuint bufID = GetBoundBufferID(target);
-        std::vector<unsigned char> tempBuffer(size);
-        memcpy(tempBuffer.data(), data, size);
-        ModifyBatcher2DVertices(tempBuffer.data(), size, "glBufferStorage", bufID, 0);
-        real_glBufferStorage(target, size, tempBuffer.data(), flags);
+        const void* upload_data = data;
+        if (PrepareBufferUploadCopy(data, size)) {
+            ModifyBatcher2DVertices(
+                g_bufferUploadScratch.data(), size, "glBufferStorage", bufID,
+                0);
+            upload_data = g_bufferUploadScratch.data();
+        }
+        real_glBufferStorage(target, size, upload_data, flags);
+        NoteHeldItemBufferMutation(target, bufID);
         return;
     }
-    if (target == 0x8A11 && data != nullptr && size >= 64) { // GL_UNIFORM_BUFFER
+    if (target == 0x8A11 && data != nullptr && size >= 64 &&
+        ShouldModifyUboUpload()) { // GL_UNIFORM_BUFFER
         GLuint bufID = GetBoundBufferID(target);
-        std::vector<unsigned char> tempBuffer(size);
-        memcpy(tempBuffer.data(), data, size);
-        
-        ScanAndModifyMatrix(tempBuffer.data(), size, "glBufferStorage", bufID, 0);
-        real_glBufferStorage(target, size, tempBuffer.data(), flags);
+        const void* upload_data = data;
+        if (PrepareBufferUploadCopy(data, size)) {
+            ScanAndModifyMatrix(
+                g_bufferUploadScratch.data(), size, "glBufferStorage", bufID,
+                0);
+            upload_data = g_bufferUploadScratch.data();
+        }
+        real_glBufferStorage(target, size, upload_data, flags);
         return;
     }
+    const GLuint buffer =
+        (target == 0x8892 || target == 0x8893) ? GetBoundBufferID(target) : 0;
     real_glBufferStorage(target, size, data, flags);
+    NoteHeldItemBufferMutation(target, buffer);
 }
 
 void* WINAPI hook_glMapBuffer(GLenum target, GLenum access) {
     void* result = real_glMapBuffer(target, access);
     if (result != nullptr && target == 0x8A11) { // GL_UNIFORM_BUFFER
         GLuint bufID = GetBoundBufferID(target);
-        MappedBufferState state = { bufID, result, 0, 99999999 };
-        
+        const bool readable =
+            access == GL_READ_ONLY_VALUE || access == GL_READ_WRITE_VALUE;
+        const bool writable = access == GL_READ_WRITE_VALUE;
+        const GLsizeiptr length = BoundBufferSize(bufID);
+        if (!readable || !writable || length < 64) return result;
+        MappedBufferState state = {
+            bufID, result, 0, length, readable, writable};
+
         bool found = false;
         for (auto& b : g_mappedBuffers) {
             if (b.bufferID == bufID) {
@@ -2427,8 +3253,17 @@ void* WINAPI hook_glMapBufferRange(GLenum target, GLintptr offset, GLsizeiptr le
     void* result = real_glMapBufferRange(target, offset, length, access);
     if (result != nullptr && target == 0x8A11) { // GL_UNIFORM_BUFFER
         GLuint bufID = GetBoundBufferID(target);
-        MappedBufferState state = { bufID, result, offset, length };
-        
+        const bool readable = (access & GL_MAP_READ_BIT_VALUE) != 0;
+        const bool writable = (access & GL_MAP_WRITE_BIT_VALUE) != 0;
+        const GLsizeiptr buffer_size = BoundBufferSize(bufID);
+        if (!readable || !writable || length < 64 || offset < 0 ||
+            buffer_size <= 0 || offset > buffer_size ||
+            length > buffer_size - offset) {
+            return result;
+        }
+        MappedBufferState state = {
+            bufID, result, offset, length, readable, writable};
+
         bool found = false;
         for (auto& b : g_mappedBuffers) {
             if (b.bufferID == bufID) {
@@ -2445,21 +3280,33 @@ void* WINAPI hook_glMapBufferRange(GLenum target, GLintptr offset, GLsizeiptr le
 }
 
 GLboolean WINAPI hook_glUnmapBuffer(GLenum target) {
+    const GLuint mutated_buffer =
+        (target == 0x8892 || target == 0x8893) ? GetBoundBufferID(target) : 0;
     if (target == 0x8A11) { // GL_UNIFORM_BUFFER
         GLuint bufID = GetBoundBufferID(target);
         for (auto it = g_mappedBuffers.begin(); it != g_mappedBuffers.end(); ++it) {
             if (it->bufferID == bufID) {
-                ScanAndModifyMatrix(it->ptr, it->length, "glUnmapBuffer", it->bufferID, it->offset);
+                if (it->readable && it->writable && it->length >= 64) {
+                    ScanAndModifyMatrix(
+                        it->ptr, it->length, "glUnmapBuffer", it->bufferID,
+                        it->offset);
+                }
                 g_mappedBuffers.erase(it);
                 break;
             }
         }
     }
-    return real_glUnmapBuffer(target);
+    const GLboolean result = real_glUnmapBuffer(target);
+    if (result) NoteHeldItemBufferMutation(target, mutated_buffer);
+    return result;
 }
 
 void WINAPI hook_glViewport(GLint x, GLint y, GLsizei width, GLsizei height) {
-    if (!g_hooksInitialized.load()) {
+    const int initialized =
+        static_cast<int>(HookInitializationState::Initialized);
+    if (g_hookInitializationState.load(std::memory_order_acquire) != initialized &&
+        GetTickCount64() >=
+            g_nextHookInitializationRetryTick.load(std::memory_order_relaxed)) {
         InitializeHooks();
     }
     HookWndProc();
@@ -2468,10 +3315,23 @@ void WINAPI hook_glViewport(GLint x, GLint y, GLsizei width, GLsizei height) {
 
 // Hook Initialization
 void InitializeHooks() {
-    if (g_hooksInitialized.load()) return;
-    
+    const int initialized =
+        static_cast<int>(HookInitializationState::Initialized);
+    if (g_hookInitializationState.load(std::memory_order_acquire) == initialized) {
+        return;
+    }
+    int expected = static_cast<int>(HookInitializationState::Uninitialized);
+    if (!g_hookInitializationState.compare_exchange_strong(
+            expected, static_cast<int>(HookInitializationState::Initializing),
+            std::memory_order_acq_rel)) {
+        return;
+    }
+
     HGLRC currentContext = wglGetCurrentContext();
     if (currentContext == NULL) {
+        g_hookInitializationState.store(
+            static_cast<int>(HookInitializationState::Uninitialized),
+            std::memory_order_release);
         return; // No active context yet in this thread
     }
     
@@ -2485,6 +3345,13 @@ void InitializeHooks() {
     real_glUniformMatrix4fv = (glUniformMatrix4fv_t)wglGetProcAddress("glUniformMatrix4fv");
     real_glProgramUniformMatrix4fv = (glProgramUniformMatrix4fv_t)wglGetProcAddress("glProgramUniformMatrix4fv");
     real_glGetUniformLocation = (glGetUniformLocation_t)wglGetProcAddress("glGetUniformLocation");
+    real_glGetUniformiv = (glGetUniformiv_t)wglGetProcAddress("glGetUniformiv");
+    real_glGetUniformfv = (glGetUniformfv_t)wglGetProcAddress("glGetUniformfv");
+    real_glGetAttribLocation = (glGetAttribLocation_t)wglGetProcAddress("glGetAttribLocation");
+    real_glGetVertexAttribiv = (glGetVertexAttribiv_t)wglGetProcAddress("glGetVertexAttribiv");
+    real_glGetVertexAttribPointerv = (glGetVertexAttribPointerv_t)wglGetProcAddress("glGetVertexAttribPointerv");
+    real_glGetNamedBufferSubData = (glGetNamedBufferSubData_t)wglGetProcAddress("glGetNamedBufferSubData");
+    real_glGetNamedBufferParameteriv = (glGetNamedBufferParameteriv_t)wglGetProcAddress("glGetNamedBufferParameteriv");
     real_glIsProgram = (glIsProgram_t)wglGetProcAddress("glIsProgram");
     real_glGetObjectLabel = (glGetObjectLabel_t)wglGetProcAddress("glGetObjectLabel");
     real_glGetTexLevelParameteriv = (glGetTexLevelParameteriv_t)wglGetProcAddress("glGetTexLevelParameteriv");
@@ -2500,6 +3367,18 @@ void InitializeHooks() {
     real_glFramebufferTexture2D = (glFramebufferTexture2D_t)wglGetProcAddress("glFramebufferTexture2D");
     real_glCheckFramebufferStatus = (glCheckFramebufferStatus_t)wglGetProcAddress("glCheckFramebufferStatus");
     HMODULE hGL = GetModuleHandleA("opengl32.dll");
+    if (hGL) {
+        raw_glDrawBuffer = reinterpret_cast<glDrawBuffer_t>(GetProcAddress(hGL, "glDrawBuffer"));
+        raw_glReadBuffer = reinterpret_cast<glReadBuffer_t>(GetProcAddress(hGL, "glReadBuffer"));
+        raw_glDepthMask = reinterpret_cast<glDepthMask_t>(GetProcAddress(hGL, "glDepthMask"));
+        raw_glColorMask = reinterpret_cast<glColorMask_t>(GetProcAddress(hGL, "glColorMask"));
+        raw_glEnable = reinterpret_cast<glEnable_t>(GetProcAddress(hGL, "glEnable"));
+        raw_glDisable = reinterpret_cast<glDisable_t>(GetProcAddress(hGL, "glDisable"));
+        raw_glClearDepth = reinterpret_cast<glClearDepth_t>(GetProcAddress(hGL, "glClearDepth"));
+        raw_glDepthFunc = reinterpret_cast<glDepthFunc_t>(GetProcAddress(hGL, "glDepthFunc"));
+        raw_glGetBooleanv = reinterpret_cast<glGetBooleanv_t>(GetProcAddress(hGL, "glGetBooleanv"));
+        raw_glIsEnabled = reinterpret_cast<glIsEnabled_t>(GetProcAddress(hGL, "glIsEnabled"));
+    }
     if (!real_glDrawArrays && hGL) {
         real_glDrawArrays = (glDrawArrays_t)GetProcAddress(hGL, "glDrawArrays");
     }
@@ -2561,6 +3440,13 @@ void InitializeHooks() {
     LogMessage("HytaleUIScaleHook: Resolving glUniformMatrix4fv: " + std::string(real_glUniformMatrix4fv ? "SUCCESS" : "FAILED"));
     LogMessage("HytaleUIScaleHook: Resolving glProgramUniformMatrix4fv: " + std::string(real_glProgramUniformMatrix4fv ? "SUCCESS" : "FAILED"));
     LogMessage("HytaleUIScaleHook: Resolving glGetUniformLocation: " + std::string(real_glGetUniformLocation ? "SUCCESS" : "FAILED"));
+    LogMessage("HytaleUIScaleHook: Resolving glGetUniformiv: " + std::string(real_glGetUniformiv ? "SUCCESS" : "FAILED"));
+    LogMessage("HytaleUIScaleHook: Resolving glGetUniformfv: " + std::string(real_glGetUniformfv ? "SUCCESS" : "FAILED"));
+    LogMessage("HytaleUIScaleHook: Resolving glGetAttribLocation: " + std::string(real_glGetAttribLocation ? "SUCCESS" : "FAILED"));
+    LogMessage("HytaleUIScaleHook: Resolving glGetVertexAttribiv: " + std::string(real_glGetVertexAttribiv ? "SUCCESS" : "FAILED"));
+    LogMessage("HytaleUIScaleHook: Resolving glGetVertexAttribPointerv: " + std::string(real_glGetVertexAttribPointerv ? "SUCCESS" : "FAILED"));
+    LogMessage("HytaleUIScaleHook: Resolving glGetNamedBufferSubData: " + std::string(real_glGetNamedBufferSubData ? "SUCCESS" : "FAILED"));
+    LogMessage("HytaleUIScaleHook: Resolving glGetNamedBufferParameteriv: " + std::string(real_glGetNamedBufferParameteriv ? "SUCCESS" : "FAILED"));
     LogMessage("HytaleUIScaleHook: Resolving glIsProgram: " + std::string(real_glIsProgram ? "SUCCESS" : "FAILED"));
     LogMessage("HytaleUIScaleHook: Resolving glGetObjectLabel: " + std::string(real_glGetObjectLabel ? "SUCCESS" : "FAILED"));
     LogMessage("HytaleUIScaleHook: Resolving glGetIntegerv: " + std::string(real_glGetIntegerv ? "SUCCESS" : "FAILED"));
@@ -2588,173 +3474,211 @@ void InitializeHooks() {
     LogMessage("HytaleUIScaleHook: Resolving glUnmapBuffer: " + std::string(real_glUnmapBuffer ? "SUCCESS" : "FAILED"));
     LogMessage("HytaleUIScaleHook: Resolving glBufferStorage: " + std::string(real_glBufferStorage ? "SUCCESS" : "FAILED"));
 
-    MH_STATUS status;
+    const bool required_functions_ready =
+        real_glUseProgram && real_glDrawArrays && real_glDrawElements &&
+        real_glUniformMatrix4fv && real_glGetUniformLocation &&
+        real_glGetIntegerv;
+    if (!required_functions_ready) {
+        LogMessage(
+            "HytaleUIScaleHook: required OpenGL functions are incomplete; "
+            "initialization will retry.");
+        g_nextHookInitializationRetryTick.store(
+            GetTickCount64() + 1000, std::memory_order_relaxed);
+        g_hookInitializationState.store(
+            static_cast<int>(HookInitializationState::Uninitialized),
+            std::memory_order_release);
+        return;
+    }
 
-    if (real_glObjectLabel) {
-        LPVOID target = (LPVOID)real_glObjectLabel;
-        status = MH_CreateHook(target, (LPVOID)hook_glObjectLabel, (LPVOID*)&real_glObjectLabel);
-        LogMessage("HytaleUIScaleHook: Create glObjectLabel hook status: " + std::string(MH_StatusToString(status)));
+    MH_STATUS status;
+    bool hook_creation_ok = true;
+    std::vector<LPVOID> created_hook_targets;
+    const auto note_hook_status =
+        [&](MH_STATUS hook_status, const char* hook_name) {
+            const bool ok = hook_status == MH_OK ||
+                            hook_status == MH_ERROR_ALREADY_CREATED;
+            if (!ok) {
+                hook_creation_ok = false;
+                LogMessage(
+                    std::string("HytaleUIScaleHook: required hook failed: ") +
+                    hook_name + " status=" + MH_StatusToString(hook_status));
+            }
+        };
+    const auto create_hook =
+        [&](LPVOID target, LPVOID detour, LPVOID* original,
+            const char* hook_name) {
+            if (!target) return;
+            const MH_STATUS hook_status =
+                MH_CreateHook(target, detour, original);
+            if (hook_status == MH_OK) {
+                created_hook_targets.push_back(target);
+            }
+            LogMessage(
+                std::string("HytaleUIScaleHook: Create ") + hook_name +
+                " hook status: " + MH_StatusToString(hook_status));
+            note_hook_status(hook_status, hook_name);
+        };
+
+    create_hook((LPVOID)real_glObjectLabel, (LPVOID)hook_glObjectLabel,
+                (LPVOID*)&real_glObjectLabel, "glObjectLabel");
+    create_hook((LPVOID)real_glLinkProgram, (LPVOID)hook_glLinkProgram,
+                (LPVOID*)&real_glLinkProgram, "glLinkProgram");
+    create_hook((LPVOID)real_glUseProgram, (LPVOID)hook_glUseProgram,
+                (LPVOID*)&real_glUseProgram, "glUseProgram");
+    create_hook((LPVOID)real_glBindTexture, (LPVOID)hook_glBindTexture,
+                (LPVOID*)&real_glBindTexture, "glBindTexture");
+    create_hook((LPVOID)real_glTexImage2D, (LPVOID)hook_glTexImage2D,
+                (LPVOID*)&real_glTexImage2D, "glTexImage2D");
+    create_hook((LPVOID)real_glDrawArrays, (LPVOID)hook_glDrawArrays,
+                (LPVOID*)&real_glDrawArrays, "glDrawArrays");
+    create_hook((LPVOID)real_glDrawElements, (LPVOID)hook_glDrawElements,
+                (LPVOID*)&real_glDrawElements, "glDrawElements");
+    create_hook((LPVOID)real_glUniformMatrix4fv,
+                (LPVOID)hook_glUniformMatrix4fv,
+                (LPVOID*)&real_glUniformMatrix4fv, "glUniformMatrix4fv");
+    create_hook((LPVOID)real_glProgramUniformMatrix4fv,
+                (LPVOID)hook_glProgramUniformMatrix4fv,
+                (LPVOID*)&real_glProgramUniformMatrix4fv,
+                "glProgramUniformMatrix4fv");
+    create_hook((LPVOID)real_glBindBuffer, (LPVOID)hook_glBindBuffer,
+                (LPVOID*)&real_glBindBuffer, "glBindBuffer");
+    create_hook((LPVOID)real_glBindBufferRange,
+                (LPVOID)hook_glBindBufferRange,
+                (LPVOID*)&real_glBindBufferRange, "glBindBufferRange");
+    create_hook((LPVOID)real_glBindBufferBase,
+                (LPVOID)hook_glBindBufferBase,
+                (LPVOID*)&real_glBindBufferBase, "glBindBufferBase");
+    create_hook((LPVOID)real_glBufferSubData,
+                (LPVOID)hook_glBufferSubData,
+                (LPVOID*)&real_glBufferSubData, "glBufferSubData");
+    create_hook((LPVOID)real_glBufferData, (LPVOID)hook_glBufferData,
+                (LPVOID*)&real_glBufferData, "glBufferData");
+    create_hook((LPVOID)real_glBufferStorage, (LPVOID)hook_glBufferStorage,
+                (LPVOID*)&real_glBufferStorage, "glBufferStorage");
+    create_hook((LPVOID)real_glMapBuffer, (LPVOID)hook_glMapBuffer,
+                (LPVOID*)&real_glMapBuffer, "glMapBuffer");
+    create_hook((LPVOID)real_glMapBufferRange,
+                (LPVOID)hook_glMapBufferRange,
+                (LPVOID*)&real_glMapBufferRange, "glMapBufferRange");
+    create_hook((LPVOID)real_glUnmapBuffer, (LPVOID)hook_glUnmapBuffer,
+                (LPVOID*)&real_glUnmapBuffer, "glUnmapBuffer");
+
+    if (!hook_creation_ok) {
+        for (LPVOID target : created_hook_targets) {
+            MH_RemoveHook(target);
+        }
+        g_nextHookInitializationRetryTick.store(
+            GetTickCount64() + 1000, std::memory_order_relaxed);
+        g_hookInitializationState.store(
+            static_cast<int>(HookInitializationState::Uninitialized),
+            std::memory_order_release);
+        return;
     }
-    if (real_glLinkProgram) {
-        LPVOID target = (LPVOID)real_glLinkProgram;
-        status = MH_CreateHook(target, (LPVOID)hook_glLinkProgram, (LPVOID*)&real_glLinkProgram);
-        LogMessage("HytaleUIScaleHook: Create glLinkProgram hook status: " + std::string(MH_StatusToString(status)));
-    }
-    if (real_glUseProgram) {
-        LPVOID target = (LPVOID)real_glUseProgram;
-        status = MH_CreateHook(target, (LPVOID)hook_glUseProgram, (LPVOID*)&real_glUseProgram);
-        LogMessage("HytaleUIScaleHook: Create glUseProgram hook status: " + std::string(MH_StatusToString(status)));
-    }
-    if (real_glBindTexture) {
-        LPVOID target = (LPVOID)real_glBindTexture;
-        status = MH_CreateHook(target, (LPVOID)hook_glBindTexture, (LPVOID*)&real_glBindTexture);
-        LogMessage("HytaleUIScaleHook: Create glBindTexture hook status: " + std::string(MH_StatusToString(status)));
-    }
-    if (real_glTexImage2D) {
-        LPVOID target = (LPVOID)real_glTexImage2D;
-        status = MH_CreateHook(target, (LPVOID)hook_glTexImage2D, (LPVOID*)&real_glTexImage2D);
-        LogMessage("HytaleUIScaleHook: Create glTexImage2D hook status: " + std::string(MH_StatusToString(status)));
-    }
-    if (real_glDrawArrays) {
-        LPVOID target = (LPVOID)real_glDrawArrays;
-        status = MH_CreateHook(target, (LPVOID)hook_glDrawArrays, (LPVOID*)&real_glDrawArrays);
-        LogMessage("HytaleUIScaleHook: Create glDrawArrays hook status: " + std::string(MH_StatusToString(status)));
-    }
-    if (real_glDrawElements) {
-        LPVOID target = (LPVOID)real_glDrawElements;
-        status = MH_CreateHook(target, (LPVOID)hook_glDrawElements, (LPVOID*)&real_glDrawElements);
-        LogMessage("HytaleUIScaleHook: Create glDrawElements hook status: " + std::string(MH_StatusToString(status)));
-    }
-    if (real_glUniformMatrix4fv) {
-        LPVOID target = (LPVOID)real_glUniformMatrix4fv;
-        status = MH_CreateHook(target, (LPVOID)hook_glUniformMatrix4fv, (LPVOID*)&real_glUniformMatrix4fv);
-        LogMessage("HytaleUIScaleHook: Create glUniformMatrix4fv hook status: " + std::string(MH_StatusToString(status)));
-    }
-    if (real_glProgramUniformMatrix4fv) {
-        LPVOID target = (LPVOID)real_glProgramUniformMatrix4fv;
-        status = MH_CreateHook(target, (LPVOID)hook_glProgramUniformMatrix4fv, (LPVOID*)&real_glProgramUniformMatrix4fv);
-        LogMessage("HytaleUIScaleHook: Create glProgramUniformMatrix4fv hook status: " + std::string(MH_StatusToString(status)));
-    }
-    
-    // Create hooks for UBO functions
-    if (real_glBindBuffer) {
-        status = MH_CreateHook((LPVOID)real_glBindBuffer, (LPVOID)hook_glBindBuffer, (LPVOID*)&real_glBindBuffer);
-        LogMessage("HytaleUIScaleHook: Create glBindBuffer hook status: " + std::string(MH_StatusToString(status)));
-    }
-    if (real_glBindBufferRange) {
-        status = MH_CreateHook((LPVOID)real_glBindBufferRange, (LPVOID)hook_glBindBufferRange, (LPVOID*)&real_glBindBufferRange);
-        LogMessage("HytaleUIScaleHook: Create glBindBufferRange hook status: " + std::string(MH_StatusToString(status)));
-    }
-    if (real_glBindBufferBase) {
-        status = MH_CreateHook((LPVOID)real_glBindBufferBase, (LPVOID)hook_glBindBufferBase, (LPVOID*)&real_glBindBufferBase);
-        LogMessage("HytaleUIScaleHook: Create glBindBufferBase hook status: " + std::string(MH_StatusToString(status)));
-    }
-    if (real_glBufferSubData) {
-        status = MH_CreateHook((LPVOID)real_glBufferSubData, (LPVOID)hook_glBufferSubData, (LPVOID*)&real_glBufferSubData);
-        LogMessage("HytaleUIScaleHook: Create glBufferSubData hook status: " + std::string(MH_StatusToString(status)));
-    }
-    if (real_glBufferData) {
-        status = MH_CreateHook((LPVOID)real_glBufferData, (LPVOID)hook_glBufferData, (LPVOID*)&real_glBufferData);
-        LogMessage("HytaleUIScaleHook: Create glBufferData hook status: " + std::string(MH_StatusToString(status)));
-    }
-    if (real_glBufferStorage) {
-        status = MH_CreateHook((LPVOID)real_glBufferStorage, (LPVOID)hook_glBufferStorage, (LPVOID*)&real_glBufferStorage);
-        LogMessage("HytaleUIScaleHook: Create glBufferStorage hook status: " + std::string(MH_StatusToString(status)));
-    }
-    if (real_glMapBuffer) {
-        status = MH_CreateHook((LPVOID)real_glMapBuffer, (LPVOID)hook_glMapBuffer, (LPVOID*)&real_glMapBuffer);
-        LogMessage("HytaleUIScaleHook: Create glMapBuffer hook status: " + std::string(MH_StatusToString(status)));
-    }
-    if (real_glMapBufferRange) {
-        status = MH_CreateHook((LPVOID)real_glMapBufferRange, (LPVOID)hook_glMapBufferRange, (LPVOID*)&real_glMapBufferRange);
-        LogMessage("HytaleUIScaleHook: Create glMapBufferRange hook status: " + std::string(MH_StatusToString(status)));
-    }
-    if (real_glUnmapBuffer) {
-        status = MH_CreateHook((LPVOID)real_glUnmapBuffer, (LPVOID)hook_glUnmapBuffer, (LPVOID*)&real_glUnmapBuffer);
-        LogMessage("HytaleUIScaleHook: Create glUnmapBuffer hook status: " + std::string(MH_StatusToString(status)));
-    }
-    
+
     status = MH_EnableHook(MH_ALL_HOOKS);
     LogMessage("HytaleUIScaleHook: MH_EnableHook status: " + std::string(MH_StatusToString(status)));
+    if (status != MH_OK && status != MH_ERROR_ENABLED) {
+        for (LPVOID target : created_hook_targets) {
+            MH_DisableHook(target);
+            MH_RemoveHook(target);
+        }
+        g_nextHookInitializationRetryTick.store(
+            GetTickCount64() + 1000, std::memory_order_relaxed);
+        g_hookInitializationState.store(
+            static_cast<int>(HookInitializationState::Uninitialized),
+            std::memory_order_release);
+        return;
+    }
 
     ScanExistingPrograms();
-    
-    g_hooksInitialized.store(true);
+
+    g_hookInitializationState.store(
+        static_cast<int>(HookInitializationState::Initialized),
+        std::memory_order_release);
 }
 
-// DLL Entry Point
-BOOL APIENTRY DllMain(HMODULE hModule, DWORD ul_reason_for_call, LPVOID lpReserved) {
-    switch (ul_reason_for_call) {
-        case DLL_PROCESS_ATTACH: {
-            DisableThreadLibraryCalls(hModule);
-            if (DebugLoggingEnabled()) {
-                std::ofstream logFile(DebugLogPath(), std::ios_base::trunc);
-                if (logFile.is_open()) {
-                    logFile << "=== HytaleUIScaleHook Log Started ===" << std::endl;
-                }
-            }
-            LogMessage("HytaleUIScaleHook: DLL attached to process.");
-            
-            InitializeSharedMemory();
-            
-            HMODULE hOpenGL = GetModuleHandleA("opengl32.dll");
-            if (hOpenGL) {
-                real_glViewport = (glViewport_t)GetProcAddress(hOpenGL, "glViewport");
-                
-                MH_STATUS status = MH_Initialize();
-                LogMessage("HytaleUIScaleHook: MinHook MH_Initialize status: " + std::string(MH_StatusToString(status)));
-                
-                if (real_glViewport) {
-                    LPVOID target = (LPVOID)real_glViewport;
-                    status = MH_CreateHook(target, (LPVOID)hook_glViewport, (LPVOID*)&real_glViewport);
-                    LogMessage("HytaleUIScaleHook: Create glViewport hook status: " + std::string(MH_StatusToString(status)));
-                    status = MH_EnableHook(target);
-                    LogMessage("HytaleUIScaleHook: Enable glViewport hook status: " + std::string(MH_StatusToString(status)));
-                } else {
-                    LogMessage("HytaleUIScaleHook: GetProcAddress for glViewport failed.");
-                }
-            } else {
-                LogMessage("HytaleUIScaleHook: GetModuleHandle for opengl32.dll failed.");
-            }
-            
-            // Hook GetCursorPos, GetClientRect, SetCursorPos
-            HMODULE hUser32 = GetModuleHandleA("user32.dll");
-            if (hUser32) {
-                real_GetCursorPos = (GetCursorPos_t)GetProcAddress(hUser32, "GetCursorPos");
-                real_GetClientRect = (GetClientRect_t)GetProcAddress(hUser32, "GetClientRect");
-                real_SetCursorPos = (SetCursorPos_t)GetProcAddress(hUser32, "SetCursorPos");
-                
-                MH_STATUS status;
-                if (real_GetCursorPos) {
-                    LPVOID target = (LPVOID)real_GetCursorPos;
-                    status = MH_CreateHook(target, (LPVOID)hook_GetCursorPos, (LPVOID*)&real_GetCursorPos);
-                    LogMessage("HytaleUIScaleHook: Create GetCursorPos hook status: " + std::string(MH_StatusToString(status)));
-                    status = MH_EnableHook(target);
-                    LogMessage("HytaleUIScaleHook: Enable GetCursorPos hook status: " + std::string(MH_StatusToString(status)));
-                }
-                if (real_SetCursorPos) {
-                    LPVOID target = (LPVOID)real_SetCursorPos;
-                    status = MH_CreateHook(target, (LPVOID)hook_SetCursorPos, (LPVOID*)&real_SetCursorPos);
-                    LogMessage("HytaleUIScaleHook: Create SetCursorPos hook status: " + std::string(MH_StatusToString(status)));
-                    status = MH_EnableHook(target);
-                    LogMessage("HytaleUIScaleHook: Enable SetCursorPos hook status: " + std::string(MH_StatusToString(status)));
-                }
-            }
-            
-            // Try to initialize immediately in case we're injected into a thread with an active context
-            InitializeHooks();
-            break;
+DWORD WINAPI InitializeUiHookWorker(LPVOID) {
+    if (DebugLoggingEnabled()) {
+        std::ofstream logFile(DebugLogPath(), std::ios_base::trunc);
+        if (logFile.is_open()) {
+            logFile << "=== HytaleUIScaleHook Log Started ===" << std::endl;
         }
-        case DLL_PROCESS_DETACH:
-            // Restore WndProc if subclassed
-            if (g_gameHWND != NULL && real_WndProc != nullptr) {
-                SetWindowLongPtrW(g_gameHWND, GWLP_WNDPROC, (LONG_PTR)real_WndProc);
+    }
+    LogMessage("HytaleUIScaleHook: initialization worker started.");
+    InitializeSharedMemory();
+
+    const MH_STATUS initialize_status = MH_Initialize();
+    LogMessage(
+        "HytaleUIScaleHook: MinHook MH_Initialize status: " +
+        std::string(MH_StatusToString(initialize_status)));
+    if (initialize_status != MH_OK &&
+        initialize_status != MH_ERROR_ALREADY_INITIALIZED) {
+        return 0;
+    }
+
+    const auto create_and_enable =
+        [](LPVOID target, LPVOID detour, LPVOID* original,
+           const char* hook_name) {
+            if (!target) return false;
+            MH_STATUS status = MH_CreateHook(target, detour, original);
+            LogMessage(
+                std::string("HytaleUIScaleHook: Create ") + hook_name +
+                " status: " + MH_StatusToString(status));
+            if (status != MH_OK && status != MH_ERROR_ALREADY_CREATED) {
+                return false;
             }
-            MH_DisableHook(MH_ALL_HOOKS);
-            MH_Uninitialize();
-            CleanupSharedMemory();
-            LogMessage("HytaleUIScaleHook: DLL detached.");
-            break;
+            status = MH_EnableHook(target);
+            LogMessage(
+                std::string("HytaleUIScaleHook: Enable ") + hook_name +
+                " status: " + MH_StatusToString(status));
+            return status == MH_OK || status == MH_ERROR_ENABLED;
+        };
+
+    HMODULE hOpenGL = GetModuleHandleA("opengl32.dll");
+    if (hOpenGL) {
+        real_glViewport =
+            (glViewport_t)GetProcAddress(hOpenGL, "glViewport");
+        if (!create_and_enable(
+                (LPVOID)real_glViewport, (LPVOID)hook_glViewport,
+                (LPVOID*)&real_glViewport, "glViewport hook")) {
+            LogMessage(
+                "HytaleUIScaleHook: bootstrap glViewport hook unavailable.");
+        }
+    } else {
+        LogMessage(
+            "HytaleUIScaleHook: GetModuleHandle for opengl32.dll failed.");
+    }
+
+    HMODULE hUser32 = GetModuleHandleA("user32.dll");
+    if (hUser32) {
+        real_GetCursorPos =
+            (GetCursorPos_t)GetProcAddress(hUser32, "GetCursorPos");
+        real_GetClientRect =
+            (GetClientRect_t)GetProcAddress(hUser32, "GetClientRect");
+        real_SetCursorPos =
+            (SetCursorPos_t)GetProcAddress(hUser32, "SetCursorPos");
+        create_and_enable(
+            (LPVOID)real_GetCursorPos, (LPVOID)hook_GetCursorPos,
+            (LPVOID*)&real_GetCursorPos, "GetCursorPos hook");
+        create_and_enable(
+            (LPVOID)real_SetCursorPos, (LPVOID)hook_SetCursorPos,
+            (LPVOID*)&real_SetCursorPos, "SetCursorPos hook");
+    }
+
+    // This succeeds only if the worker happens to own an OpenGL context.
+    // Otherwise the first hooked glViewport call completes initialization.
+    InitializeHooks();
+    return 0;
+}
+
+// Keep DllMain loader-lock safe. The UI hook remains loaded for the lifetime of
+// Hytale, so process teardown lets Windows reclaim MinHook and OpenGL resources.
+BOOL APIENTRY DllMain(HMODULE hModule, DWORD reason, LPVOID) {
+    if (reason == DLL_PROCESS_ATTACH) {
+        DisableThreadLibraryCalls(hModule);
+        HANDLE thread = CreateThread(
+            nullptr, 0, InitializeUiHookWorker, nullptr, 0, nullptr);
+        if (thread) CloseHandle(thread);
     }
     return TRUE;
 }

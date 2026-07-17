@@ -1,5 +1,42 @@
 # Changelog
 
+## [1.0.0] - 2026-07-17
+
+### VR hands and held items
+
+- Added live held-item detection for both Hytale hands.
+- Rebuilt tools, weapons, blocks, decorations, shields, and torches from Hytale's own BlockyModel and texture assets at the tracked controller poses.
+- Added item asset caching and short trigger holds so attack and placement animations no longer make held items disappear or jump between hands.
+- Added configurable item position and scale, corrected hand/item depth ordering, and kept block/decor placement in the right hand.
+- Added a controller-attached torch flame while preserving Hytale's world lighting.
+
+### Image quality
+
+- Added optional source supersampling with a configurable render percentage.
+- Added optional post-reconstruction sharpening.
+- Added VR FXAA for diagonal edges and foliage shimmer.
+- Preserved more distant texture detail by removing a redundant bilinear source copy and limiting FXAA blending on weak edges.
+- Kept supersampling and sharpening disabled by default so the standard profile remains lightweight.
+
+### Interface and movement
+
+- Moved the captured Hytale UI to a SteamVR Standing-space overlay so menus remain anchored instead of following the headset.
+- Recentered the overlay together with the VR camera.
+- Stabilized head-directed locomotion and expanded pitch-aware world loading without restoring the oversized experimental frustum.
+
+### Updates and reliability
+
+- Added an automatic stable-release check to the dashboard.
+- Added an opt-in updater that downloads the Windows x64 ZIP, validates its size, ZIP structure and GitHub SHA-256 digest, installs outside the running process, and restarts the dashboard.
+- Improved held-item detection caching and removed redundant per-frame scans and framebuffer work.
+- Added updater, item asset, locomotion, projection, depth, and binding validation tests.
+
+### Notes
+
+- Disable Hytale's built-in FXAA. The dashboard's `VR FXAA` is designed for the reconstructed headset image.
+- Supersampling can significantly increase GPU load; start at 125% and increase gradually.
+- Restart Hytale completely before replacing an already injected hook DLL.
+
 ## [0.9.5] - 2026-07-14
 
 ### VR shadows and effects

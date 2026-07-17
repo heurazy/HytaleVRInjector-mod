@@ -111,6 +111,47 @@ inline void make_yaw_only_tracking_origin(const float current[12], float origin[
     origin[10] = -forward[2];
 }
 
+// Places a vertical overlay in SteamVR Standing space using the headset's
+// current horizontal heading. The resulting pose is absolute and can remain
+// unchanged while the user moves or rotates their head.
+inline bool make_world_locked_ui_pose(const float hmd[12], float distance,
+                                      float output[12]) {
+    if (!hmd || !output || !std::isfinite(distance) || distance <= 0.0f) {
+        return false;
+    }
+    for (int index = 0; index < 12; ++index) {
+        if (!std::isfinite(hmd[index])) return false;
+    }
+
+    float forward_x = -hmd[2];
+    float forward_z = -hmd[10];
+    float length =
+        std::sqrt(forward_x * forward_x + forward_z * forward_z);
+    if (length < 0.0001f) {
+        forward_x = 0.0f;
+        forward_z = -1.0f;
+        length = 1.0f;
+    }
+    forward_x /= length;
+    forward_z /= length;
+    const float right_x = -forward_z;
+    const float right_z = forward_x;
+
+    output[0] = right_x;
+    output[1] = 0.0f;
+    output[2] = -forward_x;
+    output[3] = hmd[3] + forward_x * distance;
+    output[4] = 0.0f;
+    output[5] = 1.0f;
+    output[6] = 0.0f;
+    output[7] = hmd[7];
+    output[8] = right_z;
+    output[9] = 0.0f;
+    output[10] = -forward_z;
+    output[11] = hmd[11] + forward_z * distance;
+    return true;
+}
+
 // Builds the inverse of the headset rotation relative to its recentered pose:
 // R_view = R_current^T * R_origin. Inputs are row-major 3x3 device poses and
 // the result is a column-major OpenGL matrix.
@@ -222,6 +263,87 @@ inline Matrix4 horizontal_view(const Matrix4& view) {
               result.value[1 * 4 + row] * camera_position[1] +
               result.value[2 * 4 + row] * camera_position[2]);
     }
+    return result;
+}
+
+// Preserves camera yaw and pitch while removing roll around the forward axis.
+// This is suitable for Hytale's loading/culling camera: looking up or down must
+// move its frustum, but leaning the headset must not rotate the chunk horizon.
+inline Matrix4 roll_free_view(const Matrix4& view) {
+    float camera_position[3]{};
+    float forward[3]{};
+    view_pose(view, camera_position, forward);
+    const float forward_length =
+        std::sqrt(forward[0] * forward[0] +
+                  forward[1] * forward[1] +
+                  forward[2] * forward[2]);
+    if (forward_length <= 0.0001f) return view;
+    for (float& component : forward) component /= forward_length;
+
+    float right[3]{-forward[2], 0.0f, forward[0]};
+    float right_length =
+        std::sqrt(right[0] * right[0] + right[2] * right[2]);
+    if (right_length <= 0.0001f) {
+        right[0] = view.value[0];
+        right[1] = 0.0f;
+        right[2] = view.value[8];
+        right_length =
+            std::sqrt(right[0] * right[0] + right[2] * right[2]);
+    }
+    if (right_length <= 0.0001f) {
+        right[0] = 1.0f;
+        right[1] = 0.0f;
+        right[2] = 0.0f;
+        right_length = 1.0f;
+    }
+    right[0] /= right_length;
+    right[2] /= right_length;
+
+    float up[3]{
+        -right[2] * forward[1],
+        right[2] * forward[0] - right[0] * forward[2],
+        right[0] * forward[1],
+    };
+    const float up_length =
+        std::sqrt(up[0] * up[0] + up[1] * up[1] + up[2] * up[2]);
+    if (up_length <= 0.0001f) return view;
+    for (float& component : up) component /= up_length;
+
+    Matrix4 result = identity_matrix();
+    for (int column = 0; column < 3; ++column) {
+        result.value[column * 4 + 0] = right[column];
+        result.value[column * 4 + 1] = up[column];
+        result.value[column * 4 + 2] = -forward[column];
+    }
+    for (int row = 0; row < 3; ++row) {
+        result.value[12 + row] =
+            -(result.value[0 * 4 + row] * camera_position[0] +
+              result.value[1 * 4 + row] * camera_position[1] +
+              result.value[2 * 4 + row] * camera_position[2]);
+    }
+    return result;
+}
+
+// Expands a perspective frustum without changing its depth mapping. The
+// optical-center terms are scaled with the focal lengths so asymmetric
+// projections keep pointing in the same direction.
+inline Matrix4 expand_perspective_frustum(const Matrix4& projection,
+                                          float horizontal_factor,
+                                          float vertical_factor) {
+    Matrix4 result = projection;
+    if (!std::isfinite(horizontal_factor) || horizontal_factor < 1.0f) {
+        horizontal_factor = 1.0f;
+    }
+    if (!std::isfinite(vertical_factor) || vertical_factor < 1.0f) {
+        vertical_factor = 1.0f;
+    }
+    horizontal_factor = std::fmin(horizontal_factor, 8.0f);
+    vertical_factor = std::fmin(vertical_factor, 8.0f);
+
+    result.value[0] /= horizontal_factor;
+    result.value[8] /= horizontal_factor;
+    result.value[5] /= vertical_factor;
+    result.value[9] /= vertical_factor;
     return result;
 }
 

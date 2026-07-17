@@ -1,8 +1,14 @@
 #pragma once
 
 #include <algorithm>
+#include <cmath>
 
 namespace hytalevr {
+
+struct LocomotionAxes {
+    float x = 0.0f;
+    float y = 0.0f;
+};
 
 struct DigitalStickState {
     bool left = false;
@@ -10,6 +16,15 @@ struct DigitalStickState {
     bool forward = false;
     bool backward = false;
 };
+
+inline LocomotionAxes rotate_locomotion_axes(float x, float y, float yaw_radians) {
+    const float c = std::cos(yaw_radians);
+    const float s = std::sin(yaw_radians);
+    return {
+        std::clamp(x * c + y * s, -1.0f, 1.0f),
+        std::clamp(y * c - x * s, -1.0f, 1.0f),
+    };
+}
 
 inline bool latched_axis(float value, bool active, float press_threshold) {
     const float press = std::clamp(press_threshold, 0.05f, 0.95f);

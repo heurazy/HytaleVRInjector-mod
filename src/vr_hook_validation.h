@@ -9,17 +9,29 @@ namespace hytalevr {
 inline bool camera_hook_site_valid(const unsigned char* target) {
     constexpr unsigned char first_prefix[] = {0x0F, 0x28, 0xB4, 0x24};
     constexpr unsigned char second_prefix[] = {0x0F, 0x28, 0xBC, 0x24};
+    constexpr unsigned char third_prefix[] = {
+        0x44, 0x0F, 0x28, 0x84, 0x24};
+    constexpr unsigned char fourth_prefix[] = {
+        0x44, 0x0F, 0x28, 0x8C, 0x24};
     if (!target || std::memcmp(target, first_prefix, sizeof(first_prefix)) != 0 ||
-        std::memcmp(target + 8, second_prefix, sizeof(second_prefix)) != 0) {
+        std::memcmp(target + 8, second_prefix, sizeof(second_prefix)) != 0 ||
+        std::memcmp(target + 16, third_prefix, sizeof(third_prefix)) != 0 ||
+        std::memcmp(target + 25, fourth_prefix, sizeof(fourth_prefix)) != 0) {
         return false;
     }
     int32_t first_stack_offset = 0;
     int32_t second_stack_offset = 0;
+    int32_t third_stack_offset = 0;
+    int32_t fourth_stack_offset = 0;
     std::memcpy(&first_stack_offset, target + 4, sizeof(first_stack_offset));
     std::memcpy(&second_stack_offset, target + 12, sizeof(second_stack_offset));
+    std::memcpy(&third_stack_offset, target + 21, sizeof(third_stack_offset));
+    std::memcpy(&fourth_stack_offset, target + 30, sizeof(fourth_stack_offset));
     return first_stack_offset >= 0x40 && first_stack_offset <= 0x4000 &&
            (first_stack_offset & 0x0F) == 0 &&
-           second_stack_offset == first_stack_offset - 0x10;
+           second_stack_offset == first_stack_offset - 0x10 &&
+           third_stack_offset == second_stack_offset - 0x10 &&
+           fourth_stack_offset == third_stack_offset - 0x10;
 }
 
 inline bool interaction_hook_site_valid(const unsigned char* target) {

@@ -15,6 +15,7 @@ This is an experimental mod. It is not affiliated with or endorsed by Hytale, Hy
 - `tests/` - native math/unit tests
 - `third_party/openvr/` - minimal OpenVR headers/import library/runtime DLL
 - `third_party/minhook/` - vendored MinHook sources used by the UI hook
+- `third_party/nlohmann/` - vendored JSON parser used by the release updater
 - `BUILDING.md` - rebuild instructions
 - `CHANGELOG.md` - release history and notable changes
 
@@ -31,11 +32,37 @@ This is an experimental mod. It is not affiliated with or endorsed by Hytale, Hy
 
 Keep SteamVR running while using the mod. Hytale must stay focused for the mod controls to work correctly.
 
-### VR Resolution
+### VR Hands and Held Items
 
-`Resolution %` is available in Advanced options. It controls the AFW eye texture resolution from `50` to `200`, with `100` as the default. The source and output keep the same aspect ratio, so changing this value does not modify the eye projections.
+- The player's avatar hands are rendered at the tracked SteamVR controller poses.
+- Hytale items, tools, weapons, blocks, decorations, shields, and torches are detected from the live first-person render and rebuilt from the assets shipped with the game.
+- Items remain attached to the correct hand while attacking or placing blocks, including short detection gaps during Hytale's native animations.
+- Hand and item scale, position, orientation, and depth tolerance can be adjusted under `Advanced options`.
 
-Higher values improve AFW reconstruction and hand/pointer edge resolution at an additional GPU cost. They cannot add world detail that was not present in Hytale's original backbuffer.
+### VR Image Quality
+
+Supersampling and sharpening are always visible on the dashboard. The other
+quality controls are available in `Advanced options`:
+
+- `Supersampling %`: disabled by default. In windowed mode, enabling it asks Hytale to render a larger backbuffer before AFW reconstruction. Fullscreen and maximized windows use safe output scaling instead. Higher values cost substantially more GPU time.
+- `Sharpening %`: disabled by default. It restores some local detail after AFW reprojection but adds a small rendering cost and can amplify shimmering.
+- `VR FXAA`: enabled by default. It follows the direction of high-contrast edges to reduce diagonal stair-stepping and foliage shimmer. Disable it only if its GPU cost is too high or fine textures look too soft.
+- `Stereo projection`: keeps the SteamVR per-eye projection and depth-based AFW disparity enabled. This should normally remain on.
+
+IPD and stereo separation remain available for headset and comfort tuning. SteamVR controls asynchronous reprojection or motion smoothing externally. Temporal DLSS, FSR 2/3, XeSS, and TAA are not exposed because the injector does not currently receive Hytale's motion vectors and temporal history.
+
+### Anchored Menu
+
+The Hytale interface is captured as a SteamVR overlay anchored in Standing space.
+It stays in the world when the headset turns instead of following the player's
+head. Centering VR also recenters the menu anchor.
+
+### Automatic Updates
+
+The dashboard checks the latest stable GitHub release in the background when it
+starts. When a newer Windows x64 release is available, it asks before downloading
+anything, verifies the archive size and SHA-256 digest, installs it through a
+temporary helper, then restarts the dashboard.
 
 ### Video Tutorial
 
