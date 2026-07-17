@@ -51,19 +51,6 @@ quality controls are available in `Advanced options`:
 
 IPD and stereo separation remain available for headset and comfort tuning. SteamVR controls asynchronous reprojection or motion smoothing externally. Temporal DLSS, FSR 2/3, XeSS, and TAA are not exposed because the injector does not currently receive Hytale's motion vectors and temporal history.
 
-### Anchored Menu
-
-The Hytale interface is captured as a SteamVR overlay anchored in Standing space.
-It stays in the world when the headset turns instead of following the player's
-head. Centering VR also recenters the menu anchor.
-
-### Automatic Updates
-
-The dashboard checks the latest stable GitHub release in the background when it
-starts. When a newer Windows x64 release is available, it asks before downloading
-anything, verifies the archive size and SHA-256 digest, installs it through a
-temporary helper, then restarts the dashboard.
-
 ### Video Tutorial
 
 [![HytaleVRInjector-mod video tutorial](https://img.youtube.com/vi/ktmVUCQHKF0/maxresdefault.jpg)](https://youtu.be/ktmVUCQHKF0)
